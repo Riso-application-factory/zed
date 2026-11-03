@@ -9037,6 +9037,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jev"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "anyhow",
+ "context_server",
+ "extension",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "log",
+ "node_runtime",
+ "paths",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "sha2",
+ "tempfile",
+ "util",
+ "watch",
+ "workspace",
+]
+
+[[package]]
 name = "jiff"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22454,6 +22480,7 @@ dependencies = [
  "inspector_ui",
  "install_cli",
  "itertools 0.14.0",
+ "jev",
  "journal",
  "json_schema_store",
  "keymap_editor",

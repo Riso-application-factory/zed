@@ -442,16 +442,21 @@ fn main() {
     );
 
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+    let (jev_shell_env_loaded_tx, jev_shell_env_loaded_rx) = oneshot::channel();
     if !stdout_is_a_pty() {
         app.background_executor()
             .spawn(async {
                 #[cfg(unix)]
                 util::load_login_shell_environment().await.log_err();
                 shell_env_loaded_tx.send(()).ok();
+                if jev_shell_env_loaded_tx.send(()).is_err() {
+                    log::debug!("Jev shell environment receiver was dropped");
+                }
             })
             .detach();
     } else {
-        drop(shell_env_loaded_tx)
+        drop(shell_env_loaded_tx);
+        drop(jev_shell_env_loaded_tx);
     }
 
     app.on_open_urls({
@@ -589,6 +594,12 @@ fn main() {
         #[cfg(target_os = "macos")]
         zed::move_to_applications::init(cx);
         project::Project::init(&client, cx);
+        jev::init(
+            node_runtime.clone(),
+            fs.clone(),
+            jev_shell_env_loaded_rx,
+            cx,
+        );
         debugger_ui::init(cx);
         debugger_tools::init(cx);
         client::init(&client, cx);

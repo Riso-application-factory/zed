@@ -4,9 +4,12 @@ use collections::HashMap;
 use context_server::ContextServerId;
 use editor::Editor;
 use extension_host::ExtensionStore;
-use gpui::{Action as _, Entity, Focusable as _, ScrollHandle, WeakEntity, prelude::*};
+use gpui::{
+    Action as _, Entity, Focusable as _, ScrollHandle, WeakEntity, WindowHandle, prelude::*,
+};
 use project::context_server_store::{
     ContextServerConfiguration, ContextServerStatus, ContextServerStore,
+    registry::ContextServerDescriptorRegistry,
 };
 use project::project_settings::ContextServerSettings;
 use settings::{ContextServerCommand, ContextServerSettingsContent, OAuthClientSettings};
@@ -15,6 +18,7 @@ use ui::{
     Switch, ToggleState, Tooltip, prelude::*,
 };
 use util::ResultExt as _;
+use workspace::MultiWorkspace;
 
 use zed_actions::ExtensionCategoryFilter;
 
@@ -34,7 +38,7 @@ pub(crate) fn render_mcp_servers_page(
         if server_ids.is_empty() {
             render_empty_state(cx)
         } else {
-            render_server_list(&server_ids, store, cx)
+            render_server_list(&server_ids, store, settings_window.original_window, cx)
         }
     } else {
         render_no_project_state(cx)
@@ -134,15 +138,16 @@ fn render_no_project_state(cx: &App) -> AnyElement {
 fn render_server_list(
     server_ids: &[ContextServerId],
     store: &Entity<ContextServerStore>,
+    original_window: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     v_flex()
         .w_full()
         .gap_1()
         .children(itertools::intersperse_with(
-            server_ids
-                .iter()
-                .map(|server_id| render_context_server(server_id, store, cx).into_any_element()),
+            server_ids.iter().map(|server_id| {
+                render_context_server(server_id, store, original_window, cx).into_any_element()
+            }),
             || Divider::horizontal_dashed().into_any_element(),
         ))
         .into_any_element()
@@ -151,6 +156,7 @@ fn render_server_list(
 fn render_context_server(
     context_server_id: &ContextServerId,
     store: &Entity<ContextServerStore>,
+    original_window: Option<WindowHandle<MultiWorkspace>>,
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
     let server_status = store
@@ -209,13 +215,29 @@ fn render_context_server(
         .read(cx)
         .settings_for_server(context_server_id)
         .cloned();
-    let configure_button = (!provided_by_extension).then(|| {
-        render_configure_button(
-            context_server_id,
-            cx.entity().downgrade(),
-            server_settings.clone(),
+    let configure_button = if provided_by_extension {
+        // Without a registered descriptor (e.g. the extension was removed) there is no
+        // configuration to open.
+        let has_descriptor = ContextServerDescriptorRegistry::default_global(cx)
+            .read(cx)
+            .context_server_descriptor(&context_server_id.0)
+            .is_some();
+        original_window
+            .filter(|_| has_descriptor)
+            .map(|original_window| {
+                render_extension_configure_button(context_server_id, original_window)
+                    .into_any_element()
+            })
+    } else {
+        Some(
+            render_configure_button(
+                context_server_id,
+                cx.entity().downgrade(),
+                server_settings.clone(),
+            )
+            .into_any_element(),
         )
-    });
+    };
     let uninstall_button = render_uninstall_button(context_server_id, provided_by_extension);
 
     // Build toggle switch
@@ -293,6 +315,43 @@ fn render_configure_button(
         settings_window
             .update(cx, |this, cx| {
                 open_mcp_server_form(this, transport, existing, window, cx);
+            })
+            .log_err();
+    })
+}
+
+// Extension-provided servers are configured against their settings schema, which the
+// agent_ui modal renders in the workspace window that owns the context server store.
+fn render_extension_configure_button(
+    context_server_id: &ContextServerId,
+    original_window: WindowHandle<MultiWorkspace>,
+) -> impl IntoElement {
+    let context_server_id = context_server_id.clone();
+
+    IconButton::new(
+        format!("mcp-configure-btn-{}", context_server_id.0),
+        IconName::Settings,
+    )
+    .icon_size(IconSize::Small)
+    .tab_index(0isize)
+    .tooltip(Tooltip::text("Configure MCP Server"))
+    .on_click(move |_event, _window, cx| {
+        cx.activate(true);
+        original_window
+            .update(cx, |multi_workspace, window, cx| {
+                window.activate_window();
+                // Dispatching through the workspace reaches its action handlers even when
+                // nothing inside that window currently has focus.
+                multi_workspace
+                    .workspace()
+                    .focus_handle(cx)
+                    .dispatch_action(
+                        &zed_actions::agent::ConfigureContextServer {
+                            id: context_server_id.0.to_string(),
+                        },
+                        window,
+                        cx,
+                    );
             })
             .log_err();
     })

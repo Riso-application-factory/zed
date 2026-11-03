@@ -145,6 +145,7 @@ image_viewer.workspace = true
 input_latency_ui.workspace = true
 inspector_ui.workspace = true
 install_cli.workspace = true
+jev.workspace = true
 journal.workspace = true
 json_schema_store.workspace = true
 keymap_editor.workspace = true

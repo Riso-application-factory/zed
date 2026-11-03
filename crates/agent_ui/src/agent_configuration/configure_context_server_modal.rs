@@ -47,6 +47,8 @@ enum ConfigurationTarget {
         id: ContextServerId,
         repository_url: Option<SharedString>,
         installation: Option<extension::ContextServerConfiguration>,
+        existing_settings: serde_json::Value,
+        remote: bool,
     },
 }
 
@@ -66,6 +68,7 @@ enum ConfigurationSource {
         repository_url: Option<SharedString>,
         installation_instructions: Option<Entity<markdown::Markdown>>,
         settings_validator: Option<jsonschema::Validator>,
+        remote: bool,
     },
 }
 
@@ -128,6 +131,8 @@ impl ConfigurationSource {
                 id,
                 repository_url,
                 installation,
+                existing_settings,
+                remote,
             } => {
                 let settings_validator = installation.as_ref().and_then(|installation| {
                     jsonschema::validator_for(&installation.settings_schema)
@@ -149,8 +154,17 @@ impl ConfigurationSource {
                     repository_url,
                     installation_instructions,
                     settings_validator,
+                    remote,
                     editor: installation.map(|installation| {
-                        create_editor(installation.default_settings, jsonc_language, window, cx)
+                        create_editor(
+                            extension_settings_input(
+                                installation.default_settings,
+                                &existing_settings,
+                            ),
+                            jsonc_language,
+                            window,
+                            cx,
+                        )
                     }),
                 }
             }
@@ -194,6 +208,7 @@ impl ConfigurationSource {
                 id,
                 editor,
                 settings_validator,
+                remote,
                 ..
             } => {
                 let text = editor
@@ -211,11 +226,42 @@ impl ConfigurationSource {
                     id.clone(),
                     ContextServerSettings::Extension {
                         enabled: true,
-                        remote: false,
+                        remote: *remote,
                         settings,
                     },
                 ))
             }
+        }
+    }
+}
+
+/// Configuring an already-set-up extension server must start from its current settings;
+/// prefilling only the extension's defaults would overwrite e.g. a working token with a
+/// placeholder as soon as the user confirms.
+fn extension_settings_input(
+    default_settings: String,
+    existing_settings: &serde_json::Value,
+) -> String {
+    let Some(existing_settings) = existing_settings
+        .as_object()
+        .filter(|settings| !settings.is_empty())
+    else {
+        return default_settings;
+    };
+    let mut merged = serde_json_lenient::from_str::<serde_json::Value>(&default_settings)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(merged) = merged.as_object_mut() {
+        for (name, value) in existing_settings {
+            merged.insert(name.clone(), value.clone());
+        }
+    }
+    match serde_json::to_string_pretty(&merged) {
+        Ok(text) => text,
+        Err(error) => {
+            log::error!("Failed to serialize context server settings: {error}");
+            default_settings
         }
     }
 }
@@ -369,6 +415,8 @@ fn parse_http_input(
 
 fn resolve_context_server_extension(
     id: ContextServerId,
+    existing_settings: serde_json::Value,
+    remote: bool,
     worktree_store: Entity<WorktreeStore>,
     cx: &mut App,
 ) -> Task<Option<ConfigurationTarget>> {
@@ -397,6 +445,8 @@ fn resolve_context_server_extension(
             repository_url: extension
                 .and_then(|(_, manifest)| manifest.repository.clone().map(SharedString::from)),
             installation,
+            existing_settings,
+            remote,
         })
     })
 }
@@ -506,11 +556,15 @@ impl ConfigureContextServerModal {
                     oauth,
                 }),
 
-                ContextServerSettings::Extension { .. } => {
+                ContextServerSettings::Extension {
+                    settings, remote, ..
+                } => {
                     match workspace
                         .update(cx, |workspace, cx| {
                             resolve_context_server_extension(
                                 server_id,
+                                settings,
+                                remote,
                                 workspace.project().read(cx).worktree_store(),
                                 cx,
                             )
@@ -1307,5 +1361,145 @@ mod tests {
         let oauth = oauth.expect("oauth should be present");
         assert_eq!(oauth.client_id, "client-id");
         assert_eq!(oauth.client_secret.as_deref(), Some("client-secret"));
+    }
+
+    #[test]
+    fn extension_settings_input_prefills_existing_values_over_defaults() {
+        let defaults = String::from("{\n  \"api_key\": \"\"\n  // \"model\": \"default\"\n}");
+        assert_eq!(
+            extension_settings_input(defaults.clone(), &serde_json::json!({})),
+            defaults
+        );
+        assert_eq!(
+            extension_settings_input(defaults.clone(), &serde_json::Value::Null),
+            defaults
+        );
+        let merged: serde_json::Value = serde_json::from_str(&extension_settings_input(
+            defaults,
+            &serde_json::json!({"api_key": "existing", "timeout": 5}),
+        ))
+        .expect("merged settings should be JSON");
+        assert_eq!(
+            merged,
+            serde_json::json!({"api_key": "existing", "timeout": 5})
+        );
+    }
+
+    struct PlaceholderDescriptor;
+
+    impl project::context_server_store::registry::ContextServerDescriptor for PlaceholderDescriptor {
+        fn command(
+            &self,
+            _worktree_store: Entity<WorktreeStore>,
+            _cx: &gpui::AsyncApp,
+        ) -> Task<Result<ContextServerCommand>> {
+            Task::ready(Err(anyhow::anyhow!("not started in tests")))
+        }
+
+        fn configuration(
+            &self,
+            _worktree_store: Entity<WorktreeStore>,
+            _cx: &gpui::AsyncApp,
+        ) -> Task<Result<Option<extension::ContextServerConfiguration>>> {
+            Task::ready(Ok(Some(extension::ContextServerConfiguration {
+                installation_instructions: "Set the token.".into(),
+                settings_schema: serde_json::json!({"type": "object"}),
+                default_settings: r#"{"token": "PLACEHOLDER_TOKEN", "mode": "default"}"#.into(),
+            })))
+        }
+    }
+
+    #[gpui::test]
+    async fn configuring_existing_extension_server_preserves_its_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::Focusable as _;
+        use workspace::MultiWorkspace;
+
+        crate::test_support::init_test(cx);
+        let fs = project::FakeFs::new(cx.executor());
+        let existing = ContextServerSettings::Extension {
+            enabled: true,
+            remote: true,
+            settings: serde_json::json!({"token": "real-token"}),
+        };
+        cx.update(|cx| {
+            extension::init(cx);
+            let app_state = workspace::AppState::test(cx);
+            extension_host::init(
+                Arc::new(extension::ExtensionHostProxy::new()),
+                fs.clone(),
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                cx,
+            );
+            ContextServerDescriptorRegistry::default_global(cx).update(cx, |registry, cx| {
+                registry.register_context_server_descriptor(
+                    "placeholder-server".into(),
+                    Arc::new(PlaceholderDescriptor),
+                    cx,
+                );
+            });
+            let mut settings = ProjectSettings::get_global(cx).clone();
+            settings
+                .context_servers
+                .insert("placeholder-server".into(), existing.clone());
+            ProjectSettings::override_global(settings, cx);
+        });
+
+        let project = project::Project::test(fs.clone(), [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("multi-workspace window should exist");
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                ConfigureContextServerModal::show_modal_for_existing_server(
+                    ContextServerId("placeholder-server".into()),
+                    language_registry,
+                    workspace.downgrade(),
+                    window,
+                    cx,
+                )
+                .detach_and_log_err(cx);
+            })
+            .expect("multi-workspace window should exist");
+        cx.run_until_parked();
+
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<ConfigureContextServerModal>(cx)
+            })
+            .expect("configure modal should be open");
+        let (id, output) = cx
+            .update(|cx| modal.update(cx, |modal, cx| modal.source.output(cx)))
+            .expect("prefilled settings should be valid");
+        assert_eq!(id.0.as_ref(), "placeholder-server");
+        assert_eq!(
+            output,
+            ContextServerSettings::Extension {
+                enabled: true,
+                remote: true,
+                settings: serde_json::json!({"token": "real-token", "mode": "default"}),
+            }
+        );
+
+        multi_workspace
+            .update(cx, |_, window, cx| {
+                modal
+                    .focus_handle(cx)
+                    .dispatch_action(&menu::Confirm, window, cx);
+            })
+            .expect("multi-workspace window should exist");
+        cx.run_until_parked();
+        let written = fs::Fs::load(fs.as_ref(), paths::settings_file())
+            .await
+            .unwrap_or_default();
+        assert!(
+            !written.contains("PLACEHOLDER_TOKEN"),
+            "confirming must not overwrite the existing token: {written}"
+        );
     }
 }

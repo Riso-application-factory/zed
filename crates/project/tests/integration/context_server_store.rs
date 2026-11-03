@@ -716,7 +716,12 @@ async fn test_context_server_loaded_when_first_worktree_added(cx: &mut TestAppCo
         let store = store.read(cx);
         assert_eq!(
             (
-                store.server_ids().to_vec(),
+                store
+                    .server_ids()
+                    .iter()
+                    .filter(|id| id.0.as_ref() != "jev")
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 store.status_for_server(&server_id),
             ),
             (vec![server_id], Some(ContextServerStatus::Running))

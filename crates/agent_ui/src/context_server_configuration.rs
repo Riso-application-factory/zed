@@ -8,11 +8,39 @@ use language::LanguageRegistry;
 use settings::update_settings_file;
 use ui::prelude::*;
 use util::ResultExt;
-use workspace::{MultiWorkspace, Workspace};
+use workspace::{MultiWorkspace, Workspace, notifications::DetachAndPromptErr as _};
 
 use crate::agent_configuration::ConfigureContextServerModal;
 
 pub(crate) fn init(language_registry: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, cx: &mut App) {
+    cx.observe_new({
+        let language_registry = language_registry.clone();
+        move |workspace: &mut Workspace, _window, _cx| {
+            let language_registry = language_registry.clone();
+            workspace.register_action(
+                move |workspace,
+                      action: &zed_actions::agent::ConfigureContextServer,
+                      window,
+                      cx| {
+                    ConfigureContextServerModal::show_modal_for_existing_server(
+                        ContextServerId(action.id.as_str().into()),
+                        language_registry.clone(),
+                        workspace.weak_handle(),
+                        window,
+                        cx,
+                    )
+                    .detach_and_prompt_err(
+                        "Failed to configure MCP server",
+                        window,
+                        cx,
+                        |_, _, _| None,
+                    );
+                },
+            );
+        }
+    })
+    .detach();
+
     let Some(extension_events) = extension::ExtensionEvents::try_global(cx) else {
         log::info!(
             "No extension events global found. Skipping context server configuration wizard"
@@ -105,7 +133,7 @@ fn show_configure_mcp_modal(
 mod tests {
     use super::*;
     use context_server::ContextServerCommand;
-    use gpui::TestAppContext;
+    use gpui::{Focusable as _, TestAppContext};
     use project::{
         FakeFs, Project,
         project_settings::{ContextServerSettings, ProjectSettings},
@@ -189,6 +217,87 @@ mod tests {
                 .active_modal::<ConfigureContextServerModal>(cx)
                 .is_none()),
             "a background workspace should not receive a hidden configuration modal"
+        );
+    }
+
+    struct FakeDescriptor;
+
+    impl project::context_server_store::registry::ContextServerDescriptor for FakeDescriptor {
+        fn command(
+            &self,
+            _worktree_store: gpui::Entity<project::worktree_store::WorktreeStore>,
+            _cx: &gpui::AsyncApp,
+        ) -> gpui::Task<anyhow::Result<ContextServerCommand>> {
+            gpui::Task::ready(Err(anyhow::anyhow!("not started in tests")))
+        }
+
+        fn configuration(
+            &self,
+            _worktree_store: gpui::Entity<project::worktree_store::WorktreeStore>,
+            _cx: &gpui::AsyncApp,
+        ) -> gpui::Task<anyhow::Result<Option<extension::ContextServerConfiguration>>> {
+            gpui::Task::ready(Ok(Some(extension::ContextServerConfiguration {
+                installation_instructions: "Set the key.".into(),
+                settings_schema: serde_json::json!({"type": "object"}),
+                default_settings: r#"{"api_key": ""}"#.into(),
+            })))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_configure_context_server_action_opens_modal_for_descriptor(
+        cx: &mut TestAppContext,
+    ) {
+        crate::test_support::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let language_registry = Arc::new(LanguageRegistry::test(cx.executor()));
+        cx.update(|cx| {
+            extension::init(cx);
+            let app_state = workspace::AppState::test(cx);
+            extension_host::init(
+                Arc::new(extension::ExtensionHostProxy::new()),
+                fs.clone(),
+                app_state.client.clone(),
+                app_state.node_runtime.clone(),
+                cx,
+            );
+            project::context_server_store::registry::ContextServerDescriptorRegistry::default_global(cx)
+                .update(cx, |registry, cx| {
+                    registry.register_context_server_descriptor(
+                        "descriptor-server".into(),
+                        Arc::new(FakeDescriptor),
+                        cx,
+                    );
+                });
+            init(language_registry, fs.clone(), cx);
+        });
+
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        cx.run_until_parked();
+
+        let workspace = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let workspace = multi_workspace.workspace().clone();
+                workspace.focus_handle(cx).dispatch_action(
+                    &zed_actions::agent::ConfigureContextServer {
+                        id: "descriptor-server".into(),
+                    },
+                    window,
+                    cx,
+                );
+                workspace
+            })
+            .expect("multi-workspace window should exist");
+        cx.run_until_parked();
+
+        assert!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_modal::<ConfigureContextServerModal>(cx)
+                .is_some()),
+            "the action should open the configuration modal for a descriptor-provided server"
         );
     }
 }

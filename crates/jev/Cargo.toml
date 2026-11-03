@@ -1,0 +1,39 @@
+[package]
+name = "jev"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/jev.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+context_server.workspace = true
+extension.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui.workspace = true
+log.workspace = true
+node_runtime.workspace = true
+paths.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+sha2.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+agent.workspace = true
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+http_client.workspace = true
+tempfile.workspace = true
+watch.workspace = true
