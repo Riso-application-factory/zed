@@ -1,0 +1,37 @@
+[branches]
+product = "riso/main"
+mirror = "main"
+upstream_url = "https://github.com/zed-industries/zed.git"
+upstream_branch = "main"
+upstream_repo = "zed-industries/zed"
+upstream_ref = "upstream/main"
+sync_auto_branch = "riso/sync/auto"
+sync_blocked_prefix = "riso/sync/blocked/"
+
+[policy]
+shadow = true
+auto_merge_max_level = 1
+review_marker_lines = [
+  "> [!IMPORTANT]",
+  "> Remove this line to confirm you've reviewed this PR before submitting.",
+]
+
+[labels]
+sync = "riso-sync"
+blocked = "riso-sync-blocked"
+level_prefix = "sync:L"
+
+[jev]
+endpoint = "https://api.typesafe.ai/v1/systemone"
+model = "jev-1.14.0"
+api_key_env = "JEV_API_KEY"
+max_state_characters = 60000
+timeout_seconds = 60
+max_retries = 4
+yes_threshold = 0.7
+no_threshold = 0.3
+min_confidence = 0.6
+safe_impact_max = 1.5
+safe_impact_min_confidence = 0.75
+breaking_impact = 2.5
+l1_escalate_threshold = 0.3

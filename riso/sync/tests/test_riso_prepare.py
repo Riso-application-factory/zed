@@ -1,0 +1,469 @@
+import contextlib
+import copy
+import json
+import io
+import os
+from pathlib import Path
+import shutil
+import sys
+from types import SimpleNamespace
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from riso_common import git, load_config
+from riso_prepare import Executor, merge, prepare, publish_pull_request, resolve, sync_mirror, dispatch
+
+
+class LocalExecutor(Executor):
+    """Run local git mutations while recording remote writes without executing them."""
+
+    def __init__(self, root, replies=None):
+        super().__init__(root)
+        self.replies = replies or {}
+
+    def run(self, *command, **keywords):
+        if command[0] == 'gh' or command[:2] == ('git', 'push'):
+            self.commands.append(list(command))
+            return self.replies.get(tuple(command), '101' if command[:3] == ('gh', 'pr', 'view') else '')
+        return super().run(*command, **keywords)
+
+    def body_command(self, command, body):
+        self.commands.append([*command, '--body-file', '<generated-body>'])
+        self.last_body = body
+        return ''
+
+
+class PrepareTests(unittest.TestCase):
+    def setUp(self):
+        renderers = SimpleNamespace(
+            render_auto_body=lambda plan, config: 'Bản đồng bộ tự động',
+            render_blocked_body=lambda plan, config: 'Bản đồng bộ bị chặn',
+            render_waiting_comment=lambda plan, number: f'Đang chờ #{number}',
+        )
+        renderer_patch = patch.dict(sys.modules, {'riso_report': renderers})
+        renderer_patch.start()
+        self.addCleanup(renderer_patch.stop)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name) / 'work'
+        self.root.mkdir()
+        git(self.root, 'init', '-b', 'product')
+        git(self.root, 'config', 'user.name', 'Test')
+        git(self.root, 'config', 'user.email', 'test@example.invalid')
+        (self.root / 'riso').mkdir()
+        shutil.copy(Path(__file__).resolve().parents[2] / 'config.toml', self.root / 'riso/config.toml')
+        (self.root / 'riso/hooks.toml').write_text('')
+        self.write('file.txt', 'base\n')
+        self.base = self.commit('base')
+        for name in ('origin', 'upstream'):
+            remote = Path(self.directory.name) / name
+            remote.mkdir()
+            git(remote, 'init', '--bare')
+            git(remote, 'fetch', str(self.root), 'HEAD:refs/heads/main')
+            git(self.root, 'remote', 'add', name, str(remote))
+            git(self.root, 'fetch', name)
+        git(self.root, 'update-ref', 'refs/remotes/origin/riso/main', self.base)
+        self.config = load_config(self.root)
+        self.output = contextlib.redirect_stdout(io.StringIO())
+        self.output.__enter__()
+        self.addCleanup(self.output.__exit__, None, None, None)
+
+    def write(self, path, text):
+        (self.root / path).write_text(text)
+
+    def commit(self, message):
+        git(self.root, 'add', '.')
+        git(self.root, 'commit', '-m', message)
+        return git(self.root, 'rev-parse', 'HEAD').strip()
+
+    def upstream(self, path='upstream.txt', text='upstream\n'):
+        git(self.root, 'checkout', '-B', 'upstream-work', self.base)
+        self.write(path, text)
+        target = self.commit('upstream')
+        git(self.root, 'checkout', 'product')
+        git(self.root, 'update-ref', 'refs/remotes/upstream/main', target)
+        return target
+
+    def plan(self, target=None, blocker=None, level=1, eligible=None):
+        head = git(self.root, 'rev-parse', 'HEAD').strip()
+        git(self.root, 'update-ref', 'refs/remotes/origin/riso/main', head)
+        upstream = blocker['sha'] if blocker else target or self.base
+        records = []
+        for sha in git(self.root, 'rev-list', '--reverse', '--first-parent', f'{self.base}..{upstream}').splitlines():
+            current_level = blocker['level'] if blocker and sha == blocker['sha'] else level
+            records.append({'sha': sha, 'short': sha[:7], 'subject': 'upstream', 'upstream_pr': None,
+                            'author': 'Test', 'date': '2026-01-01T00:00:00Z', 'files': [],
+                            'baseline_level': current_level, 'level': current_level,
+                            'reasons': [], 'adrs': [], 'conflicts': {'mechanical': [], 'real': []}, 'jev': []})
+        maximum = level if target else 0
+        return {'version': 1, 'generated_at': '2026-01-01T00:00:00Z', 'head': head,
+                'base': self.base, 'upstream': upstream, 'upstream_repo': 'test/upstream',
+                'jev': {'enabled': False, 'model': 'test'}, 'commits': records,
+                'summary': {str(number): sum(record['level'] == number for record in records) for number in range(5)},
+                'auto': {'target': target, 'count': int(bool(target)), 'max_level': maximum,
+                         'auto_merge_eligible': eligible if eligible is not None else (
+                             maximum <= self.config.policy.auto_merge_max_level and not self.config.policy.shadow)},
+                'blocker': blocker}
+
+    def test_mirror_fast_forward_command_sequence(self):
+        target = self.upstream()
+        executor = Executor(self.root, True)
+        sync_mirror(executor, self.config)
+        self.assertEqual(executor.commands, [
+            ['git', 'fetch', 'upstream', 'main'],
+            ['git', 'push', 'origin', f'{target}:refs/heads/main']])
+        self.assertEqual(git(self.root, 'status', '--porcelain'), '')
+
+    def test_mirror_refuses_non_fast_forward(self):
+        self.write('file.txt', 'fork\n')
+        fork = self.commit('fork')
+        self.upstream('file.txt', 'other\n')
+        git(self.root, 'update-ref', 'refs/remotes/origin/main', fork)
+        executor = Executor(self.root, True)
+        with self.assertRaisesRegex(RuntimeError, 'not a fast-forward'):
+            sync_mirror(executor, self.config)
+        self.assertEqual(executor.commands, [['git', 'fetch', 'upstream', 'main']])
+
+    def test_clean_auto_merge(self):
+        target = self.upstream()
+        self.write('fork.txt', 'fork\n')
+        self.commit('fork')
+        executor = LocalExecutor(self.root)
+        prepare(executor, self.config, self.plan(target), push=True)
+        self.assertEqual(git(self.root, 'branch', '--show-current').strip(), 'riso/sync/auto')
+        self.assertEqual(len(git(self.root, 'rev-list', '--parents', '-n', '1', 'HEAD').split()), 3)
+        self.assertEqual(executor.commands[-1], ['git', 'push', '--force-with-lease', 'origin', 'riso/sync/auto'])
+
+    def test_cargo_lock_mechanical_resolution(self):
+        self.write('Cargo.lock', 'base\n')
+        self.base = self.commit('lock base')
+        target = self.upstream('Cargo.lock', 'upstream\n')
+        self.write('Cargo.lock', 'fork\n')
+        self.commit('fork lock')
+        tools = Path(self.directory.name) / 'bin'
+        tools.mkdir()
+        cargo = tools / 'cargo'
+        cargo.write_text('#!/bin/sh\n[ "$1 $2" = "update --workspace" ] || exit 1\nprintf "resolved\\n" > Cargo.lock\n')
+        cargo.chmod(0o755)
+        executor = LocalExecutor(self.root)
+        with patch.dict(os.environ, {'PATH': f'{tools}:{os.environ["PATH"]}'}):
+            self.assertTrue(merge(executor, target))
+        self.assertEqual((self.root / 'Cargo.lock').read_text(), 'resolved\n')
+        self.assertIn(['cargo', 'update', '--workspace'], executor.commands)
+        self.assertEqual(executor.commands[-1], ['git', 'commit', '--no-edit'])
+
+    def test_hook_only_resolution(self):
+        self.write('riso/hooks.toml', '[[hooks]]\nid="init"\nfile="file.txt"\nanchor="base"\nposition="after"\ntext="custom"\n')
+        self.base = self.commit('hook declaration')
+        target = self.upstream('file.txt', 'base\nupstream\n')
+        self.write('file.txt', 'base\ncustom\n')
+        self.commit('hook insertion')
+        executor = LocalExecutor(self.root)
+        self.assertTrue(merge(executor, target))
+        self.assertEqual((self.root / 'file.txt').read_text(), 'base\ncustom\nupstream\n')
+        self.assertIn(['git', 'checkout', '--theirs', '--', 'file.txt'], executor.commands)
+
+    def conflict(self):
+        target = self.upstream('file.txt', 'upstream\n')
+        self.write('file.txt', 'fork\n')
+        self.commit('fork')
+        return target
+
+    def test_real_conflict_aborts(self):
+        target = self.conflict()
+        executor = LocalExecutor(self.root)
+        self.assertFalse(merge(executor, target))
+        self.assertEqual(executor.commands[-1], ['git', 'merge', '--abort'])
+        self.assertEqual(git(self.root, 'status', '--porcelain'), '')
+
+    def assert_auto_failure_blocked(self, executor, target, message):
+        self.assertTrue(any(command[:3] == ['gh', 'issue', 'create'] for command in executor.commands))
+        self.assertFalse(any(command[:2] == ['git', 'push'] for command in executor.commands))
+        self.assertFalse(any(command[:3] == ['gh', 'pr', 'create'] for command in executor.commands))
+        self.assertFalse(any('--auto' in command for command in executor.commands))
+        self.assertIn(['gh', 'label', 'create', 'riso-sync-blocked', '--force'], executor.commands)
+        self.assertIn(['gh', 'label', 'create', 'sync:L3', '--force'], executor.commands)
+        self.assertIn(target, executor.last_body)
+        self.assertIn(message, executor.last_body)
+        self.assertEqual(git(self.root, 'status', '--porcelain'), '')
+
+    def test_auto_real_conflict_fails(self):
+        target = self.conflict()
+        executor = LocalExecutor(self.root)
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected real conflict'):
+            prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assert_auto_failure_blocked(executor, target, 'file.txt')
+
+    def test_auto_cargo_failure_creates_blocked_issue(self):
+        self.write('Cargo.lock', 'base\n')
+        self.base = self.commit('lock base')
+        target = self.upstream('Cargo.lock', 'upstream\n')
+        self.write('Cargo.lock', 'fork\n')
+        self.commit('fork lock')
+        tools = Path(self.directory.name) / 'bin'
+        tools.mkdir()
+        cargo = tools / 'cargo'
+        cargo.write_text('#!/bin/sh\nprintf "lock regeneration failed\\n" >&2\nexit 1\n')
+        cargo.chmod(0o755)
+        executor = LocalExecutor(self.root)
+        with patch.dict(os.environ, {'PATH': f'{tools}:{os.environ["PATH"]}'}):
+            with self.assertRaisesRegex(RuntimeError, 'lock regeneration failed'):
+                prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assert_auto_failure_blocked(executor, target, 'Cargo.lock')
+        self.assertIn('lock regeneration failed', executor.last_body)
+        self.assertIn(['git', 'merge', '--abort'], executor.commands)
+
+    def test_auto_hook_verification_failure_creates_blocked_issue(self):
+        target = self.upstream()
+        executor = LocalExecutor(self.root)
+        with patch.object(executor, 'verify_hooks', side_effect=RuntimeError('Hooks are not applied in file.txt')):
+            with self.assertRaisesRegex(RuntimeError, 'Hooks are not applied'):
+                prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assert_auto_failure_blocked(executor, target, 'file.txt')
+
+    def test_auto_push_failure_never_opens_pull_request(self):
+        target = self.upstream()
+        executor = LocalExecutor(self.root)
+        original = executor.run
+
+        def run(*command, **keywords):
+            if command[:2] == ('git', 'push'):
+                executor.commands.append(list(command))
+                raise RuntimeError('push rejected')
+            return original(*command, **keywords)
+
+        executor.run = run
+        with self.assertRaisesRegex(RuntimeError, 'push rejected'):
+            prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assertTrue(any(command[:3] == ['gh', 'issue', 'create'] for command in executor.commands))
+        self.assertFalse(any(command[:3] == ['gh', 'pr', 'create'] for command in executor.commands))
+        self.assertFalse(any('--auto' in command for command in executor.commands))
+        self.assertIn('push rejected', executor.last_body)
+
+    def test_auto_failure_updates_existing_blocked_issue(self):
+        target = self.conflict()
+        executor = LocalExecutor(self.root)
+        original = executor.run
+        issue_lists = 0
+
+        def run(*command, **keywords):
+            nonlocal issue_lists
+            if command[:3] == ('gh', 'issue', 'list'):
+                issue_lists += 1
+                if issue_lists > 1:
+                    executor.commands.append(list(command))
+                    return '[{"number": 77}]'
+            return original(*command, **keywords)
+
+        executor.run = run
+        with self.assertRaisesRegex(RuntimeError, 'Unexpected real conflict'):
+            prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assertTrue(any(command[:4] == ['gh', 'issue', 'edit', '77'] for command in executor.commands))
+        self.assertFalse(any(command[:3] == ['gh', 'issue', 'create'] for command in executor.commands))
+
+    def test_stale_plan_refused_before_any_side_effect(self):
+        target = self.upstream()
+        plan = self.plan(target)
+        self.write('fork.txt', 'new product tip\n')
+        current = self.commit('product advanced')
+        git(self.root, 'update-ref', 'refs/remotes/origin/riso/main', current)
+        executor = LocalExecutor(self.root)
+        with self.assertRaisesRegex(ValueError, 'Stale plan'):
+            prepare(executor, self.config, plan, push=True, github=True)
+        self.assertEqual(executor.commands, [])
+
+    def test_stale_plan_refused_against_local_product_tip(self):
+        target = self.upstream()
+        plan = self.plan(target)
+        self.write('fork.txt', 'local product advanced\n')
+        current = self.commit('product advanced')
+        git(self.root, 'update-ref', 'refs/heads/riso/main', current)
+        executor = LocalExecutor(self.root)
+        with self.assertRaisesRegex(ValueError, 'Stale plan'):
+            prepare(executor, self.config, plan, push=True, github=True)
+        self.assertEqual(executor.commands, [])
+
+    def test_malformed_plans_refused_before_any_side_effect(self):
+        target = self.upstream()
+        valid = self.plan(target)
+        malformed = [[], {'version': 1}]
+        for name, value in [('head', '--invalid'), ('upstream', '0' * 40), ('commits', []),
+                            ('auto', {'target': self.base, 'count': 1, 'max_level': 1, 'auto_merge_eligible': False}),
+                            ('blocker', {'sha': self.base, 'level': 3, 'mechanical_conflicts': [], 'real_conflicts': []}),
+                            ('summary', {'0': True})]:
+            plan = copy.deepcopy(valid)
+            plan[name] = value
+            malformed.append(plan)
+        for plan in malformed:
+            with self.subTest(plan=plan):
+                executor = LocalExecutor(self.root)
+                with self.assertRaises((ValueError, RuntimeError)):
+                    prepare(executor, self.config, plan, push=True, github=True)
+                self.assertEqual(executor.commands, [])
+
+    def test_malformed_plan_cli_returns_nonzero(self):
+        plan_path = Path(self.directory.name) / 'plan.json'
+        plan_path.write_text(json.dumps({'version': 1}))
+        arguments = SimpleNamespace(command='prepare', dry_run=True, plan=str(plan_path), push=True, github=True)
+        with patch('riso_prepare.repository_root', return_value=self.root), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(dispatch(arguments), 1)
+
+    def test_blocker_opens_pr_or_issue(self):
+        for real_conflict in (False, True):
+            with self.subTest(real_conflict=real_conflict):
+                target = self.upstream('file.txt', 'upstream\n')
+                if real_conflict:
+                    self.write('file.txt', 'fork\n')
+                    self.commit('fork')
+                blocker = {'sha': target, 'level': 3, 'mechanical_conflicts': [], 'real_conflicts': []}
+                executor = LocalExecutor(self.root)
+                prepare(executor, self.config, self.plan(blocker=blocker), push=True, github=True)
+                expected = 'issue' if real_conflict else 'pr'
+                self.assertTrue(any(command[:3] == ['gh', expected, 'create'] for command in executor.commands))
+                self.assertFalse(any('--auto' in command for command in executor.commands))
+                if real_conflict:
+                    self.assertIn('resolve ' + target, executor.last_body)
+                git(self.root, 'checkout', 'product')
+
+    def test_waiting_blocked_exits_before_git_mutation(self):
+        for kind in ('pr', 'issue'):
+            with self.subTest(kind=kind):
+                command = ('gh', kind, 'list', '--state', 'open', '--label', 'riso-sync-blocked', '--json', 'number')
+                executor = LocalExecutor(self.root, {command: '[{"number": 42}]'})
+                self.assertEqual(prepare(executor, self.config, self.plan(), github=True), 0)
+                self.assertFalse(any(command[0] == 'git' for command in executor.commands))
+                self.assertEqual(executor.commands[-1][:4], ['gh', kind, 'comment', '42'])
+
+    def test_auto_merge_enable_disable_and_shadow(self):
+        for shadow, level, eligible, enabled in ((False, 1, True, True), (True, 1, True, False),
+                                                  (False, 2, True, False), (False, 1, False, False)):
+            with self.subTest(shadow=shadow, level=level, eligible=eligible):
+                self.config.policy['shadow'] = shadow
+                executor = Executor(self.root, True)
+                publish_pull_request(executor, self.config, 'branch', 'title', 'body', level, eligible=eligible)
+                expected = ['gh', 'pr', 'merge', '--auto', '--merge', '<new-pr-number>'] if enabled else ['gh', 'pr', 'merge', '--disable-auto', '<new-pr-number>']
+                self.assertEqual(executor.commands[-1], expected)
+                self.assertIn(['gh', 'label', 'create', f'sync:L{level}', '--force'], executor.commands)
+
+    def test_existing_pr_edited(self):
+        command = ('gh', 'pr', 'list', '--state', 'open', '--head', 'branch', '--base', 'riso/main', '--json', 'number')
+        executor = LocalExecutor(self.root, {command: '[{"number": 9}]'})
+        publish_pull_request(executor, self.config, 'branch', 'title', 'body', 1)
+        self.assertTrue(any(command[:4] == ['gh', 'pr', 'edit', '9'] for command in executor.commands))
+        self.assertEqual(executor.commands[-1], ['gh', 'pr', 'merge', '--disable-auto', '9'])
+
+    def test_resolve_leaves_conflicts_then_finish_detects_markers(self):
+        target = self.conflict()
+        git(self.root, 'update-ref', 'refs/remotes/origin/riso/main', 'HEAD')
+        executor = LocalExecutor(self.root)
+        resolve(executor, self.config, target)
+        self.assertTrue(git(self.root, 'diff', '--name-only', '--diff-filter=U').strip())
+        self.assertNotIn(['git', 'merge', '--abort'], executor.commands)
+        self.write('file.txt', '<<<<<<< remaining\n')
+        git(self.root, 'add', '.')
+        with self.assertRaises(RuntimeError):
+            resolve(executor, self.config, target, True)
+        git(self.root, 'commit', '-m', 'unresolved marker')
+        with self.assertRaisesRegex(RuntimeError, 'Conflict marker'):
+            resolve(executor, self.config, target, True)
+        self.write('file.txt', 'resolved\n')
+        self.commit('resolved')
+        resolve(executor, self.config, target, True)
+        self.assertIn(['git', 'push', '--force-with-lease', 'origin', 'riso/sync/blocked/' + target[:7]], executor.commands)
+        self.assertFalse(any('--auto' in command for command in executor.commands))
+
+    def test_disable_auto_handles_only_not_enabled_errors(self):
+        executor = Executor(self.root)
+        response = SimpleNamespace(returncode=1, stderr='auto-merge is not enabled', stdout='')
+        with patch('riso_prepare.subprocess.run', return_value=response):
+            executor.run('gh', 'pr', 'merge', '--disable-auto', '9', allowed_errors=('not enabled',))
+        response.stderr = 'authentication failed'
+        with patch('riso_prepare.subprocess.run', return_value=response):
+            with self.assertRaisesRegex(RuntimeError, 'authentication failed'):
+                executor.run('gh', 'pr', 'merge', '--disable-auto', '9', allowed_errors=('not enabled',))
+
+    def test_dry_run_blocker_issue_sequence(self):
+        target = self.upstream()
+        blocker = {'sha': target, 'level': 3, 'real_conflicts': ['file.txt'], 'mechanical_conflicts': []}
+        executor = Executor(self.root, True)
+        prepare(executor, self.config, self.plan(blocker=blocker), github=True, push=True)
+        self.assertIn(['git', 'merge', '--abort'], executor.commands)
+        self.assertTrue(any(command[:3] == ['gh', 'issue', 'create'] for command in executor.commands))
+        self.assertFalse(any(command[:2] == ['git', 'push'] for command in executor.commands))
+
+    def test_workflow_pull_request_credentials_are_read_only(self):
+        root = Path(__file__).resolve().parents[3]
+        workflow = (root / '.github/workflows/riso_checks.yml').read_text()
+        for name in ('riso-adr', 'riso-verify'):
+            block = workflow.split(f'\n  {name}:\n', 1)[1].split('\n  riso-', 1)[0]
+            self.assertIn('    permissions:\n      contents: read\n', block)
+            self.assertNotIn(': write', block)
+            self.assertIn('persist-credentials: false', block)
+        reporting = workflow.split('\n  riso-report-failure:\n', 1)[1]
+        self.assertIn("github.event_name == 'push'", reporting)
+        self.assertIn("github.repository_owner != 'zed-industries'", reporting)
+        self.assertIn('issues: write', reporting)
+        self.assertNotIn('actions/checkout', reporting)
+        self.assertNotIn('python3 riso/', reporting)
+
+    def test_workflow_uses_app_token_and_bot_identity(self):
+        root = Path(__file__).resolve().parents[3]
+        workflow = (root / '.github/workflows/riso_upstream_sync.yml').read_text()
+        first_step = workflow.split('    steps:\n', 1)[1].split('      - uses: actions/checkout', 1)[0]
+        self.assertIn('uses: actions/create-github-app-token@v2', first_step)
+        self.assertIn('id: app-token', first_step)
+        self.assertIn('app-id: ${{ secrets.RISO_BOT_APP_ID }}', first_step)
+        self.assertIn('private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}', first_step)
+        self.assertNotIn('owner:', first_step)
+        self.assertNotIn('repositories:', first_step)
+        self.assertIn('token: ${{ steps.app-token.outputs.token }}', workflow)
+        preparation = workflow.split('      - name: Prepare review requests\n', 1)[1].split('      - uses:', 1)[0]
+        self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', preparation)
+        self.assertNotIn('github.token', preparation)
+        self.assertIn("git config user.name 'riso-tech-bot[bot]'", workflow)
+        self.assertIn("git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'", workflow)
+        self.assertIn('    permissions:\n      contents: read\n      issues: write\n', workflow)
+        checks = (root / '.github/workflows/riso_checks.yml').read_text()
+        self.assertIn('GH_TOKEN: ${{ github.token }}', checks)
+        self.assertNotIn('app-token', checks)
+
+    def test_workflow_records_sync_failure_and_honors_dry_run(self):
+        root = Path(__file__).resolve().parents[3]
+        workflow = (root / '.github/workflows/riso_upstream_sync.yml').read_text()
+        handler = workflow.split('      - name: Record unexpected sync failure\n', 1)[1].split('      - uses:', 1)[0]
+        self.assertIn('if: failure()', handler)
+        self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}', handler)
+        self.assertIn('if [ "$DRY_RUN" = true ]', handler)
+        self.assertIn('--label riso-sync-blocked', handler)
+        self.assertIn('--label sync:L3', handler)
+        self.assertIn('gh issue comment', handler)
+        self.assertIn('gh issue create', handler)
+
+    def test_dry_run_preserves_worktree(self):
+        target = self.upstream()
+        before = git(self.root, 'rev-parse', 'HEAD')
+        executor = Executor(self.root, True)
+        prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assertEqual(git(self.root, 'rev-parse', 'HEAD'), before)
+        self.assertEqual(git(self.root, 'status', '--porcelain'), '')
+        self.assertEqual(executor.commands, [
+            ['gh', 'pr', 'list', '--state', 'open', '--label', 'riso-sync-blocked', '--json', 'number'],
+            ['gh', 'issue', 'list', '--state', 'open', '--label', 'riso-sync-blocked', '--json', 'number'],
+            ['git', 'checkout', '-B', 'riso/sync/auto', before.strip()],
+            ['git', 'merge', '--no-ff', '-m', f'Merge upstream {target[:7]} (riso sync, max L1)', target],
+            ['python3', 'riso/sync/riso_sync.py', 'hooks', 'verify'],
+            ['git', 'push', '--force-with-lease', 'origin', 'riso/sync/auto'],
+            ['gh', 'label', 'create', 'riso-sync', '--force'],
+            ['gh', 'label', 'create', 'sync:L1', '--force'],
+            ['gh', 'pr', 'list', '--state', 'open', '--head', 'riso/sync/auto', '--base', 'riso/main', '--json', 'number'],
+            ['gh', 'pr', 'create', '--base', 'riso/main', '--head', 'riso/sync/auto',
+             '--title', f'Sync upstream → {target[:7]} (L1)', '--label', 'riso-sync', '--label', 'sync:L1',
+             '--body-file', '<generated-body>'],
+            ['gh', 'pr', 'view', 'riso/sync/auto', '--json', 'number', '--jq', '.number'],
+            ['gh', 'pr', 'merge', '--disable-auto', '<new-pr-number>'],
+        ])
+
+
+if __name__ == '__main__':
+    unittest.main()

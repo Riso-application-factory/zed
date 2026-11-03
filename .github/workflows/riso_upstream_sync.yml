@@ -1,0 +1,100 @@
+name: Riso upstream sync
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log mutations without executing them
+        type: boolean
+        default: false
+concurrency:
+  group: riso-upstream-sync
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  sync:
+    if: github.repository_owner != 'zed-industries'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Mint bot token
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RISO_BOT_APP_ID }}
+          private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: riso/main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure git
+        run: |
+          git config user.name 'riso-tech-bot[bot]'
+          git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+      - name: Update mirror
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          arguments=()
+          if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
+          python3 riso/sync/riso_sync.py sync-mirror "${arguments[@]}"
+      - name: Plan upstream sync
+        env:
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+        run: |
+          python3 riso/sync/riso_sync.py plan --out "$RUNNER_TEMP/plan.json" --body-auto "$RUNNER_TEMP/body-auto.md" --body-blocked "$RUNNER_TEMP/body-blocked.md"
+      - name: Prepare review requests
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          arguments=(--plan "$RUNNER_TEMP/plan.json" --push --github)
+          if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
+          python3 riso/sync/riso_sync.py prepare "${arguments[@]}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: riso-sync-plan
+          path: |
+            ${{ runner.temp }}/plan.json
+            ${{ runner.temp }}/body-auto.md
+            ${{ runner.temp }}/body-blocked.md
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/body-auto.md" ]; then
+            cat "$RUNNER_TEMP/body-auto.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Record unexpected sync failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PRODUCT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            printf 'Dry run: would open/update blocked issue for failed run %s\n' "$RUN_URL"
+            exit 0
+          fi
+          printf 'Đồng bộ upstream thất bại ngoài dự kiến.\n\nCommit sản phẩm: `%s`\n\nĐường dẫn và lỗi: xem nhật ký %s\n' "$PRODUCT_SHA" "$RUN_URL" > "$RUNNER_TEMP/sync-failure.md"
+          gh label create riso-sync --force
+          gh label create riso-sync-blocked --force
+          gh label create sync:L3 --force
+          issue=$(gh issue list --state open --label riso-sync-blocked --json number --jq '.[0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file "$RUNNER_TEMP/sync-failure.md"
+          else
+            gh issue create --title 'Sync upstream bị chặn do lỗi ngoài dự kiến (L3)' --label riso-sync --label riso-sync-blocked --label sync:L3 --body-file "$RUNNER_TEMP/sync-failure.md"
+          fi

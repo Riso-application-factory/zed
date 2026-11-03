@@ -1,0 +1,7 @@
+# Declared, re-appliable insertions into upstream files. Empty for now.
+# [[hooks]]
+# id = "riso-init"
+# file = "crates/zed/src/main.rs"
+# anchor = "settings_ui::init(cx);"
+# position = "after"
+# text = "        riso::init(app_state.clone(), cx);"
