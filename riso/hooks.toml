@@ -1,7 +1,19 @@
-# Declared, re-appliable insertions into upstream files. Empty for now.
+# Declared, re-appliable insertions into upstream files.
 # [[hooks]]
 # id = "riso-init"
 # file = "crates/zed/src/main.rs"
 # anchor = "settings_ui::init(cx);"
 # position = "after"
 # text = "        riso::init(app_state.clone(), cx);"
+
+[[hooks]]
+id = "jev-init"
+file = "crates/zed/src/main.rs"
+anchor = "        project::Project::init(&client, cx);"
+position = "after"
+text = """        jev::init(
+            node_runtime.clone(),
+            fs.clone(),
+            jev_shell_env_loaded_rx,
+            cx,
+        );"""

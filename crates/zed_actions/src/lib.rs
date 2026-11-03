@@ -616,6 +616,15 @@ pub mod agent {
         pub agent: String,
     }
 
+    /// Opens the configuration modal for an existing MCP server in the workspace.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = agent)]
+    #[serde(deny_unknown_fields)]
+    pub struct ConfigureContextServer {
+        /// The id of the MCP server to configure.
+        pub id: String,
+    }
+
     /// Opens a new agent thread with the provided branch diff for review.
     #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = agent)]

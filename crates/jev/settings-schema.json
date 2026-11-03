@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "api_key": {"type": "string", "description": "TypeSafe API key. Empty uses JEV_API_KEY from the server environment.", "format": "password"},
+    "model": {"type": "string", "minLength": 1, "default": "jev-1.14.0"},
+    "endpoint": {"type": "string", "format": "uri", "default": "https://api.typesafe.ai/v1/systemone"},
+    "timeout": {"type": "number", "exclusiveMinimum": 0, "maximum": 3600, "default": 60, "description": "Total request deadline in seconds, including retries."}
+  }
+}
