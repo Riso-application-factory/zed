@@ -55,6 +55,7 @@ jobs:
           python3 riso/sync/riso_sync.py plan --out "$RUNNER_TEMP/plan.json" --body-auto "$RUNNER_TEMP/body-auto.md" --body-blocked "$RUNNER_TEMP/body-blocked.md"
       - name: Prepare review requests
         env:
+          GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
