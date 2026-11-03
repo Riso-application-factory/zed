@@ -20,6 +20,22 @@ class Executor:
         self.dry_run = dry_run
         self.commands = []
         self.failure_paths = []
+        self._github_repository = None
+
+    def github_repository(self, config):
+        if self._github_repository is None:
+            if 'GH_REPO' in os.environ:
+                repository = os.environ['GH_REPO'].strip()
+            else:
+                origin = git(self.root, 'remote', 'get-url', 'origin').strip()
+                match = re.fullmatch(r'(?:https?://(?:[^/@]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)([^/\s]+/[^/\s]+?)(?:\.git)?/?', origin)
+                repository = match.group(1) if match else ''
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+', repository):
+                raise ValueError('Cannot resolve fork repository: set GH_REPO to owner/name or configure a GitHub origin URL')
+            if repository.casefold() == config.branches.upstream_repo.casefold():
+                raise ValueError(f'Refusing GitHub operations against upstream repository {repository}; configure the fork as origin or GH_REPO')
+            self._github_repository = repository
+        return self._github_repository
 
     def run(self, *command, allowed_errors=()):
         command = list(map(str, command))
@@ -140,8 +156,8 @@ def merge(executor, target, message=None):
     return True
 
 
-def github_list(executor, kind, *arguments):
-    output = executor.run("gh", kind, "list", "--state", "open", *arguments, "--json", "number")
+def github_list(executor, config, kind, *arguments):
+    output = executor.run("gh", kind, "list", "--state", "open", *arguments, "--json", "number", "--repo", executor.github_repository(config))
     return json.loads(output or "[]")
 
 
@@ -150,30 +166,30 @@ def labels(executor, config, level, blocked=False):
     if blocked:
         names.append(config.labels.blocked)
     for name in names:
-        executor.run("gh", "label", "create", name, "--force")
+        executor.run("gh", "label", "create", name, "--force", "--repo", executor.github_repository(config))
     return [argument for name in names for argument in ("--label", name)]
 
 
 def publish_pull_request(executor, config, branch, title, body, level, blocked=False, eligible=False):
     label_arguments = labels(executor, config, level, blocked)
-    existing = github_list(executor, "pr", "--head", branch, "--base", config.branches.product)
+    existing = github_list(executor, config, "pr", "--head", branch, "--base", config.branches.product)
     if existing:
         number = str(existing[0]["number"])
         executor.body_command(["gh", "pr", "edit", number, "--title", title,
-                               *["--add-label" if item == "--label" else item for item in label_arguments]], body)
+                               *["--add-label" if item == "--label" else item for item in label_arguments], "--repo", executor.github_repository(config)], body)
     else:
         executor.body_command(["gh", "pr", "create", "--base", config.branches.product,
-                               "--head", branch, "--title", title, *label_arguments], body)
-        number = executor.run("gh", "pr", "view", branch, "--json", "number", "--jq", ".number").strip()
+                               "--head", branch, "--title", title, *label_arguments, "--repo", executor.github_repository(config)], body)
+        number = executor.run("gh", "pr", "view", branch, "--json", "number", "--jq", ".number", "--repo", executor.github_repository(config)).strip()
         if not number:
             if executor.dry_run:
                 number = "<new-pr-number>"
             else:
                 raise RuntimeError(f"Could not determine PR number for {branch}")
     if eligible and not blocked and not config.policy.shadow and level <= config.policy.auto_merge_max_level:
-        executor.run("gh", "pr", "merge", "--auto", "--merge", number)
+        executor.run("gh", "pr", "merge", "--auto", "--merge", number, "--repo", executor.github_repository(config))
     else:
-        executor.run("gh", "pr", "merge", "--disable-auto", number,
+        executor.run("gh", "pr", "merge", "--disable-auto", number, "--repo", executor.github_repository(config),
                      allowed_errors=("not enabled", "no auto-merge"))
 
 
@@ -285,12 +301,12 @@ def record_auto_failure(executor, config, target, error):
             f"Commit/target: `{target}`\n\nĐường dẫn: {paths}\n\nLỗi: {error}\n\n"
             f"Chạy `python3 riso/sync/riso_sync.py resolve {target}` để xử lý.\n").replace("@", "@\u200b")
     title = f"Sync upstream bị chặn → {target[:7]} (L3)"
-    existing = github_list(executor, "issue", "--label", config.labels.blocked)
+    existing = github_list(executor, config, "issue", "--label", config.labels.blocked)
     if existing:
         command = ["gh", "issue", "edit", str(existing[0]["number"]), "--title", title,
-                   *["--add-label" if argument == "--label" else argument for argument in label_arguments]]
+                   *["--add-label" if argument == "--label" else argument for argument in label_arguments], "--repo", executor.github_repository(config)]
     else:
-        command = ["gh", "issue", "create", "--title", title, *label_arguments]
+        command = ["gh", "issue", "create", "--title", title, *label_arguments, "--repo", executor.github_repository(config)]
     executor.body_command(command, body)
 
 
@@ -299,11 +315,12 @@ def prepare(executor, config, plan, push=False, github=False):
 
     validate_plan(executor.root, config, plan)
     if github:
+        executor.github_repository(config)
         for kind in ("pr", "issue"):
-            blocked = github_list(executor, kind, "--label", config.labels.blocked)
+            blocked = github_list(executor, config, kind, "--label", config.labels.blocked)
             if blocked:
                 number = str(blocked[0]["number"])
-                executor.body_command(["gh", kind, "comment", number], render_waiting_comment(plan, blocked[0]["number"]))
+                executor.body_command(["gh", kind, "comment", number, "--repo", executor.github_repository(config)], render_waiting_comment(plan, blocked[0]["number"]))
                 print(f"Waiting on blocked {kind} {number}")
                 return 0
     require_clean(executor.root)
@@ -344,7 +361,7 @@ def prepare(executor, config, plan, push=False, github=False):
             if github:
                 label_arguments = labels(executor, config, blocker["level"], True)
                 body += f"\n\nChạy `python3 riso/sync/riso_sync.py resolve {blocker['sha']}` để xử lý xung đột.\n"
-                executor.body_command(["gh", "issue", "create", "--title", f"Sync upstream bị chặn → {blocker['sha'][:7]}", *label_arguments], body)
+                executor.body_command(["gh", "issue", "create", "--title", f"Sync upstream bị chặn → {blocker['sha'][:7]}", *label_arguments, "--repo", executor.github_repository(config)], body)
         else:
             if push:
                 executor.run("git", "push", "--force-with-lease", "origin", branch)
@@ -385,6 +402,7 @@ def resolve(executor, config, target, finish=False):
     if exists(executor.root, "MERGE_HEAD"):
         raise RuntimeError("Commit the resolved merge before --finish")
     git(executor.root, "merge-base", "--is-ancestor", target, "HEAD")
+    executor.github_repository(config)
     executor.run("git", "push", "--force-with-lease", "origin", branch)
     publish_pull_request(executor, config, branch, f"Sync upstream → {target[:7]} (L3)",
                          f"Đã xử lý thủ công upstream `{target}`.\n", 3, blocked=True)

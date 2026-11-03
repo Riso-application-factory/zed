@@ -23,12 +23,17 @@ class LocalExecutor(Executor):
         self.replies = replies or {}
 
     def run(self, *command, **keywords):
+        if command[0] == 'gh':
+            assert '--repo' in command and command[command.index('--repo') + 1] == 'fork-owner/zed', command
+            assert 'zed-industries/zed' not in command, command
         if command[0] == 'gh' or command[:2] == ('git', 'push'):
             self.commands.append(list(command))
-            return self.replies.get(tuple(command), '101' if command[:3] == ('gh', 'pr', 'view') else '')
+            return self.replies.get(tuple(command[:-2]) if command[0] == 'gh' else tuple(command), '101' if command[:3] == ('gh', 'pr', 'view') else '')
         return super().run(*command, **keywords)
 
     def body_command(self, command, body):
+        assert '--repo' in command and command[command.index('--repo') + 1] == 'fork-owner/zed', command
+        assert 'zed-industries/zed' not in command, command
         self.commands.append([*command, '--body-file', '<generated-body>'])
         self.last_body = body
         return ''
@@ -36,6 +41,9 @@ class LocalExecutor(Executor):
 
 class PrepareTests(unittest.TestCase):
     def setUp(self):
+        repository_environment = patch.dict(os.environ, {'GH_REPO': 'fork-owner/zed'})
+        repository_environment.start()
+        self.addCleanup(repository_environment.stop)
         renderers = SimpleNamespace(
             render_auto_body=lambda plan, config: 'Bản đồng bộ tự động',
             render_blocked_body=lambda plan, config: 'Bản đồng bộ bị chặn',
@@ -105,6 +113,70 @@ class PrepareTests(unittest.TestCase):
                          'auto_merge_eligible': eligible if eligible is not None else (
                              maximum <= self.config.policy.auto_merge_max_level and not self.config.policy.shadow)},
                 'blocker': blocker}
+
+    def test_fork_repository_from_https_and_ssh_origin(self):
+        for url in ('https://github.com/fork-owner/zed.git', 'https://github.com/fork-owner/zed',
+                    'git@github.com:fork-owner/zed.git', 'ssh://git@github.com/fork-owner/zed.git'):
+            with self.subTest(url=url), patch.dict(os.environ):
+                os.environ.pop('GH_REPO', None)
+                git(self.root, 'remote', 'set-url', 'origin', url)
+                executor = Executor(self.root, True)
+                publish_pull_request(executor, self.config, 'branch', 'title', 'body', 1)
+                self.assert_fork_commands(executor)
+
+    def test_repository_environment_takes_precedence_and_resolves_once(self):
+        git(self.root, 'remote', 'set-url', 'origin', 'https://github.com/zed-industries/zed.git')
+        executor = Executor(self.root, True)
+        publish_pull_request(executor, self.config, 'branch', 'title', 'body', 1)
+        with patch.dict(os.environ, {'GH_REPO': 'zed-industries/zed'}):
+            publish_pull_request(executor, self.config, 'branch', 'title', 'body', 1)
+        self.assert_fork_commands(executor)
+
+    def test_refuse_upstream_or_empty_repository_before_side_effects(self):
+        target = self.upstream()
+        plan = self.plan(target)
+        for repository in ('zed-industries/zed', 'ZED-INDUSTRIES/ZED', ''):
+            with self.subTest(repository=repository), patch.dict(os.environ, {'GH_REPO': repository}):
+                executor = LocalExecutor(self.root)
+                with self.assertRaisesRegex(ValueError, 'upstream repository|Cannot resolve fork repository'):
+                    prepare(executor, self.config, plan, push=True, github=True)
+                self.assertEqual(executor.commands, [])
+        with patch.dict(os.environ):
+            os.environ.pop('GH_REPO', None)
+            git(self.root, 'remote', 'set-url', 'origin', 'git@github.com:zed-industries/zed.git')
+            executor = LocalExecutor(self.root)
+            with self.assertRaisesRegex(ValueError, 'upstream repository'):
+                prepare(executor, self.config, plan, push=True, github=True)
+            self.assertEqual(executor.commands, [])
+
+    def test_upstream_repository_cli_returns_nonzero(self):
+        target = self.upstream()
+        plan_path = Path(self.directory.name) / 'plan.json'
+        plan_path.write_text(json.dumps(self.plan(target)))
+        arguments = SimpleNamespace(command='prepare', dry_run=True, plan=str(plan_path), push=True, github=True)
+        with patch('riso_prepare.repository_root', return_value=self.root), patch.dict(os.environ, {'GH_REPO': 'zed-industries/zed'}), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(dispatch(arguments), 1)
+
+    def assert_fork_commands(self, executor):
+        commands = [command for command in executor.commands if command[0] == 'gh']
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn('--repo', command)
+            self.assertEqual(command[command.index('--repo') + 1], 'fork-owner/zed')
+            self.assertNotIn('zed-industries/zed', command)
+
+    def test_all_github_commands_target_fork_with_upstream_remote(self):
+        target = self.upstream()
+        executor = Executor(self.root, True)
+        with patch.dict(os.environ, {'GH_REPO': 'fork-owner/zed'}):
+            prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assertIn('upstream', git(self.root, 'remote').splitlines())
+        commands = [command for command in executor.commands if command[0] == 'gh']
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn('--repo', command)
+            self.assertEqual(command[command.index('--repo') + 1], 'fork-owner/zed')
+            self.assertNotIn('zed-industries/zed', command)
 
     def test_mirror_fast_forward_command_sequence(self):
         target = self.upstream()
@@ -182,8 +254,8 @@ class PrepareTests(unittest.TestCase):
         self.assertFalse(any(command[:2] == ['git', 'push'] for command in executor.commands))
         self.assertFalse(any(command[:3] == ['gh', 'pr', 'create'] for command in executor.commands))
         self.assertFalse(any('--auto' in command for command in executor.commands))
-        self.assertIn(['gh', 'label', 'create', 'riso-sync-blocked', '--force'], executor.commands)
-        self.assertIn(['gh', 'label', 'create', 'sync:L3', '--force'], executor.commands)
+        self.assertIn(['gh', 'label', 'create', 'riso-sync-blocked', '--force', '--repo', 'fork-owner/zed'], executor.commands)
+        self.assertIn(['gh', 'label', 'create', 'sync:L3', '--force', '--repo', 'fork-owner/zed'], executor.commands)
         self.assertIn(target, executor.last_body)
         self.assertIn(message, executor.last_body)
         self.assertEqual(git(self.root, 'status', '--porcelain'), '')
@@ -342,16 +414,16 @@ class PrepareTests(unittest.TestCase):
                 self.config.policy['shadow'] = shadow
                 executor = Executor(self.root, True)
                 publish_pull_request(executor, self.config, 'branch', 'title', 'body', level, eligible=eligible)
-                expected = ['gh', 'pr', 'merge', '--auto', '--merge', '<new-pr-number>'] if enabled else ['gh', 'pr', 'merge', '--disable-auto', '<new-pr-number>']
+                expected = ['gh', 'pr', 'merge', '--auto', '--merge', '<new-pr-number>', '--repo', 'fork-owner/zed'] if enabled else ['gh', 'pr', 'merge', '--disable-auto', '<new-pr-number>', '--repo', 'fork-owner/zed']
                 self.assertEqual(executor.commands[-1], expected)
-                self.assertIn(['gh', 'label', 'create', f'sync:L{level}', '--force'], executor.commands)
+                self.assertIn(['gh', 'label', 'create', f'sync:L{level}', '--force', '--repo', 'fork-owner/zed'], executor.commands)
 
     def test_existing_pr_edited(self):
         command = ('gh', 'pr', 'list', '--state', 'open', '--head', 'branch', '--base', 'riso/main', '--json', 'number')
         executor = LocalExecutor(self.root, {command: '[{"number": 9}]'})
         publish_pull_request(executor, self.config, 'branch', 'title', 'body', 1)
         self.assertTrue(any(command[:4] == ['gh', 'pr', 'edit', '9'] for command in executor.commands))
-        self.assertEqual(executor.commands[-1], ['gh', 'pr', 'merge', '--disable-auto', '9'])
+        self.assertEqual(executor.commands[-1], ['gh', 'pr', 'merge', '--disable-auto', '9', '--repo', 'fork-owner/zed'])
 
     def test_resolve_leaves_conflicts_then_finish_detects_markers(self):
         target = self.conflict()
@@ -377,11 +449,11 @@ class PrepareTests(unittest.TestCase):
         executor = Executor(self.root)
         response = SimpleNamespace(returncode=1, stderr='auto-merge is not enabled', stdout='')
         with patch('riso_prepare.subprocess.run', return_value=response):
-            executor.run('gh', 'pr', 'merge', '--disable-auto', '9', allowed_errors=('not enabled',))
+            executor.run('gh', 'pr', 'merge', '--disable-auto', '9', '--repo', 'fork-owner/zed', allowed_errors=('not enabled',))
         response.stderr = 'authentication failed'
         with patch('riso_prepare.subprocess.run', return_value=response):
             with self.assertRaisesRegex(RuntimeError, 'authentication failed'):
-                executor.run('gh', 'pr', 'merge', '--disable-auto', '9', allowed_errors=('not enabled',))
+                executor.run('gh', 'pr', 'merge', '--disable-auto', '9', '--repo', 'fork-owner/zed', allowed_errors=('not enabled',))
 
     def test_dry_run_blocker_issue_sequence(self):
         target = self.upstream()
@@ -420,6 +492,7 @@ class PrepareTests(unittest.TestCase):
         self.assertIn('token: ${{ steps.app-token.outputs.token }}', workflow)
         preparation = workflow.split('      - name: Prepare review requests\n', 1)[1].split('      - uses:', 1)[0]
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', preparation)
+        self.assertIn('GH_REPO: ${{ github.repository }}', preparation)
         self.assertNotIn('github.token', preparation)
         self.assertIn("git config user.name 'riso-tech-bot[bot]'", workflow)
         self.assertIn("git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'", workflow)
@@ -447,7 +520,7 @@ class PrepareTests(unittest.TestCase):
         prepare(executor, self.config, self.plan(target), push=True, github=True)
         self.assertEqual(git(self.root, 'rev-parse', 'HEAD'), before)
         self.assertEqual(git(self.root, 'status', '--porcelain'), '')
-        self.assertEqual(executor.commands, [
+        expected = [
             ['gh', 'pr', 'list', '--state', 'open', '--label', 'riso-sync-blocked', '--json', 'number'],
             ['gh', 'issue', 'list', '--state', 'open', '--label', 'riso-sync-blocked', '--json', 'number'],
             ['git', 'checkout', '-B', 'riso/sync/auto', before.strip()],
@@ -459,10 +532,12 @@ class PrepareTests(unittest.TestCase):
             ['gh', 'pr', 'list', '--state', 'open', '--head', 'riso/sync/auto', '--base', 'riso/main', '--json', 'number'],
             ['gh', 'pr', 'create', '--base', 'riso/main', '--head', 'riso/sync/auto',
              '--title', f'Sync upstream → {target[:7]} (L1)', '--label', 'riso-sync', '--label', 'sync:L1',
-             '--body-file', '<generated-body>'],
+             '--repo', 'fork-owner/zed', '--body-file', '<generated-body>'],
             ['gh', 'pr', 'view', 'riso/sync/auto', '--json', 'number', '--jq', '.number'],
             ['gh', 'pr', 'merge', '--disable-auto', '<new-pr-number>'],
-        ])
+        ]
+        expected = [command + ['--repo', 'fork-owner/zed'] if command[0] == 'gh' and '--repo' not in command else command for command in expected]
+        self.assertEqual(executor.commands, expected)
 
 
 if __name__ == '__main__':
