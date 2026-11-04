@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from riso_claude import stage_resolution, write_explain_context, write_resolve_context
+from riso_claude import REVIEW_SCHEMA, load_review, parse_review, stage_resolution, write_explain_context, write_resolve_context
 from riso_common import git, load_config
 
 
@@ -60,11 +60,13 @@ class ClaudeTests(unittest.TestCase):
         plan = {'commits': commits, 'auto': {'count': 2}, 'blocker': None}
         self.assertTrue(write_explain_context(self.root, plan, 'auto', self.context / 'auto'))
         self.assertEqual(sorted(path.name for path in (self.context / 'auto').iterdir()),
-                         sorted(['commits.json', 'prompt.md', relevant[:7] + '.patch']))
+                         sorted(['commits.json', 'prompt.md', 'schema.json', relevant[:7] + '.patch']))
+        self.assertEqual(json.loads((self.context / 'auto/schema.json').read_text()), REVIEW_SCHEMA)
         self.assertIn('relevant', (self.context / 'auto' / f'{relevant[:7]}.patch').read_text())
         self.assertEqual([commit['sha'] for commit in json.loads((self.context / 'auto/commits.json').read_text())], [relevant])
         prompt = (self.context / 'auto/prompt.md').read_text()
-        self.assertIn('do not re-assess', prompt)
+        self.assertIn('advisory', prompt)
+        self.assertIn('never change the level', prompt)
         self.assertIn('Vietnamese', prompt)
         self.assertFalse(write_explain_context(self.root, plan, 'blocked', self.context / 'blocked'))
         self.assertFalse((self.context / 'blocked/prompt.md').exists())
@@ -120,6 +122,29 @@ class ClaudeTests(unittest.TestCase):
         self.assertEqual(cargo_commands, [['cargo', 'update', '--workspace']])
         self.assertEqual((self.root / 'Cargo.lock').read_text(), 'upstream Cargo.lock\n')
         self.assertEqual(git(self.root, 'status', '--porcelain'), '')
+
+    def test_parse_review_reads_envelope_bare_object_and_fences(self):
+        review = {'commits': [{'short': '4ebf3eac14', 'verdict': 'review', 'reason': ' Kiểm tra Cargo.lock '},
+                              {'short': 'bad', 'verdict': 'merge it', 'reason': 'x'},
+                              {'short': 'nolabel', 'verdict': 'safe'}],
+                  'notes': ' Ghi chú '}
+        expected = {'notes': 'Ghi chú', 'verdicts': {'4ebf3ea': {'verdict': 'review', 'reason': 'Kiểm tra Cargo.lock'}}}
+        envelope = {'type': 'result', 'is_error': False, 'result': '', 'structured_output': review}
+        self.assertEqual(parse_review(json.dumps(envelope)), expected)
+        self.assertEqual(parse_review(json.dumps(review)), expected)
+        fenced = {'type': 'result', 'is_error': False, 'result': '```json\n' + json.dumps(review) + '\n```'}
+        self.assertEqual(parse_review(json.dumps(fenced)), expected)
+
+    def test_parse_review_drops_errors_and_keeps_plain_notes(self):
+        empty = {'notes': '', 'verdicts': {}}
+        self.assertEqual(parse_review(json.dumps({'type': 'result', 'is_error': True, 'result': 'Not logged in'})), empty)
+        self.assertEqual(parse_review('Chỉ có văn xuôi'), {'notes': 'Chỉ có văn xuôi', 'verdicts': {}})
+        self.assertEqual(parse_review(json.dumps({'type': 'result', 'is_error': False, 'result': 'Văn xuôi'})),
+                         {'notes': 'Văn xuôi', 'verdicts': {}})
+        self.assertEqual(parse_review(json.dumps([1, 2])), empty)
+        self.assertEqual(parse_review(json.dumps({'commits': 'oops', 'notes': 3})), empty)
+        self.assertEqual(load_review(str(self.context / 'missing.json')), empty)
+        self.assertEqual(load_review(None), empty)
 
 
 if __name__ == '__main__':

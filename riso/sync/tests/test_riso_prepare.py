@@ -52,8 +52,8 @@ class PrepareTests(unittest.TestCase):
         repository_environment.start()
         self.addCleanup(repository_environment.stop)
         renderers = SimpleNamespace(
-            render_auto_body=lambda plan, config: 'Bản đồng bộ tự động',
-            render_blocked_body=lambda plan, config: 'Bản đồng bộ bị chặn',
+            render_auto_body=lambda plan, config, verdicts=None: 'Bản đồng bộ tự động' + (f' {verdicts}' if verdicts else ''),
+            render_blocked_body=lambda plan, config, verdicts=None: 'Bản đồng bộ bị chặn' + (f' {verdicts}' if verdicts else ''),
             render_waiting_comment=lambda plan, number: f'Đang chờ #{number}',
         )
         renderer_patch = patch.dict(sys.modules, {'riso_report': renderers})
@@ -405,19 +405,37 @@ class PrepareTests(unittest.TestCase):
                     self.assertIn('resolve ' + target, executor.last_body)
                 git(self.root, 'checkout', 'product')
 
-    def test_explanations_are_appended_to_review_requests(self):
+    def test_claude_reviews_reach_the_report_and_notes(self):
         sys.modules['riso_report'].append_explanation = lambda body, text: f'{body}|{text}'
         target = self.upstream()
         executor = LocalExecutor(self.root)
+        verdicts = {'abc1234': {'verdict': 'safe', 'reason': 'ổn'}}
         prepare(executor, self.config, self.plan(target), push=True, github=True,
-                explanations={'auto': 'Ghi chú auto', 'blocked': ''})
-        self.assertEqual(executor.last_body, 'Bản đồng bộ tự động|Ghi chú auto')
+                reviews={'auto': {'notes': 'Ghi chú auto', 'verdicts': verdicts}, 'blocked': {'notes': '', 'verdicts': {}}})
+        self.assertEqual(executor.last_body, f'Bản đồng bộ tự động {verdicts}|Ghi chú auto')
         git(self.root, 'checkout', 'product')
         blocker = {'sha': self.upstream('file.txt', 'upstream\n'), 'level': 3, 'mechanical_conflicts': [], 'real_conflicts': []}
         executor = LocalExecutor(self.root)
         prepare(executor, self.config, self.plan(blocker=blocker), push=True, github=True,
-                explanations={'auto': '', 'blocked': 'Ghi chú blocked'})
+                reviews={'blocked': {'notes': 'Ghi chú blocked', 'verdicts': {}}})
         self.assertEqual(executor.last_body, 'Bản đồng bộ bị chặn|Ghi chú blocked')
+
+    def test_dry_run_prints_generated_bodies(self):
+        target = self.upstream()
+        executor = Executor(self.root, True)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            prepare(executor, self.config, self.plan(target), push=True, github=True)
+        self.assertIn('Bản đồng bộ tự động', output.getvalue())
+
+    def test_generated_bodies_reach_the_step_summary(self):
+        target = self.upstream()
+        summary = Path(self.directory.name) / 'summary.md'
+        with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}):
+            prepare(Executor(self.root, True), self.config, self.plan(target), push=True, github=True)
+        written = summary.read_text()
+        self.assertIn('<!-- pr create -->\nBản đồng bộ tự động', written)
+        self.assertEqual(written.count('Bản đồng bộ'), 1)
 
     def test_waiting_blocked_exits_before_git_mutation(self):
         for kind in ('pr', 'issue'):
@@ -508,7 +526,7 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(list(jobs), ['preflight', 'lint', 'adr-policy', 'clippy', 'build-and-test', 'ci-passed', 'notify-failure'])
         for name in ('lint', 'adr-policy', 'clippy', 'build-and-test'):
             block = jobs[name]
-            self.assertIn('    needs: preflight\n', block)
+            self.assertIn('    needs: preflight\n' if name in ('lint', 'adr-policy') else '    needs: [preflight, lint]\n', block)
             self.assertIn("    if: needs.preflight.outputs.run-checks == 'true'\n", block)
             self.assertIn('    permissions:\n      contents: read\n', block)
             self.assertNotIn(': write', block)

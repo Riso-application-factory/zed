@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -9,6 +10,26 @@ from riso_common import git, load_config, repository_root
 from riso_adr import apply_hooks_to_text, load_hooks
 
 CONFLICT_MARKERS = (b"<<<<<<<", b"|||||||", b">>>>>>>")
+VERDICTS = ("safe", "review", "risky")
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "commits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "short": {"type": "string"},
+                    "verdict": {"type": "string", "enum": list(VERDICTS)},
+                    "reason": {"type": "string"},
+                },
+                "required": ["short", "verdict", "reason"],
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["commits", "notes"],
+}
 
 
 def explain_commits(plan, scope):
@@ -23,8 +44,9 @@ def explain_commits(plan, scope):
 
 def explain_prompt(scope, directory, count):
     pull_request = "automatic sync pull request" if scope == "auto" else "blocked sync pull request, which a human must review"
-    return f"""You are writing reviewer notes for the {pull_request} that merges upstream zed-industries/zed commits into the riso fork of Zed.
-The pipeline has already classified every commit. Those levels are final: do not re-assess them and do not recommend whether to merge.
+    return f"""You are reviewing the {pull_request} that merges upstream zed-industries/zed commits into the riso fork of Zed.
+The pipeline has already classified every commit with deterministic rules and Jev. Those levels are final:
+your verdicts are advisory, are shown next to them, and never change the level or whether anything is merged.
 
 Read:
 - {directory}/commits.json: the {count} commit(s) at level 1 or higher in this pull request, with the deterministic reasons for each level.
@@ -32,10 +54,13 @@ Read:
 - riso/adr/*.md and riso/hooks.toml: the fork's customizations, the upstream code they rely on, and their contracts.
 - Any other repository file, to see the current fork code.
 
-Write in Vietnamese Markdown, at most about 400 words, with no title and no preamble:
-- For each commit, one short paragraph: what the upstream change does and how it affects the customization named in its reasons.
-- Then a bullet list of concrete things the reviewer should verify (files, behaviours, contracts).
-Print only these notes.
+Return JSON matching the provided schema:
+- "commits": one entry for every commit in commits.json, using its "short" value, with
+  "verdict" = "safe" (the customization keeps working unchanged), "review" (probably fine, but a human should check
+  something specific) or "risky" (the customization will likely break or need code changes), and
+  "reason" = one Vietnamese sentence naming the concrete file, symbol or contract behind the verdict.
+- "notes": Vietnamese Markdown, at most about 400 words, with no title: what the upstream changes do, how they affect
+  the customizations, and a bullet list of concrete things the reviewer should verify.
 """
 
 
@@ -51,7 +76,49 @@ def write_explain_context(root, plan, scope, directory):
     summary = [{name: commit[name] for name in ("sha", "short", "subject", "level", "adrs", "reasons")} for commit in commits]
     (directory / "commits.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     (directory / "prompt.md").write_text(explain_prompt(scope, directory, len(commits)))
+    (directory / "schema.json").write_text(json.dumps(REVIEW_SCHEMA))
     return True
+
+
+def parse_json(text):
+    text = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    try:
+        return json.loads(fenced.group(1) if fenced else text)
+    except ValueError:
+        return None
+
+
+def parse_review(text):
+    """Read Claude's review, from either the CLI's JSON envelope or the bare object, as notes plus verdicts by short SHA.
+
+    Claude's output is untrusted: anything malformed is dropped instead of failing the sync.
+    """
+    empty = {"notes": "", "verdicts": {}}
+    data = parse_json(text)
+    if isinstance(data, dict) and data.get("type") == "result":
+        if data.get("is_error"):
+            return empty
+        structured = data.get("structured_output")
+        data = structured if structured is not None else parse_json(str(data.get("result", ""))) or data.get("result")
+    if isinstance(data, str):
+        return {"notes": data.strip(), "verdicts": {}}
+    if not isinstance(data, dict):
+        return {"notes": text.strip(), "verdicts": {}} if data is None and text.strip() else empty
+    verdicts = {}
+    for item in data.get("commits") if isinstance(data.get("commits"), list) else []:
+        if (isinstance(item, dict) and isinstance(item.get("short"), str) and item.get("verdict") in VERDICTS
+                and isinstance(item.get("reason"), str)):
+            verdicts[item["short"].strip()[:7]] = {"verdict": item["verdict"], "reason": item["reason"].strip()}
+    notes = data.get("notes")
+    return {"notes": notes.strip() if isinstance(notes, str) else "", "verdicts": verdicts}
+
+
+def load_review(path):
+    """Load an optional review file; a missing file means the explain job was skipped or Claude failed."""
+    if not path or not Path(path).is_file():
+        return {"notes": "", "verdicts": {}}
+    return parse_review(Path(path).read_text())
 
 
 def conflicted_paths(root):

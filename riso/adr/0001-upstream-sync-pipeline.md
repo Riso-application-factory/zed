@@ -35,9 +35,11 @@ The pipeline opens an auto prefix PR and stops at the first L3/L4 blocker. L2 wa
 human review under the initial L1 auto-merge threshold. Shadow mode is enabled initially:
 PRs are opened but auto-merge is never enabled until shadow mode is deliberately disabled.
 
-Claude Code has two generative roles. It writes reviewer notes for the auto and blocked PRs
-from the level 1+ commits, the ADRs and the upstream patches; the notes are appended to the
-deterministic report and never change levels or auto-merge eligibility. When a blocker merge
+Claude Code has two generative roles. It reviews the level 1+ commits of the auto and blocked
+PRs from the ADRs and the upstream patches, returning an advisory verdict per commit and
+reviewer notes; the report shows one table of every commit with the rule level, Jev's decision,
+Claude's verdict, the final level and the action, followed by the notes. Claude's output is
+advisory only and never changes levels or auto-merge eligibility. When a blocker merge
 has real conflicts, it edits only the conflicted files; deterministic code then rejects any
 remaining marker or any other change, regenerates Cargo.lock, re-applies hooks, adds the
 README review marker and opens an L3 blocked PR that a human must review. Claude runs in
