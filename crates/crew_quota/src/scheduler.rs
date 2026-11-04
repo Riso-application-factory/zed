@@ -199,7 +199,10 @@ impl Scheduler {
         self.scopes
             .values()
             .filter(|state| {
-                !state.in_flight && !state.suspended && state.provider == ProviderId::Codex
+                !state.in_flight
+                    && !state.suspended
+                    && (state.provider == ProviderId::Codex
+                        || (state.provider == ProviderId::Claude && state.demand_until > now))
             })
             .map(|state| {
                 let due = Self::next_for(state, now, monotonic);
@@ -223,7 +226,8 @@ impl Scheduler {
         for state in self.scopes.values_mut() {
             if !state.in_flight
                 && !state.suspended
-                && state.provider == ProviderId::Codex
+                && (state.provider == ProviderId::Codex
+                    || (state.provider == ProviderId::Claude && state.demand_until > now))
                 && Self::next_for(state, now, monotonic) <= now
             {
                 state.queued_at.get_or_insert(now);
@@ -237,7 +241,8 @@ impl Scheduler {
             .filter(|(_, state)| {
                 !state.in_flight
                     && !state.suspended
-                    && state.provider == ProviderId::Codex
+                    && (state.provider == ProviderId::Codex
+                        || (state.provider == ProviderId::Claude && state.demand_until > now))
                     && Self::next_for(state, now, monotonic) <= now
                     && state.last_monotonic.is_none_or(|attempt| {
                         monotonic.saturating_sub(attempt) >= Self::floor(state.provider)
@@ -256,7 +261,21 @@ impl Scheduler {
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(_, aged, active, order)| (!aged, !active, *order));
         let mut started = Vec::new();
+        let mut billable = self
+            .scopes
+            .values()
+            .any(|state| state.in_flight && state.provider == ProviderId::Claude);
         for (scope, _, _, _) in candidates.into_iter().take(MAX_QUEUE).take(available) {
+            if self
+                .scopes
+                .get(&scope)
+                .is_some_and(|state| state.provider == ProviderId::Claude)
+            {
+                if billable {
+                    continue;
+                }
+                billable = true;
+            }
             if let Some(state) = self.scopes.get_mut(&scope) {
                 state.queued_at = None;
                 state.in_flight = true;

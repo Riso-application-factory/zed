@@ -232,3 +232,149 @@ pub fn decode_attempt(
     }
     Ok(record)
 }
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeWindow {
+    pub utilization: Option<f64>,
+    pub resets_at: Option<i64>,
+    pub status: Option<ClaudeAdmission>,
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeAdmission {
+    Allowed,
+    AllowedWarning,
+    Rejected,
+}
+
+impl From<ClaudeAdmission> for Admission {
+    fn from(value: ClaudeAdmission) -> Self {
+        match value {
+            ClaudeAdmission::Allowed => Self::Allowed,
+            ClaudeAdmission::AllowedWarning => Self::Warning,
+            ClaudeAdmission::Rejected => Self::Exhausted,
+        }
+    }
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeRateLimit {
+    #[serde(flatten)]
+    pub representative: ClaudeWindow,
+    pub rate_limit_type: Option<String>,
+    pub unified_windows: Option<ClaudeWindows>,
+    pub overage_status: Option<ClaudeAdmission>,
+    pub overage_resets_at: Option<i64>,
+}
+
+#[derive(Default, serde::Deserialize)]
+pub struct ClaudeWindows {
+    pub five_hour: Option<ClaudeWindow>,
+    pub seven_day: Option<ClaudeWindow>,
+}
+
+pub fn normalize_claude(
+    data: ClaudeRateLimit,
+    scope: &str,
+    generation: u64,
+    source: SourceKind,
+    observed_at: Timestamp,
+    sequence: u64,
+) -> Result<Observation, ErrorCode> {
+    let explicit = data.unified_windows.unwrap_or_default();
+    let representative = data.rate_limit_type.as_deref();
+    let mut windows = Vec::new();
+    for (name, duration, wire) in [
+        (
+            "five_hour",
+            Some(18000),
+            explicit.five_hour.or_else(|| {
+                (representative == Some("five_hour")).then(|| ClaudeWindow {
+                    utilization: data.representative.utilization,
+                    resets_at: data.representative.resets_at,
+                    status: data.representative.status,
+                })
+            }),
+        ),
+        (
+            "seven_day",
+            Some(604800),
+            explicit.seven_day.or_else(|| {
+                (representative == Some("seven_day")).then(|| ClaudeWindow {
+                    utilization: data.representative.utilization,
+                    resets_at: data.representative.resets_at,
+                    status: data.representative.status,
+                })
+            }),
+        ),
+        (
+            "overage",
+            None,
+            (data.overage_status.is_some() || data.overage_resets_at.is_some()).then_some(
+                ClaudeWindow {
+                    utilization: None,
+                    resets_at: data.overage_resets_at,
+                    status: data.overage_status,
+                },
+            ),
+        ),
+    ] {
+        let Some(wire) = wire else {
+            continue;
+        };
+        if wire
+            .utilization
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+            || wire.resets_at.is_some_and(|reset| reset < 0)
+        {
+            return Err(ErrorCode::InvalidData);
+        }
+        windows.push(WindowPatch {
+            key: WindowKey {
+                bucket: BucketKey {
+                    scope: scope.into(),
+                    bucket: name.into(),
+                    applicability: Applicability::AllModels,
+                },
+                role: "base".into(),
+                duration_seconds: duration,
+            },
+            used_fraction: wire
+                .utilization
+                .map_or(Patch::Missing, |value| Patch::Set(Some(value))),
+            reset_at: wire
+                .resets_at
+                .map_or(Patch::Missing, |value| Patch::Set(Some(value))),
+            admission: wire
+                .status
+                .map_or(Patch::Missing, |value| Patch::Set(value.into())),
+            remaining: Patch::Missing,
+            limit: Patch::Missing,
+            disabled: Patch::Missing,
+            precision: Precision::Fraction,
+        });
+    }
+    let observation = Observation {
+        scope: scope.into(),
+        generation,
+        source,
+        source_version: "claude-unified-v1".into(),
+        observed_at,
+        provider_sample_at: None,
+        sequence,
+        start_sequence: None,
+        complete: windows
+            .iter()
+            .any(|window| window.key.bucket.bucket == "five_hour")
+            && windows
+                .iter()
+                .any(|window| window.key.bucket.bucket == "seven_day"),
+        windows,
+        metadata: Default::default(),
+    };
+    validate_observation(&observation, observed_at)?;
+    Ok(observation)
+}

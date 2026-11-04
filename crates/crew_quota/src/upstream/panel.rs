@@ -371,7 +371,7 @@ impl Panel for QuotaPanel {
                         max_age: Duration::from_secs(120),
                         required_measurements: vec![],
                         deadline: now + 180,
-                        allow_inference: false,
+                        allow_inference: true,
                     },
                     cx,
                 )
@@ -490,7 +490,16 @@ fn age(updated: Option<Timestamp>, now: Timestamp) -> String {
 fn account_status(account: &AccountState, now: Timestamp) -> String {
     let availability = match account.availability {
         Availability::Unknown => "Unknown",
+        Availability::Unsupported(ErrorCode::StoredAuthUnsupported) => {
+            "Stored OAuth unsupported — use producer shell login"
+        }
         Availability::Unsupported(_) => "Unsupported",
+        Availability::Unavailable(ErrorCode::StoredAuthUnsupported) => {
+            "Stored OAuth unsupported — use producer shell login"
+        }
+        Availability::Unavailable(ErrorCode::InferenceAccess) => {
+            "Probe access unavailable — listening for session updates"
+        }
         Availability::NotInstalled => "Not installed",
         Availability::NotLoggedIn => "Not logged in",
         Availability::Unavailable(_) => "Unavailable",
@@ -516,13 +525,18 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
     }) {
         states.push("Stale");
     }
-    if account.windows.values().any(|window| {
-        used_fraction(window).is_some_and(|used| used >= 1.)
-            || window
-                .admission
-                .as_ref()
-                .is_some_and(|value| value.value == Admission::Exhausted)
-    }) {
+    if account
+        .windows
+        .values()
+        .filter(|window| window.key.bucket.bucket != "overage")
+        .any(|window| {
+            used_fraction(window).is_some_and(|used| used >= 1.)
+                || window
+                    .admission
+                    .as_ref()
+                    .is_some_and(|value| value.value == Admission::Exhausted)
+        })
+    {
         states.push("Exhausted");
     }
     if states.is_empty() && account.windows.is_empty() {
@@ -720,11 +734,13 @@ impl Render for QuotaPanel {
                     statuses.insert("Disabled bucket".into());
                 }
                 if row.accounts.is_empty() {
-                    statuses.insert(if provider_id == ProviderId::Codex {
-                        "Unknown".into()
-                    } else {
-                        "Unsupported · source pending".into()
-                    });
+                    statuses.insert(
+                        if matches!(provider_id, ProviderId::Codex | ProviderId::Claude) {
+                            "Unknown".into()
+                        } else {
+                            "Unsupported · source pending".into()
+                        },
+                    );
                 }
                 provider = provider
                     .child(
@@ -754,7 +770,7 @@ impl Render for QuotaPanel {
             }
             if row.accounts.is_empty() {
                 provider = provider.child(badge(
-                    if row.provider == ProviderId::Codex {
+                    if matches!(row.provider, ProviderId::Codex | ProviderId::Claude) {
                         "Unknown"
                     } else {
                         "Unsupported · source pending"
@@ -779,9 +795,21 @@ impl Render for QuotaPanel {
                     );
                 }
                 account_header = account_header.child(
-                    Label::new(age(account.last_success_at, now))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    Label::new(
+                        if account.scope.provider == ProviderId::Claude
+                            && account
+                                .windows
+                                .values()
+                                .filter_map(|window| window.used_fraction.as_ref())
+                                .any(|sample| sample.source == SourceKind::Persisted)
+                        {
+                            "Cached · age unknown".into()
+                        } else {
+                            age(account.last_success_at, now)
+                        },
+                    )
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
                 );
                 provider = provider.child(account_header);
                 let status = account_status(account, now);
@@ -925,13 +953,21 @@ impl Render for QuotaPanel {
                                     .map(|reset| reset.to_rfc3339())
                                     .unwrap_or_else(|| "unknown".into()),
                                 window.precision,
-                                age(
-                                    window
-                                        .used_fraction
-                                        .as_ref()
-                                        .map(|sample| sample.observed_at),
-                                    now
-                                )
+                                if window
+                                    .used_fraction
+                                    .as_ref()
+                                    .is_some_and(|sample| sample.source == SourceKind::Persisted)
+                                {
+                                    "Cached · age unknown".into()
+                                } else {
+                                    age(
+                                        window
+                                            .used_fraction
+                                            .as_ref()
+                                            .map(|sample| sample.observed_at),
+                                        now,
+                                    )
+                                }
                             ))),
                     );
                 }

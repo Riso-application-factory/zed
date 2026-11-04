@@ -119,6 +119,8 @@ pub enum ErrorCode {
     UnsupportedVersion,
     UnsupportedPlatform,
     CleanupFailed,
+    InferenceAccess,
+    StoredAuthUnsupported,
     Unknown,
 }
 

@@ -4192,13 +4192,17 @@ dependencies = [
 name = "crew_quota"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
+ "agent_servers",
  "anyhow",
+ "async-channel 2.5.0",
  "async-process",
  "chrono",
  "db",
  "fs",
  "futures 0.3.34",
  "gpui",
+ "http_client",
  "libc",
  "log",
  "node_runtime",
@@ -4208,6 +4212,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "sha2",
  "smol",
  "tempfile",
  "theme",

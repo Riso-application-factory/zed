@@ -1,15 +1,15 @@
 +++
 id = "ADR-0004"
-title = "Crew quota service, Codex source and dock panel"
+title = "Crew quota service, Codex and Claude sources and dock panel"
 status = "proposed"
 review = "human"
-intent = "Provide an app-wide attributed, freshness-aware quota API and a non-generative installed Codex source."
+intent = "Provide an app-wide attributed, freshness-aware quota API with installed Codex reads and Claude passive updates plus demand-driven inference probes."
 owns = ["crates/crew_quota/**"]
 patches = ["Cargo.toml", "Cargo.lock", "crates/zed/Cargo.toml"]
 hooks = ["crew-quota-init"]
-watch = ["crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs", "crates/workspace/src/dock.rs", "crates/ui/src/components/button/button_like.rs", "crates/ui/src/components/button/icon_button.rs", "crates/gpui/src/elements/div.rs"]
-relies_on = ["ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available", "Workspace observe_new receives its creation window before asynchronous dock restoration completes", "Workspace add_panel restores width through the stable panel_key", "Dock panel activation priorities must be unique; Crew quota reserves 100", "Dock relocation observes SettingsStore changes; Crew defers a SettingsStore pulse after changing its own KVP preference"]
-contracts = ["cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
+watch = ["crates/acp_thread/src/acp_thread.rs", "crates/acp_thread/src/connection.rs", "crates/agent_servers/src/acp/v1.rs", "crates/agent_servers/src/acp/v2.rs", "crates/agent_servers/src/acp/debug_log.rs", "crates/http_client/src/http_client.rs", "crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs", "crates/workspace/src/dock.rs", "crates/ui/src/components/button/button_like.rs", "crates/ui/src/components/button/icon_button.rs", "crates/gpui/src/elements/div.rs"]
+relies_on = ["AcpThread exposes local project, agent connection and session ID; defer avoids entity reentry", "Both concrete ACP connections expose subscribe_debug_messages with timestamp-free backlog and a live receiver", "Default registry claude-acp without env, args or config overrides shares the ProjectEnvironment shell-OAuth login with the probe; overridden or custom connections remain isolated", "Scope keys hash only env key names and nonsecret configuration flags, never secret values; residual risk: project-local environment or login changes may differ from the hidden project without an explicit upstream auth identity", "Claude ACP rateLimit utilization is a consumed fraction and resetsAt is Unix seconds; unifiedWindows takes precedence over representative fields", "Claude tiny Haiku messages probe uses fixed OAuth headers and max_tokens 1; stored credentials are presence-detected only and unsupported", "ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available", "Workspace observe_new receives its creation window before asynchronous dock restoration completes", "Workspace add_panel restores width through the stable panel_key", "Dock panel activation priorities must be unique; Crew quota reserves 100", "Dock relocation observes SettingsStore changes; Crew defers a SettingsStore pulse after changing its own KVP preference"]
+contracts = ["cargo test -p crew_quota upstream::claude", "cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
 obsolete_if = "Upstream supplies an app-wide attributed quota service with equivalent freshness, persistence, scheduling and Codex account read contracts."
 superseded_by = ""
 +++
@@ -55,8 +55,7 @@ Unknown JSON-RPC errors are safe codes, not automatically authentication failure
 
 Schedule at two minutes with demand and fifteen minutes idle, with provider
 floors, account single flight, two external operations, backoff and reset alarms.
-Grok remains passive only, with no probes or probe budget. Claude and Antigravity
-source implementations are deferred. A consumer asking for broader coverage than
+Grok remains passive only, with no probes or probe budget. Antigravity source implementation remains deferred. A consumer asking for broader coverage than
 the producer proves receives Partial, never a fabricated Fresh account.
 
 Persist bounded schema-v1 sanitized records and attempt guards in `crew_quota`
@@ -147,3 +146,39 @@ The existing `SignalHigh` icon provides four rising usage bars for the dock
 button. No upstream icon list or assets change. Detailed/Compact and
 Remaining/Used use paired, labeled icon toggles beside Refresh on one header
 row, including at the panel minimum width of 280 px.
+
+## Claude source
+
+Observe local Claude threads after their entity update, downcast v1/v2 concrete
+connections and drain one public debug feed per connection. Exact known session
+IDs and incoming usage_update envelopes gate a bounded field allowlist; context
+usage, model labels, unrelated traffic and unknown fields are discarded. Backlog
+uses persisted provenance and cannot freshen windows. Live events and Haiku
+headers share one fraction/epoch normalizer, with independent 5h, 7d and overage
+status; overage rejection does not exhaust the base allowance.
+
+Default configured registry claude-acp without environment, argument or config
+overrides shares the shell-OAuth probe scope. Custom/overridden/unknown origins
+receive isolated connection scopes, keyed by nonsecret configuration flags and
+environment key names, never secret values. This deliberately assumes matching
+ProjectEnvironment login for default connections; project-local environments and
+external login changes remain an attribution risk without a producer identity.
+Settings/inventory changes invalidate generations; old connection generations
+cannot repopulate new login data. No token fingerprint is retained.
+
+Probe only with inference-enabled demand and stale 5h/7d coverage, at most one
+billable operation and two external operations globally. Human task instructions
+restrict this commit to demand-driven probes, overriding the design's idle
+maintenance proposal. Preserve durable attempt-start floors, HTTP Retry-After,
+exponential backoff and rejected-window reset on 429. Retain 429 windows while
+recording refresh failure. HTTP 400/401/403 latch inference access; no model,
+auth or immediate retry fallback. Request is the exact validated Haiku one-token
+body, fixed endpoint and headers, redirects rejected, 30-second deadline, and
+1 MiB response cap; generated content is discarded in chunks.
+
+Only ProjectEnvironment CLAUDE_CODE_OAUTH_TOKEN is supported. Never launch a fresh
+shell per refresh. Detect the exact config directory credentials-file presence
+and macOS Keychain item metadata without reading passwords; stored OAuth is
+explicitly unsupported pending a validated scoped credential-reader contract.
+No credential writes, renewal, login UI or live test network calls are made.
+Codex auth-file invalidation affects only Codex and preserves Claude access latches.

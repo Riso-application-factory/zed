@@ -1,3 +1,4 @@
+mod claude;
 mod panel;
 mod providers;
 
@@ -110,6 +111,7 @@ impl Drop for DemandLease {
     }
 }
 struct Demand {
+    allow_inference: bool,
     selector: Selector,
     until: Rc<Cell<Timestamp>>,
     active: Rc<Cell<bool>>,
@@ -132,6 +134,7 @@ pub struct QuotaService {
     _writer: Task<()>,
     pending_persistence: BTreeMap<String, Task<()>>,
     _inventory: Option<Task<()>>,
+    claude: claude::ClaudeState,
     _auth_watcher: Option<Task<()>>,
     auth_path: Option<std::path::PathBuf>,
     _project: Option<Entity<Project>>,
@@ -211,6 +214,7 @@ impl QuotaService {
             _writer: writer,
             pending_persistence: BTreeMap::new(),
             _inventory: None,
+            claude: Default::default(),
             _auth_watcher: None,
             auth_path: None,
             _project: None,
@@ -241,6 +245,7 @@ impl QuotaService {
             .min(self.ports.clock.now().saturating_add(300));
         let until = Rc::new(Cell::new(until));
         self.demands.push(Demand {
+            allow_inference: request.allow_inference,
             selector: request.selector,
             until: until.clone(),
             active: active.clone(),
@@ -297,7 +302,9 @@ impl QuotaService {
             let Some(state) = self.scheduler.scopes.get(&scope) else {
                 return Task::ready(Err(RefreshError::Unknown));
             };
-            if state.provider != ProviderId::Codex {
+            if state.provider != ProviderId::Codex
+                && (state.provider != ProviderId::Claude || !request.allow_inference)
+            {
                 return Task::ready(Err(RefreshError::NotRefreshable));
             }
             if let Some(task) = self.tasks.get(&scope) {
@@ -384,6 +391,7 @@ impl QuotaService {
         observation: Observation,
         cx: &mut Context<Self>,
     ) -> Result<(), ErrorCode> {
+        let live = observation.source != SourceKind::Persisted;
         let scope = observation.scope.clone();
         let previous_availability = self
             .core
@@ -404,7 +412,7 @@ impl QuotaService {
             {
                 cx.emit(QuotaEvent::AvailabilityChanged(scope.clone()));
             }
-            if !changed.is_empty() {
+            if live && !changed.is_empty() {
                 self.scheduler.passive(
                     &scope,
                     self.ports.clock.now(),
@@ -452,19 +460,35 @@ impl QuotaService {
     }
 
     fn invalidate_auth(&mut self, cx: &mut Context<Self>) {
-        for (_, handle) in std::mem::take(&mut self.cancellations) {
-            handle.abort();
+        let scopes: Vec<_> = self
+            .core
+            .snapshot
+            .accounts
+            .values()
+            .filter(|account| account.scope.provider == ProviderId::Codex)
+            .map(|account| account.scope.id.clone())
+            .collect();
+        for scope in &scopes {
+            if let Some(handle) = self.cancellations.remove(scope) {
+                handle.abort();
+            }
+            self.tasks.remove(scope);
         }
-        self.tasks.clear();
-        let scopes = self.core.snapshot.accounts.keys().cloned().collect();
         let windows = self
             .core
             .snapshot
             .accounts
             .values()
+            .filter(|account| account.scope.provider == ProviderId::Codex)
             .flat_map(|account| account.windows.keys().cloned())
             .collect();
-        for account in self.core.snapshot.accounts.values_mut() {
+        for account in self
+            .core
+            .snapshot
+            .accounts
+            .values_mut()
+            .filter(|account| account.scope.provider == ProviderId::Codex)
+        {
             account.generation = account.generation.saturating_add(1);
             account.windows.clear();
             account.metadata = AccountMetadata::default();
@@ -559,17 +583,29 @@ impl QuotaService {
             state.demand_until = 0;
         }
         for demand in &self.demands {
-            for account in self
-                .core
-                .snapshot
-                .accounts
-                .values()
-                .filter(|account| demand.selector.matches(&account.scope))
-            {
+            for account in self.core.snapshot.accounts.values().filter(|account| {
+                demand.selector.matches(&account.scope)
+                    && (account.scope.provider != ProviderId::Claude || demand.allow_inference)
+            }) {
                 self.scheduler.demand(&account.scope.id, demand.until.get());
             }
         }
         for account in self.core.snapshot.accounts.values() {
+            if account.scope.provider == ProviderId::Claude {
+                let fresh = ["five_hour", "seven_day"].iter().all(|bucket| {
+                    account.windows.values().any(|window| {
+                        window.key.bucket.bucket == *bucket
+                            && window.freshness(now, Duration::from_secs(120)) == Freshness::Fresh
+                    })
+                });
+                if fresh {
+                    if let Some(schedule) = self.scheduler.scopes.get_mut(&account.scope.id) {
+                        schedule.demand_until = 0;
+                    }
+                } else {
+                    self.scheduler.force(&account.scope.id);
+                }
+            }
             let reset = account
                 .windows
                 .values()
@@ -702,12 +738,16 @@ impl QuotaService {
                 .apply(observation, now)
                 .map_err(RefreshError::Failed)
         });
+        let retry_at = match &result {
+            Err(RefreshError::Deferred { retry_at }) => Some(*retry_at),
+            _ => None,
+        };
         self.scheduler.complete(
             scope,
             now,
             self.ports.clock.monotonic(),
             result.is_ok(),
-            None,
+            retry_at,
         );
         if let Some(account) = self.core.snapshot.accounts.get_mut(scope) {
             account.refresh = match &result {
@@ -725,6 +765,19 @@ impl QuotaService {
                         schedule.suspended = true;
                     }
                     RefreshState::Suspended(ErrorCode::CleanupFailed)
+                }
+                Err(RefreshError::Failed(
+                    code @ (ErrorCode::InferenceAccess | ErrorCode::StoredAuthUnsupported),
+                )) => {
+                    account.availability = if *code == ErrorCode::StoredAuthUnsupported {
+                        Availability::Unsupported(*code)
+                    } else {
+                        Availability::Unavailable(*code)
+                    };
+                    if let Some(schedule) = self.scheduler.scopes.get_mut(scope) {
+                        schedule.suspended = true;
+                    }
+                    RefreshState::Suspended(*code)
                 }
                 Err(RefreshError::UnsupportedPlatform) => {
                     account.availability =
@@ -788,6 +841,9 @@ impl QuotaSource for CodexSource {
         start_sequence: u64,
         cx: &mut App,
     ) -> Task<Result<Observation, RefreshError>> {
+        if scope.starts_with("claude-") {
+            return claude::refresh(self.project.clone(), scope, generation, start_sequence, cx);
+        }
         let project = self.project.clone();
         let node_runtime = self.node_runtime.clone();
         let fs = self.fs.clone();
@@ -937,6 +993,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     });
     cx.set_global(GlobalQuota(service.clone()));
     panel::init(cx);
+    claude::init(&service, &project, cx);
     service.update(cx, |service, _| service._project = Some(project.clone()));
     let subscription = cx.subscribe(&store, {
         let service = service.downgrade();
@@ -972,13 +1029,22 @@ fn sync_inventory(
             .map(|agent| agent.install_status(cx))
     });
     let Some(status) = status else {
-        for (_, handle) in std::mem::take(&mut service.cancellations) {
-            handle.abort();
+        let scopes: Vec<_> = service
+            .core
+            .snapshot
+            .accounts
+            .values()
+            .filter(|account| account.scope.provider == ProviderId::Codex)
+            .map(|account| account.scope.id.clone())
+            .collect();
+        for scope in &scopes {
+            if let Some(handle) = service.cancellations.remove(scope) {
+                handle.abort();
+            }
+            service.tasks.remove(scope);
+            service.core.snapshot.accounts.remove(scope);
+            service.scheduler.scopes.remove(scope);
         }
-        service.tasks.clear();
-        let scopes = service.core.snapshot.accounts.keys().cloned().collect();
-        service.core.snapshot.accounts.clear();
-        service.scheduler.scopes.clear();
         service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
         service.finish_init(Ok(()));
         cx.emit(QuotaEvent::Changed {
@@ -1504,5 +1570,74 @@ mod tests {
             );
         });
         assert_eq!(source.calls.get(), 0);
+    }
+    #[gpui::test]
+    async fn claude_inference_failure_latches_after_fake_http_response(cx: &mut TestAppContext) {
+        let (service, _, source, _) = harness(cx);
+        let client = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::Response::builder()
+                .status(403)
+                .body(http_client::AsyncBody::empty())?)
+        });
+        let failure = claude::probe(client, "fake-token".into(), "scope", 1, 0)
+            .await
+            .map(|(observation, _)| observation);
+        service.update(cx, |service, cx| {
+            service
+                .core
+                .snapshot
+                .accounts
+                .get_mut("scope")
+                .expect("scope")
+                .scope
+                .provider = ProviderId::Claude;
+            service
+                .scheduler
+                .track("scope".into(), ProviderId::Claude, 1);
+            assert_eq!(
+                service.complete("scope", 1, failure, cx),
+                Err(RefreshError::Failed(ErrorCode::InferenceAccess))
+            );
+            service.scheduler.force("scope");
+            service.evaluate(cx);
+            assert!(service.scheduler.scopes["scope"].suspended);
+        });
+        cx.run_until_parked();
+        assert_eq!(source.calls.get(), 0);
+    }
+    #[gpui::test]
+    fn codex_auth_change_preserves_claude_generation_and_latch(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            service
+                .core
+                .inventory(
+                    AccountScope {
+                        id: "claude-test".into(),
+                        provider: ProviderId::Claude,
+                        runtime: "local".into(),
+                        identity_known: false,
+                    },
+                    7,
+                    Availability::Unavailable(ErrorCode::InferenceAccess),
+                )
+                .expect("inventory");
+            service
+                .scheduler
+                .track("claude-test".into(), ProviderId::Claude, 7);
+            service
+                .scheduler
+                .scopes
+                .get_mut("claude-test")
+                .expect("schedule")
+                .suspended = true;
+            service.invalidate_auth(cx);
+            assert_eq!(service.core.snapshot.accounts["claude-test"].generation, 7);
+            assert_eq!(
+                service.core.snapshot.accounts["claude-test"].availability,
+                Availability::Unavailable(ErrorCode::InferenceAccess)
+            );
+            assert!(service.scheduler.scopes["claude-test"].suspended);
+        });
     }
 }

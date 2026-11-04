@@ -94,6 +94,13 @@ impl QuotaCore {
                     return false;
                 };
                 if let Some(previous) = destination {
+                    if matches!(
+                        observation.source,
+                        SourceKind::ClaudeAcpEvent | SourceKind::ClaudeHeaderProbe
+                    ) && observation.at < previous.observed_at
+                    {
+                        return false;
+                    }
                     if observation.source == SourceKind::Persisted
                         && previous.source != SourceKind::Persisted
                     {
