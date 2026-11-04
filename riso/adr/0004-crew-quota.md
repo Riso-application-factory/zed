@@ -123,7 +123,7 @@ sources remain explicit and cached data retains stale/error labels. A workspace
 created without a window attaches on its first window render through a deferred
 action renderer; the usual creation-window path remains synchronous.
 
-A later commit adds the separate provider-summary status bar. Display defaults are Detailed/Remaining for the panel and
+The existing workspace observer also attaches a provider-summary status bar. It reads the panel snapshot and shared Used/Remaining preference without acquiring demand or starting a provider timer. The panel header and ToggleStatusSummary action persist visibility in Crew KVP. Provider chips open or focus the panel, show per-window tooltips and reset countdowns at 80% used; narrow windows collapse trailing providers into a worst-severity +N summary. The debug fixture is shared with the footer. Display defaults are Detailed/Remaining for the panel and
 Compact/Remaining for the status bar, with used-fraction colors at 60/80.
 
 ## Merge notes

@@ -8,7 +8,17 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-actions!(crew_quota, [ToggleFocus, RefreshQuota]);
+actions!(
+    crew_quota,
+    [
+        ToggleFocus,
+        RefreshQuota,
+        ToggleStatusSummary,
+        OpenQuotaSummary
+    ]
+);
+
+mod status;
 
 #[cfg(debug_assertions)]
 mod preview;
@@ -21,6 +31,7 @@ struct Preferences {
     left: bool,
     compact: bool,
     used: bool,
+    hide_status: bool,
     collapsed: BTreeSet<ProviderId>,
 }
 
@@ -102,6 +113,16 @@ fn register_workspace(
     window: Option<&mut Window>,
     cx: &mut Context<Workspace>,
 ) {
+    workspace.register_action(|workspace, _: &OpenQuotaSummary, window, cx| {
+        workspace.focus_panel::<QuotaPanel>(window, cx);
+    });
+    workspace.register_action(|_, _: &ToggleStatusSummary, _, cx| {
+        let preferences = cx.global::<GlobalPreferences>().0.clone();
+        preferences.update(cx, |preferences, cx| {
+            preferences.value.hide_status = !preferences.value.hide_status;
+            preferences.save(cx);
+        });
+    });
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<QuotaPanel>(window, cx);
     });
@@ -133,7 +154,8 @@ fn register_workspace(
     // Construct without reading Workspace again: observe_new already holds its mutable borrow.
     if let Some(window) = window {
         let panel = cx.new(QuotaPanel::new);
-        workspace.add_panel(panel, window, cx);
+        workspace.add_panel(panel.clone(), window, cx);
+        status::attach(workspace, panel, window, cx);
     } else {
         // A windowless workspace can acquire a window later; attach on its first render.
         workspace.register_action_renderer(|element, workspace, window, cx| {
@@ -141,7 +163,8 @@ fn register_workspace(
                 cx.defer_in(window, |workspace, window, cx| {
                     if workspace.panel::<QuotaPanel>(cx).is_none() {
                         let panel = cx.new(QuotaPanel::new);
-                        workspace.add_panel(panel, window, cx);
+                        workspace.add_panel(panel.clone(), window, cx);
+                        status::attach(workspace, panel, window, cx);
                     }
                 });
             }
@@ -1006,6 +1029,14 @@ impl Render for QuotaPanel {
             content = content.child(provider);
         }
         let controls = h_flex()
+            .child(
+                IconButton::new("quota-status-visibility", IconName::SignalHigh)
+                    .toggle_state(!self.preferences.read(cx).value.hide_status)
+                    .tooltip(Tooltip::text("Show quota in status bar"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleStatusSummary), cx)
+                    }),
+            )
             .id("quota-header-controls")
             .debug_selector(|| "quota-header-controls".into())
             .gap_1()
@@ -1168,7 +1199,7 @@ impl Render for QuotaPanel {
 mod tests {
     use super::*;
 
-    struct InertPorts;
+    pub(super) struct InertPorts;
     impl QuotaStore for InertPorts {
         fn load(&self, _: String, _: &App) -> Task<Result<Option<String>, ErrorCode>> {
             Task::ready(Ok(None))
