@@ -291,15 +291,20 @@ impl StoredRecord {
         self.consecutive_failures = 0;
     }
 
-    fn backoff_until(&self) -> Option<DateTime<Utc>> {
-        if self.consecutive_failures == 0 {
+    fn backoff_until(&self, launch_failures: u32) -> Option<DateTime<Utc>> {
+        if launch_failures == 0 {
             return None;
         }
         let attempt = self.last_attempt.as_ref()?;
-        let exponent = self.consecutive_failures.saturating_sub(1).min(16);
+        let exponent = launch_failures.saturating_sub(1).min(16);
+        let maximum_delay = if attempt.outcome == AttemptOutcome::NotLoggedIn {
+            Duration::from_secs(15 * 60)
+        } else {
+            HARD_TTL
+        };
         let delay = FAILURE_BACKOFF_BASE
             .saturating_mul(1 << exponent)
-            .min(HARD_TTL);
+            .min(maximum_delay);
         attempt
             .at
             .checked_add_signed(chrono::Duration::from_std(delay).ok()?)
@@ -436,6 +441,8 @@ struct AgentState {
     commits: Arc<Semaphore>,
     record: RecordState,
     refresh: Option<RefreshTask>,
+    launch_failures: u32,
+    live_commits: usize,
 }
 
 struct GlobalModelCatalog(Entity<ModelCatalog>);
@@ -576,21 +583,14 @@ impl ModelCatalog {
         let Some(state) = self.agents.get(agent) else {
             return Task::ready(Err(RefreshError::NotConfigured));
         };
-        if state.installation == Installation::NotInstalled {
-            return Task::ready(Err(RefreshError::NotInstalled));
-        }
-        if let Some(models) = self.models(agent)
+        if state.installation != Installation::NotInstalled
+            && let Some(models) = self.models(agent)
             && models.freshness == Freshness::Fresh
         {
             return Task::ready(Ok(models));
         }
         if state.refresh.is_none() {
-            if let RecordState::Loaded(Some(record)) = &state.record
-                && record.stored.consecutive_failures > 0
-                && let Some(attempt) = &record.stored.last_attempt
-                && self.ports.clock.now() - attempt.at
-                    < chrono::Duration::from_std(ENSURE_FRESH_COOLDOWN)
-                        .unwrap_or(chrono::Duration::MAX)
+            if state.installation != Installation::NotInstalled && self.refresh_cooling_down(agent)
             {
                 return Task::ready(Err(RefreshError::CoolingDown));
             }
@@ -604,6 +604,18 @@ impl ModelCatalog {
             return Task::ready(Err(RefreshError::NotConfigured));
         };
         cx.spawn(async move |_, _| refresh.await)
+    }
+
+    fn refresh_cooling_down(&self, agent: &AgentKey) -> bool {
+        self.agents.get(agent).is_some_and(|state| {
+            matches!(&state.record, RecordState::Loaded(Some(record))
+            if record.stored.consecutive_failures > 0
+                && record.stored.last_attempt.as_ref().is_some_and(|attempt| {
+                    self.ports.clock.now() - attempt.at
+                        < chrono::Duration::from_std(ENSURE_FRESH_COOLDOWN)
+                            .unwrap_or(chrono::Duration::MAX)
+                }))
+        })
     }
 
     /// Re-reads the agent inventory, loads records of new agents and schedules due refreshes.
@@ -634,19 +646,37 @@ impl ModelCatalog {
             self.pending_live.insert(agent, (options, agent_version));
             return;
         };
+        if matches!(
+            state.installation,
+            Installation::NotInstalled | Installation::Installed { version: None }
+        ) {
+            self.pending_live.insert(agent, (options, agent_version));
+            self.sync_inventory(cx);
+            return;
+        }
         if matches!(state.record, RecordState::Loading) {
             self.pending_live.insert(agent, (options, agent_version));
             return;
         }
         let commits = state.commits.clone();
+        if let Some(state) = self.agents.get_mut(&agent) {
+            state.live_commits += 1;
+        }
         cx.spawn(async move |this, cx| {
             let _guard = commits.acquire_arc().await;
             let commit = this
                 .update(cx, |this, cx| {
-                    this.apply_live(agent, options, agent_version, cx)
+                    this.apply_live(agent.clone(), options, agent_version, cx)
                 })
                 .map_err(|_| RefreshError::Cancelled)?;
-            commit.await
+            let result = commit.await;
+            this.update(cx, |this, _| {
+                if let Some(state) = this.agents.get_mut(&agent) {
+                    state.live_commits = state.live_commits.saturating_sub(1);
+                }
+            })
+            .ok();
+            result
         })
         .detach_and_log_err(cx);
     }
@@ -672,6 +702,7 @@ impl ModelCatalog {
             && current.models.as_ref() == models.as_slice()
             && current.stored.agent_version.as_deref() == agent_version.as_deref()
             && current.stored.consecutive_failures == 0
+            && current.stored.installed_version == installed_version(&state.installation)
             && current
                 .stored
                 .fetched_at
@@ -717,6 +748,8 @@ impl ModelCatalog {
                             commits: Arc::new(Semaphore::new(1)),
                             record: RecordState::Loading,
                             refresh: None,
+                            launch_failures: 0,
+                            live_commits: 0,
                         },
                     );
                     self.load(descriptor.key.clone(), cx);
@@ -733,6 +766,25 @@ impl ModelCatalog {
         for key in removed {
             self.agents.remove(&key);
             cx.emit(CatalogEvent::AvailabilityChanged(key));
+        }
+        let ready = self
+            .pending_live
+            .keys()
+            .filter(|agent| {
+                self.agents.get(*agent).is_some_and(|state| {
+                    !matches!(state.record, RecordState::Loading)
+                        && !matches!(
+                            state.installation,
+                            Installation::NotInstalled | Installation::Installed { version: None }
+                        )
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for agent in ready {
+            if let Some((options, version)) = self.pending_live.remove(&agent) {
+                self.observe_live(agent, options, version, cx);
+            }
         }
         self.schedule_refreshes(cx);
     }
@@ -778,8 +830,12 @@ impl ModelCatalog {
         let due = self
             .agents
             .iter()
-            .filter(|(_, state)| {
-                if state.refresh.is_some() || state.installation == Installation::NotInstalled {
+            .filter(|(agent, state)| {
+                if self.pending_live.contains_key(*agent)
+                    || state.live_commits > 0
+                    || state.refresh.is_some()
+                    || state.installation == Installation::NotInstalled
+                {
                     return false;
                 }
                 let RecordState::Loaded(record) = &state.record else {
@@ -791,7 +847,7 @@ impl ModelCatalog {
                 freshness(&record.stored, &state.installation, now) != Freshness::Fresh
                     && record
                         .stored
-                        .backoff_until()
+                        .backoff_until(state.launch_failures)
                         .is_none_or(|backoff_until| now >= backoff_until)
             })
             .map(|(key, _)| key.clone())
@@ -810,6 +866,8 @@ impl ModelCatalog {
         if state.refresh.is_some() {
             return;
         }
+        let recheck_installation = state.installation == Installation::NotInstalled;
+        let inventory = self.ports.inventory.clone();
         let commits = state.commits.clone();
         let permits = self.probe_permits.clone();
         let probe = self.ports.probe.clone();
@@ -817,30 +875,66 @@ impl ModelCatalog {
             .spawn({
                 let agent = agent.clone();
                 async move |this, cx| {
-                    let permit = permits.acquire_arc().await;
-                    let (installation_generation, observation_sequence) = this
-                        .read_with(cx, |this, _| {
-                            this.agents.get(&agent).map(|state| {
-                                (state.installation_generation, state.observation_sequence)
+                    let result = async {
+                        if recheck_installation {
+                            let descriptors = cx
+                                .update(|cx| inventory.agents(cx))
+                                .await
+                                .map_err(|_| RefreshError::Failed(FailureKind::ConnectionFailed))?;
+                            let models = this
+                                .update(cx, |this, cx| {
+                                    this.apply_inventory(descriptors, cx);
+                                    match this.agents.get(&agent) {
+                                        None => Err(RefreshError::NotConfigured),
+                                        Some(state)
+                                            if state.installation == Installation::NotInstalled =>
+                                        {
+                                            Err(RefreshError::NotInstalled)
+                                        }
+                                        Some(_) => {
+                                            if let Some(models) = this.models(&agent)
+                                                && models.freshness == Freshness::Fresh
+                                            {
+                                                return Ok(Some(models));
+                                            }
+                                            if this.refresh_cooling_down(&agent) {
+                                                return Err(RefreshError::CoolingDown);
+                                            }
+                                            Ok(None)
+                                        }
+                                    }
+                                })
+                                .map_err(|_| RefreshError::Cancelled)??;
+                            if let Some(models) = models {
+                                return Ok(models);
+                            }
+                        }
+                        let permit = permits.acquire_arc().await;
+                        let (installation_generation, observation_sequence) = this
+                            .read_with(cx, |this, _| {
+                                this.agents.get(&agent).map(|state| {
+                                    (state.installation_generation, state.observation_sequence)
+                                })
                             })
-                        })
-                        .map_err(|_| RefreshError::Cancelled)?
-                        .ok_or(RefreshError::NotConfigured)?;
-                    let outcome = cx.update(|cx| probe.probe(&agent, cx)).await;
-                    drop(permit);
-                    let _guard = commits.acquire_arc().await;
-                    let commit = this
-                        .update(cx, |this, cx| {
-                            this.apply_probe_outcome(
-                                &agent,
-                                outcome,
-                                installation_generation,
-                                observation_sequence,
-                                cx,
-                            )
-                        })
-                        .map_err(|_| RefreshError::Cancelled)?;
-                    let result = commit.await;
+                            .map_err(|_| RefreshError::Cancelled)?
+                            .ok_or(RefreshError::NotConfigured)?;
+                        let outcome = cx.update(|cx| probe.probe(&agent, cx)).await;
+                        drop(permit);
+                        let _guard = commits.acquire_arc().await;
+                        let commit = this
+                            .update(cx, |this, cx| {
+                                this.apply_probe_outcome(
+                                    &agent,
+                                    outcome,
+                                    installation_generation,
+                                    observation_sequence,
+                                    cx,
+                                )
+                            })
+                            .map_err(|_| RefreshError::Cancelled)?;
+                        commit.await
+                    }
+                    .await;
                     this.update(cx, |this, _| {
                         if let Some(state) = this.agents.get_mut(&agent) {
                             state.refresh = None;
@@ -1006,6 +1100,11 @@ impl ModelCatalog {
                         attempt.outcome
                     );
                 }
+                state.launch_failures = if result.is_ok() {
+                    0
+                } else {
+                    state.launch_failures.saturating_add(1)
+                };
                 state.record = RecordState::Loaded(Some(LoadedRecord {
                     stored: record,
                     models,
@@ -1384,6 +1483,179 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn live_observation_rechecks_installation_without_probing(cx: &mut TestAppContext) {
+        for installation in [
+            Installation::NotInstalled,
+            Installation::Installed { version: None },
+        ] {
+            let expected_initial_calls = usize::from(installation != Installation::NotInstalled);
+            let harness = Harness::new(
+                vec![AgentDescriptor {
+                    key: key("agent"),
+                    installation,
+                }],
+                cx,
+            );
+            // Loading must finish before simulating the download made by the live thread.
+            harness.probe.gated.set(true);
+            harness.sync(cx);
+            assert_eq!(harness.calls(), expected_initial_calls);
+            *harness.inventory.0.borrow_mut() = vec![installed("agent", "v1")];
+            harness.catalog.update(cx, |catalog, cx| {
+                catalog.observe_live(key("agent"), offered(&["live"]), None, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(harness.check("agent", "live", cx), ModelCheck::Available);
+            assert_eq!(harness.availability("agent", cx), AgentAvailability::Ready);
+            assert_eq!(harness.freshness("agent", cx), Some(Freshness::Fresh));
+            let records = harness.store.records.borrow();
+            let record: StoredRecord =
+                serde_json::from_str(records.get(&key("agent")).unwrap()).unwrap();
+            assert_eq!(record.installed_version.as_deref(), Some("v1"));
+            assert_eq!(harness.calls(), expected_initial_calls);
+        }
+    }
+
+    #[gpui::test]
+    async fn ensure_fresh_rechecks_new_installation_and_shares_probe(cx: &mut TestAppContext) {
+        let harness = Harness::new(
+            vec![AgentDescriptor {
+                key: key("agent"),
+                installation: Installation::NotInstalled,
+            }],
+            cx,
+        );
+        harness.sync(cx);
+        *harness.inventory.0.borrow_mut() = vec![installed("agent", "v1")];
+        harness.probe.gated.set(true);
+        let first = harness.ensure_fresh("agent", cx);
+        let second = harness.ensure_fresh("agent", cx);
+        cx.run_until_parked();
+        assert_eq!(harness.calls(), 1);
+        assert!(
+            harness
+                .probe
+                .gates
+                .borrow_mut()
+                .remove(0)
+                .send(models_outcome(&["model"], "v1"))
+                .is_ok()
+        );
+        for result in [first.await, second.await] {
+            assert_eq!(result.unwrap().freshness, Freshness::Fresh);
+        }
+        assert_eq!(harness.check("agent", "model", cx), ModelCheck::Available);
+    }
+
+    #[gpui::test]
+    async fn ensure_fresh_rechecks_still_missing_installation(cx: &mut TestAppContext) {
+        let harness = Harness::new(
+            vec![AgentDescriptor {
+                key: key("agent"),
+                installation: Installation::NotInstalled,
+            }],
+            cx,
+        );
+        harness.sync(cx);
+        let first = harness.ensure_fresh("agent", cx);
+        let second = harness.ensure_fresh("agent", cx);
+        assert_eq!(first.await, Err(RefreshError::NotInstalled));
+        assert_eq!(second.await, Err(RefreshError::NotInstalled));
+        assert_eq!(harness.calls(), 0);
+        *harness.inventory.0.borrow_mut() = vec![installed("agent", "v1")];
+        harness.queue("agent", models_outcome(&["model"], "v1"));
+        assert!(harness.ensure_fresh("agent", cx).await.is_ok());
+        assert_eq!(harness.calls(), 1);
+    }
+
+    #[gpui::test]
+    async fn ensure_fresh_keeps_cooldown_after_installation_recheck(cx: &mut TestAppContext) {
+        let store = MemoryStore::default();
+        store.records.borrow_mut().insert(
+            key("agent"),
+            serde_json::json!({
+                "schema_version": 1,
+                "consecutive_failures": 1,
+                "last_attempt": {"at": "2026-11-04T09:00:00Z", "outcome": "not_logged_in"}
+            })
+            .to_string(),
+        );
+        let harness = Harness::with_store(
+            vec![AgentDescriptor {
+                key: key("agent"),
+                installation: Installation::NotInstalled,
+            }],
+            store,
+            cx,
+        );
+        harness.sync(cx);
+        *harness.inventory.0.borrow_mut() = vec![installed("agent", "v1")];
+        assert_eq!(
+            harness.ensure_fresh("agent", cx).await,
+            Err(RefreshError::CoolingDown)
+        );
+        assert_eq!(harness.calls(), 0);
+        harness.clock.advance(ENSURE_FRESH_COOLDOWN);
+        harness.queue("agent", models_outcome(&["model"], "v1"));
+        assert!(harness.ensure_fresh("agent", cx).await.is_ok());
+        assert_eq!(harness.calls(), 1);
+    }
+
+    #[gpui::test]
+    async fn restored_failures_do_not_delay_first_probe(cx: &mut TestAppContext) {
+        let store = MemoryStore::default();
+        store.records.borrow_mut().insert(
+            key("agent"),
+            serde_json::json!({
+                "schema_version": 1,
+                "consecutive_failures": 100,
+                "last_attempt": {"at": "2026-11-04T09:00:00Z", "outcome": "not_logged_in"}
+            })
+            .to_string(),
+        );
+        let harness = Harness::with_store(vec![installed("agent", "v1")], store, cx);
+        harness.queue("agent", ProbeOutcome::NotLoggedIn);
+        harness.sync(cx);
+        assert_eq!(harness.calls(), 1);
+        let records = harness.store.records.borrow();
+        let record: StoredRecord =
+            serde_json::from_str(records.get(&key("agent")).unwrap()).unwrap();
+        assert_eq!(record.consecutive_failures, 101);
+    }
+
+    #[gpui::test]
+    async fn not_logged_in_backoff_is_capped_at_fifteen_minutes(cx: &mut TestAppContext) {
+        let harness = Harness::new(vec![installed("agent", "v1")], cx);
+        for (index, delay) in [0, 5, 10, 15, 15, 15, 15, 15].into_iter().enumerate() {
+            harness.queue("agent", ProbeOutcome::NotLoggedIn);
+            if delay > 0 {
+                harness.clock.advance(Duration::from_secs(delay * 60 - 1));
+                harness.sync(cx);
+                assert_eq!(harness.calls(), index);
+                harness.clock.advance(Duration::from_secs(1));
+            }
+            harness.sync(cx);
+            assert_eq!(harness.calls(), index + 1);
+        }
+    }
+
+    #[gpui::test]
+    async fn timeout_backoff_grows_past_fifteen_minutes(cx: &mut TestAppContext) {
+        let harness = Harness::new(vec![installed("agent", "v1")], cx);
+        for (index, delay) in [0, 5, 10, 20, 40].into_iter().enumerate() {
+            harness.queue("agent", ProbeOutcome::Failed(FailureKind::Timeout));
+            if delay > 0 {
+                harness.clock.advance(Duration::from_secs(delay * 60 - 1));
+                harness.sync(cx);
+                assert_eq!(harness.calls(), index);
+                harness.clock.advance(Duration::from_secs(1));
+            }
+            harness.sync(cx);
+            assert_eq!(harness.calls(), index + 1);
+        }
+    }
+
     #[test]
     fn backoff_handles_maximum_timestamp() {
         let mut record = StoredRecord::empty();
@@ -1391,7 +1663,7 @@ mod tests {
             AttemptOutcome::Failed(FailureKind::Timeout),
             DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(1),
         );
-        assert_eq!(record.backoff_until(), None);
+        assert_eq!(record.backoff_until(1), None);
     }
 
     #[gpui::test]

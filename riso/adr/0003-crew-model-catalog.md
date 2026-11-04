@@ -44,7 +44,11 @@ The core schedules probes:
 - on demand through `ensure_fresh`.
 
 Probes run at most two at a time, share one run per agent, and back off
-exponentially after failures.
+exponentially after failures, using a failure count that resets on each app launch.
+Not-logged-in agents have a maximum delay of 15 minutes; other failures have a
+maximum delay of 24 hours. Live observations and `ensure_fresh` immediately
+re-check inventory for agents believed not installed; live observations also
+re-check installed agents whose version is unknown before storing their models.
 
 Every answer carries freshness:
 
