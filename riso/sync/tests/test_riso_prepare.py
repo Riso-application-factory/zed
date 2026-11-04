@@ -16,6 +16,12 @@ from riso_common import git, load_config
 from riso_prepare import Executor, merge, prepare, publish_pull_request, resolve, sync_mirror, dispatch
 
 
+def workflow_jobs(file_name):
+    workflow = (Path(__file__).resolve().parents[3] / '.github/workflows' / file_name).read_text()
+    blocks = re.split(r'^  ([a-z0-9-]+):\n', workflow.split('\njobs:\n', 1)[1], flags=re.MULTILINE)
+    return dict(zip(blocks[1::2], blocks[2::2]))
+
+
 class LocalExecutor(Executor):
     """Run local git mutations while recording remote writes without executing them."""
 
@@ -466,10 +472,7 @@ class PrepareTests(unittest.TestCase):
         self.assertFalse(any(command[:2] == ['git', 'push'] for command in executor.commands))
 
     def test_workflow_pull_request_credentials_are_read_only(self):
-        root = Path(__file__).resolve().parents[3]
-        workflow = (root / '.github/workflows/riso_ci.yml').read_text()
-        jobs = re.split(r'^  ([a-z0-9-]+):\n', workflow.split('\njobs:\n', 1)[1], flags=re.MULTILINE)
-        jobs = dict(zip(jobs[1::2], jobs[2::2]))
+        jobs = workflow_jobs('riso_ci.yml')
         self.assertEqual(list(jobs), ['preflight', 'lint', 'adr-policy', 'clippy', 'build-and-test', 'ci-passed', 'notify-failure'])
         for name in ('lint', 'adr-policy', 'clippy', 'build-and-test'):
             block = jobs[name]
@@ -498,32 +501,49 @@ class PrepareTests(unittest.TestCase):
         self.assertNotIn('python3 riso/', reporting)
 
     def test_workflow_uses_app_token_and_bot_identity(self):
-        root = Path(__file__).resolve().parents[3]
-        workflow = (root / '.github/workflows/riso_upstream_sync.yml').read_text()
-        first_step = workflow.split('    steps:\n', 1)[1].split('      - uses: actions/checkout', 1)[0]
-        self.assertIn('uses: actions/create-github-app-token@v2', first_step)
-        self.assertIn('id: app-token', first_step)
-        self.assertIn('app-id: ${{ secrets.RISO_BOT_APP_ID }}', first_step)
-        self.assertIn('private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}', first_step)
-        self.assertNotIn('owner:', first_step)
-        self.assertNotIn('repositories:', first_step)
-        self.assertIn('token: ${{ steps.app-token.outputs.token }}', workflow)
-        preparation = workflow.split('      - name: Prepare review requests\n', 1)[1].split('      - uses:', 1)[0]
+        jobs = workflow_jobs('riso_upstream_sync.yml')
+        self.assertEqual(list(jobs), ['mirror', 'plan', 'apply', 'notify-failure'])
+        for name in ('mirror', 'apply', 'notify-failure'):
+            first_step = jobs[name].split('    steps:\n', 1)[1].split('\n      - ', 1)[0]
+            self.assertIn('uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2', first_step)
+            self.assertIn('id: app-token', first_step)
+            self.assertIn('app-id: ${{ secrets.RISO_BOT_APP_ID }}', first_step)
+            self.assertIn('private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}', first_step)
+            self.assertNotIn('owner:', first_step)
+            self.assertNotIn('repositories:', first_step)
+        for name in ('mirror', 'apply'):
+            self.assertIn('token: ${{ steps.app-token.outputs.token }}', jobs[name])
+        apply = jobs['apply']
+        self.assertIn('    needs: plan\n', apply)
+        preparation = apply.split('      - name: Prepare review requests\n', 1)[1]
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', preparation)
         self.assertIn('GH_REPO: ${{ github.repository }}', preparation)
         self.assertNotIn('github.token', preparation)
-        self.assertIn("git config user.name 'riso-tech-bot[bot]'", workflow)
-        self.assertIn("git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'", workflow)
-        self.assertIn('    permissions:\n      contents: read\n      issues: write\n', workflow)
-        checks = (root / '.github/workflows/riso_ci.yml').read_text()
+        self.assertIn("git config user.name 'riso-tech-bot[bot]'", apply)
+        self.assertIn("git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'", apply)
+        self.assertIn('    permissions:\n      contents: read\n      issues: write\n', jobs['notify-failure'])
+        checks = (Path(__file__).resolve().parents[3] / '.github/workflows/riso_ci.yml').read_text()
         self.assertIn('GH_TOKEN: ${{ github.token }}', checks)
         self.assertNotIn('app-token', checks)
 
+    def test_workflow_keeps_jev_key_away_from_write_credentials(self):
+        jobs = workflow_jobs('riso_upstream_sync.yml')
+        plan = jobs['plan']
+        self.assertIn('JEV_API_KEY: ${{ secrets.JEV_API_KEY }}', plan)
+        self.assertIn('persist-credentials: false', plan)
+        self.assertIn('    permissions:\n      contents: read\n', plan)
+        self.assertNotIn(': write', plan)
+        self.assertNotIn('app-token', plan)
+        self.assertNotIn('RISO_BOT', plan)
+        for name in ('mirror', 'apply', 'notify-failure'):
+            self.assertNotIn('JEV_API_KEY', jobs[name])
+
     def test_workflow_records_sync_failure_and_honors_dry_run(self):
-        root = Path(__file__).resolve().parents[3]
-        workflow = (root / '.github/workflows/riso_upstream_sync.yml').read_text()
-        handler = workflow.split('      - name: Record unexpected sync failure\n', 1)[1].split('      - uses:', 1)[0]
-        self.assertIn('if: failure()', handler)
+        reporting = workflow_jobs('riso_upstream_sync.yml')['notify-failure']
+        self.assertIn('    needs: [mirror, plan, apply]\n', reporting)
+        self.assertIn('if: ${{ failure()', reporting)
+        self.assertNotIn('actions/checkout', reporting)
+        handler = reporting.split('      - name: Record unexpected sync failure\n', 1)[1]
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}', handler)
         self.assertIn('if [ "$DRY_RUN" = true ]', handler)
         self.assertIn('--label riso-sync-blocked', handler)
