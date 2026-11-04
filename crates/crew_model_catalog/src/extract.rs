@@ -225,10 +225,22 @@ mod tests {
 
         for (values, expected) in [
             (vec![value("ok"), value("")], Err(ExtractError::SizeLimit)),
-            (vec![value("ok"), value(&too_long_id)], Err(ExtractError::SizeLimit)),
-            (vec![value("ok"), long_description], Err(ExtractError::SizeLimit)),
-            (vec![value("ok"), value("bad\nid")], Err(ExtractError::InvalidCharacters)),
-            (vec![value("bad\u{202E}id")], Err(ExtractError::InvalidCharacters)),
+            (
+                vec![value("ok"), value(&too_long_id)],
+                Err(ExtractError::SizeLimit),
+            ),
+            (
+                vec![value("ok"), long_description],
+                Err(ExtractError::SizeLimit),
+            ),
+            (
+                vec![value("ok"), value("bad\nid")],
+                Err(ExtractError::InvalidCharacters),
+            ),
+            (
+                vec![value("bad\u{202E}id")],
+                Err(ExtractError::InvalidCharacters),
+            ),
         ] {
             assert_eq!(
                 extract_models(&[model_option(OfferedSelect::Ungrouped(values))]),

@@ -156,7 +156,9 @@ pub enum AgentInstallStatus {
     NotInstalled,
     /// `version` is `None` when only an installation of another version is present, which
     /// `get_command` replaces with the current one.
-    Installed { version: Option<SharedString> },
+    Installed {
+        version: Option<SharedString>,
+    },
 }
 
 enum AgentServerStoreState {
