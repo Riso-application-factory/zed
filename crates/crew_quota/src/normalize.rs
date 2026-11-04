@@ -124,7 +124,8 @@ pub fn decode_record(
     if record.schema_version != 1 {
         return Err(ErrorCode::UnsupportedVersion);
     }
-    if record.account.scope != *scope
+    if record.retry_at > now.saturating_add(MAX_BACKOFF_SECONDS as i64)
+        || record.account.scope != *scope
         || record.account.windows.len() > MAX_WINDOWS
         || !valid_text(&scope.id, 512)
         || record
@@ -211,7 +212,11 @@ pub struct AttemptRecord {
     pub at: Timestamp,
 }
 
-pub fn decode_attempt(json: &str, scope: &AccountScope) -> Result<AttemptRecord, ErrorCode> {
+pub fn decode_attempt(
+    json: &str,
+    scope: &AccountScope,
+    now: Timestamp,
+) -> Result<AttemptRecord, ErrorCode> {
     if json.len() > 4096 {
         return Err(ErrorCode::InvalidData);
     }
@@ -219,7 +224,10 @@ pub fn decode_attempt(json: &str, scope: &AccountScope) -> Result<AttemptRecord,
     if record.schema_version != 1 {
         return Err(ErrorCode::UnsupportedVersion);
     }
-    if record.scope != scope.id || record.provider != scope.provider {
+    if record.scope != scope.id
+        || record.provider != scope.provider
+        || record.at > now.saturating_add(300)
+    {
         return Err(ErrorCode::InvalidData);
     }
     Ok(record)

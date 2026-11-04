@@ -36,3 +36,9 @@ workspace.workspace = true
 anyhow.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
+
+[[bin]]
+name = "crew_quota_process_fixture"
+path = "tests/fixtures/process.rs"
+test = false
+bench = false

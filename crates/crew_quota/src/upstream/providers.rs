@@ -1,11 +1,10 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    process::Stdio,
     time::Duration,
 };
 
-use async_process::{Child, Command};
+use async_process::Child;
 use futures::{
     AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, io::BufReader,
 };
@@ -287,25 +286,89 @@ pub fn decode(
 
 struct OwnedChild {
     child: Child,
+    #[cfg(unix)]
     group: Option<i32>,
+}
+
+impl OwnedChild {
+    fn terminate(&mut self) -> Result<(), RefreshError> {
+        #[cfg(unix)]
+        if let Some(group) = self.group {
+            // This group belongs exclusively to this read, including descendants whose launcher already exited.
+            if unsafe { libc::kill(-group, libc::SIGKILL) } != 0
+                && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            {
+                return Err(RefreshError::Failed(ErrorCode::CleanupFailed));
+            }
+            self.group = None;
+        }
+        match self.child.try_status() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = self.child.kill() {
+                    #[cfg(unix)]
+                    let already_gone = error.raw_os_error() == Some(libc::ESRCH);
+                    #[cfg(not(unix))]
+                    let already_gone = false;
+                    if !already_gone && error.kind() != std::io::ErrorKind::InvalidInput {
+                        return Err(RefreshError::Failed(ErrorCode::CleanupFailed));
+                    }
+                }
+            }
+            Err(_) => return Err(RefreshError::Failed(ErrorCode::CleanupFailed)),
+        }
+        Ok(())
+    }
 }
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Some(group) = self.group {
-            // The group is created exclusively for this read; kill descendants even if the launcher has exited.
-            if unsafe { libc::kill(-group, libc::SIGKILL) } != 0 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    log::warn!("crew_quota: process_group_cleanup_failed");
-                }
-            }
+        if self.terminate().is_err() {
+            log::warn!("crew_quota: child_cleanup_failed");
         }
-        if let Err(error) = self.child.kill() {
-            if error.kind() != std::io::ErrorKind::InvalidInput {
-                log::warn!("crew_quota: child_cleanup_failed");
-            }
+    }
+}
+
+fn spawn_owned(mut command: std::process::Command) -> Result<OwnedChild, RefreshError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+        let child = async_process::Command::from(command)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
+        let group = i32::try_from(child.id())
+            .map_err(|_| RefreshError::Failed(ErrorCode::CleanupFailed))?;
+        Ok(OwnedChild {
+            child,
+            group: Some(group),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // std/async-process cannot atomically assign a Windows Job Object before the launcher can spawn children.
+        // Reject the operation until this adapter can guarantee ownership from process creation.
+        let _command = &mut command;
+        Err(RefreshError::UnsupportedPlatform)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReadTimeouts {
+    initialize: Duration,
+    read: Duration,
+    cleanup: Duration,
+}
+impl Default for ReadTimeouts {
+    fn default() -> Self {
+        Self {
+            initialize: Duration::from_secs(15),
+            read: Duration::from_secs(25),
+            cleanup: Duration::from_secs(3),
         }
     }
 }
@@ -347,13 +410,21 @@ async fn bounded_response<R: futures::AsyncRead + Unpin>(
 
 async fn deadline<T>(
     executor: &BackgroundExecutor,
-    seconds: u64,
+    duration: Duration,
     future: impl std::future::Future<Output = Result<T, RefreshError>>,
 ) -> Result<T, RefreshError> {
-    futures::select_biased! { value = future.fuse() => value, _ = executor.timer(Duration::from_secs(seconds)).fuse() => Err(RefreshError::Failed(ErrorCode::Timeout)) }
+    futures::select_biased! { value = future.fuse() => value, _ = executor.timer(duration).fuse() => Err(RefreshError::Failed(ErrorCode::Timeout)) }
 }
 
 pub async fn read(launch: Launch, executor: BackgroundExecutor) -> Result<Value, RefreshError> {
+    read_with_timeouts(launch, executor, ReadTimeouts::default()).await
+}
+
+async fn read_with_timeouts(
+    launch: Launch,
+    executor: BackgroundExecutor,
+    timeouts: ReadTimeouts,
+) -> Result<Value, RefreshError> {
     let mut command = std::process::Command::new(&launch.node);
     command
         .arg(&launch.entrypoint)
@@ -361,20 +432,7 @@ pub async fn read(launch: Launch, executor: BackgroundExecutor) -> Result<Value,
         .env_clear()
         .envs(&launch.environment)
         .current_dir(&launch.directory);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        command.process_group(0);
-    }
-    let child = Command::from(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
-    let group = i32::try_from(child.id()).ok();
-    let mut owned = OwnedChild { child, group };
+    let mut owned = spawn_owned(command)?;
     let mut stdin = owned
         .child
         .stdin
@@ -404,9 +462,9 @@ pub async fn read(launch: Launch, executor: BackgroundExecutor) -> Result<Value,
         }
     });
     let mut reader = BufReader::new(stdout);
-    let result = exchange(&mut stdin, &mut reader, &executor).await;
+    let result = exchange(&mut stdin, &mut reader, &executor, timeouts).await;
     drop(stdin);
-    let cleanup = deadline(&executor, 3, async {
+    let cleanup = deadline(&executor, timeouts.cleanup, async {
         owned
             .child
             .status()
@@ -414,10 +472,17 @@ pub async fn read(launch: Launch, executor: BackgroundExecutor) -> Result<Value,
             .map_err(|_| RefreshError::Failed(ErrorCode::CleanupFailed))
     })
     .await;
+    owned.terminate()?;
     if cleanup.is_err() {
-        drop(owned);
-        drop(drain);
-        return Err(RefreshError::Failed(ErrorCode::CleanupFailed));
+        deadline(&executor, timeouts.cleanup, async {
+            owned
+                .child
+                .status()
+                .await
+                .map_err(|_| RefreshError::Failed(ErrorCode::CleanupFailed))
+        })
+        .await
+        .map_err(|_| RefreshError::Failed(ErrorCode::CleanupFailed))?;
     }
     drop(owned);
     drop(drain);
@@ -428,10 +493,11 @@ async fn exchange<W: futures::AsyncWrite + Unpin, R: futures::AsyncRead + Unpin>
     stdin: &mut W,
     reader: &mut BufReader<R>,
     executor: &BackgroundExecutor,
+    timeouts: ReadTimeouts,
 ) -> Result<Value, RefreshError> {
     let initialize = serde_json::to_vec(&json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"crew_quota","version":"0.1.0"}}})).map_err(|_| RefreshError::Failed(ErrorCode::Protocol))?;
     let mut remaining = OUTPUT_LIMIT;
-    deadline(&executor, 15, async {
+    deadline(executor, timeouts.initialize, async {
         stdin
             .write_all(&initialize)
             .await
@@ -452,7 +518,7 @@ async fn exchange<W: futures::AsyncWrite + Unpin, R: futures::AsyncRead + Unpin>
         Ok(())
     })
     .await?;
-    deadline(&executor, 25, async {
+    deadline(executor, timeouts.read, async {
             stdin.write_all(b"{\"method\":\"initialized\",\"params\":{}}\n{\"id\":2,\"method\":\"account/rateLimits/read\"}\n").await.map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
             stdin.flush().await.map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
             bounded_response(reader, 2, &mut remaining).await
@@ -468,7 +534,11 @@ mod tests {
         let input = b"{\"id\":1,\"result\":{}}\n{\"method\":\"account/updated\",\"params\":{}}\n{\"id\":2,\"result\":{}}\n";
         let mut reader = BufReader::new(futures::io::Cursor::new(input));
         let mut writer = futures::io::Cursor::new(Vec::new());
-        assert!(exchange(&mut writer, &mut reader, &executor).await.is_ok());
+        assert!(
+            exchange(&mut writer, &mut reader, &executor, ReadTimeouts::default())
+                .await
+                .is_ok()
+        );
         let methods = writer
             .into_inner()
             .split(|byte| *byte == b'\n')
@@ -504,7 +574,11 @@ mod tests {
         ] {
             let mut reader = BufReader::new(futures::io::Cursor::new(input));
             let mut writer = futures::io::Cursor::new(Vec::new());
-            assert!(exchange(&mut writer, &mut reader, &executor).await.is_err());
+            assert!(
+                exchange(&mut writer, &mut reader, &executor, ReadTimeouts::default())
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -614,5 +688,141 @@ mod tests {
             }
             Ok(())
         })
+    }
+    fn fixture_launch(directory: &Path, mode: &str) -> anyhow::Result<Launch> {
+        let test_binary = std::env::current_exe()?;
+        let executable = test_binary
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("missing target directory"))?
+            .join(format!(
+                "crew_quota_process_fixture{}",
+                std::env::consts::EXE_SUFFIX
+            ));
+        anyhow::ensure!(
+            executable.is_file(),
+            "Cargo did not build the process fixture"
+        );
+        Ok(Launch {
+            node: executable,
+            entrypoint: directory.join("unused"),
+            directory: directory.into(),
+            version: "synthetic".into(),
+            environment: BTreeMap::from([
+                (
+                    "CREW_QUOTA_FIXTURE_DIRECTORY".into(),
+                    directory.to_string_lossy().into_owned(),
+                ),
+                ("CREW_QUOTA_FIXTURE_MODE".into(), mode.into()),
+            ]),
+        })
+    }
+
+    #[cfg(unix)]
+    fn assert_fixture_terminated(directory: &Path) -> anyhow::Result<()> {
+        for file in ["launcher.pid", "descendant.pid"] {
+            let identifier = std::fs::read_to_string(directory.join(file))?.parse::<i32>()?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let alive = unsafe { libc::kill(identifier, 0) } == 0;
+                #[cfg(target_os = "linux")]
+                let zombie = std::fs::read_to_string(format!("/proc/{identifier}/stat"))
+                    .ok()
+                    .is_some_and(|status| {
+                        status
+                            .split_once(") ")
+                            .is_some_and(|(_, status)| status.starts_with('Z'))
+                    });
+                #[cfg(not(target_os = "linux"))]
+                let zombie = false;
+                if !alive || zombie {
+                    break;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "fixture process remained alive: {file}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_process_success_protocol_and_timeout_cleanup() -> anyhow::Result<()> {
+        let executor =
+            BackgroundExecutor::new(std::sync::Arc::new(gpui::ThreadedDispatcher::new()));
+        for mode in ["success", "protocol", "timeout"] {
+            let directory = tempfile::tempdir()?;
+            let result = smol::block_on(read_with_timeouts(
+                fixture_launch(directory.path(), mode)?,
+                executor.clone(),
+                ReadTimeouts {
+                    initialize: Duration::from_secs(5),
+                    read: Duration::from_millis(300),
+                    cleanup: Duration::from_millis(300),
+                },
+            ));
+            #[cfg(windows)]
+            {
+                assert!(matches!(result, Err(RefreshError::UnsupportedPlatform)));
+                assert!(!directory.path().join("launcher.pid").exists());
+            }
+            #[cfg(unix)]
+            {
+                match mode {
+                    "success" => assert!(result.is_ok()),
+                    "protocol" => assert!(matches!(
+                        result,
+                        Err(RefreshError::Failed(ErrorCode::Protocol))
+                    )),
+                    "timeout" => assert!(matches!(
+                        result,
+                        Err(RefreshError::Failed(ErrorCode::Timeout))
+                    )),
+                    _ => unreachable!(),
+                }
+                assert_fixture_terminated(directory.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_process_cancellation_cleanup() -> anyhow::Result<()> {
+        let executor =
+            BackgroundExecutor::new(std::sync::Arc::new(gpui::ThreadedDispatcher::new()));
+        let directory = tempfile::tempdir()?;
+        let launch = fixture_launch(directory.path(), "cancel")?;
+        smol::block_on(async {
+            let operation = read(launch, executor.clone()).fuse();
+            futures::pin_mut!(operation);
+            #[cfg(windows)]
+            assert!(matches!(
+                operation.await,
+                Err(RefreshError::UnsupportedPlatform)
+            ));
+            #[cfg(unix)]
+            {
+                let ready = async {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !directory.path().join("heartbeat").exists() {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "fixture failed to launch descendant"
+                        );
+                        executor.timer(Duration::from_millis(20)).await;
+                    }
+                }
+                .fuse();
+                futures::pin_mut!(ready);
+                futures::select_biased! { _ = operation => panic!("read completed before cancellation"), _ = ready => {} }
+            }
+        });
+        #[cfg(unix)]
+        assert_fixture_terminated(directory.path())?;
+        #[cfg(windows)]
+        assert!(!directory.path().join("launcher.pid").exists());
+        Ok(())
     }
 }

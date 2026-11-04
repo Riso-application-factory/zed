@@ -302,7 +302,11 @@ impl QuotaService {
             if let Some(task) = self.tasks.get(&scope) {
                 tasks.push(task.clone());
             } else {
-                let retry_at = Scheduler::due_at(state, self.ports.clock.now());
+                let retry_at = Scheduler::next_for(
+                    state,
+                    self.ports.clock.now(),
+                    self.ports.clock.monotonic(),
+                );
                 return Task::ready(Err(RefreshError::Deferred { retry_at }));
             }
         }
@@ -349,13 +353,16 @@ impl QuotaService {
                     Availability::NotLoggedIn => RefreshError::NotLoggedIn,
                     Availability::Unsupported(_) => RefreshError::Unsupported,
                     _ => RefreshError::Deferred {
-                        retry_at: self
-                            .scheduler
-                            .scopes
-                            .get(&account.scope.id)
-                            .map_or(self.ports.clock.now(), |state| {
-                                Scheduler::due_at(state, self.ports.clock.now())
-                            }),
+                        retry_at: self.scheduler.scopes.get(&account.scope.id).map_or(
+                            self.ports.clock.now(),
+                            |state| {
+                                Scheduler::next_for(
+                                    state,
+                                    self.ports.clock.now(),
+                                    self.ports.clock.monotonic(),
+                                )
+                            },
+                        ),
                     },
                 }));
             }
@@ -377,11 +384,31 @@ impl QuotaService {
         cx: &mut Context<Self>,
     ) -> Result<(), ErrorCode> {
         let scope = observation.scope.clone();
+        let previous_availability = self
+            .core
+            .snapshot
+            .accounts
+            .get(&scope)
+            .map(|account| account.availability.clone());
         let previous_revision = self.core.snapshot.revision;
         let changed = self.core.apply(observation, self.ports.clock.now())?;
         if self.core.snapshot.revision != previous_revision {
+            if previous_availability
+                != self
+                    .core
+                    .snapshot
+                    .accounts
+                    .get(&scope)
+                    .map(|account| account.availability.clone())
+            {
+                cx.emit(QuotaEvent::AvailabilityChanged(scope.clone()));
+            }
             if !changed.is_empty() {
-                self.scheduler.passive(&scope, self.ports.clock.now());
+                self.scheduler.passive(
+                    &scope,
+                    self.ports.clock.now(),
+                    self.ports.clock.monotonic(),
+                );
             }
             self.persist(&scope, cx);
             cx.emit(QuotaEvent::Changed {
@@ -428,6 +455,14 @@ impl QuotaService {
             handle.abort();
         }
         self.tasks.clear();
+        let scopes = self.core.snapshot.accounts.keys().cloned().collect();
+        let windows = self
+            .core
+            .snapshot
+            .accounts
+            .values()
+            .flat_map(|account| account.windows.keys().cloned())
+            .collect();
         for account in self.core.snapshot.accounts.values_mut() {
             account.generation = account.generation.saturating_add(1);
             account.windows.clear();
@@ -443,6 +478,11 @@ impl QuotaService {
             cx.emit(QuotaEvent::AvailabilityChanged(account.scope.id.clone()));
         }
         self.core.snapshot.revision = self.core.snapshot.revision.saturating_add(1);
+        cx.emit(QuotaEvent::Changed {
+            scopes,
+            windows,
+            revision: self.core.snapshot.revision,
+        });
         self.wake();
         cx.notify();
     }
@@ -684,6 +724,14 @@ impl QuotaService {
                         schedule.suspended = true;
                     }
                     RefreshState::Suspended(ErrorCode::CleanupFailed)
+                }
+                Err(RefreshError::UnsupportedPlatform) => {
+                    account.availability =
+                        Availability::Unsupported(ErrorCode::UnsupportedPlatform);
+                    if let Some(schedule) = self.scheduler.scopes.get_mut(scope) {
+                        schedule.suspended = true;
+                    }
+                    RefreshState::Suspended(ErrorCode::UnsupportedPlatform)
                 }
                 Err(RefreshError::Unsupported) => {
                     account.availability = Availability::Unsupported(ErrorCode::UnsupportedVersion);
@@ -1030,12 +1078,14 @@ fn sync_inventory(
                         match decode_record(&record, &scope, this.ports.clock.now()) {
                             Ok(record) => {
                                 // Installation scope cannot prove account identity across restarts; retain attempt guards, never hydrate numbers into an unverified login.
-                                if let Some(schedule) = this.scheduler.scopes.get_mut(&scope_id) {
-                                    schedule.last_attempt =
-                                        schedule.last_attempt.max(record.account.last_attempt_at);
-                                    schedule.retry_at = schedule.retry_at.max(record.retry_at);
-                                    schedule.failures = schedule.failures.max(record.failures);
-                                }
+                                this.scheduler.restore_timing(
+                                    &scope_id,
+                                    record.account.last_attempt_at,
+                                    record.retry_at,
+                                    record.failures,
+                                    this.ports.clock.now(),
+                                    this.ports.clock.monotonic(),
+                                );
                             }
                             Err(error) => {
                                 if error == ErrorCode::UnsupportedVersion {
@@ -1049,20 +1099,26 @@ fn sync_inventory(
                     Ok(None) => {}
                 }
                 match attempt {
-                    Ok(Some(record)) => match decode_attempt(&record, &scope) {
-                        Ok(attempt) => {
-                            if let Some(schedule) = this.scheduler.scopes.get_mut(&scope_id) {
-                                schedule.last_attempt =
-                                    Some(schedule.last_attempt.unwrap_or(i64::MIN).max(attempt.at));
+                    Ok(Some(record)) => {
+                        match decode_attempt(&record, &scope, this.ports.clock.now()) {
+                            Ok(attempt) => {
+                                this.scheduler.restore_timing(
+                                    &scope_id,
+                                    Some(attempt.at),
+                                    0,
+                                    0,
+                                    this.ports.clock.now(),
+                                    this.ports.clock.monotonic(),
+                                );
+                            }
+                            Err(error) => {
+                                if error == ErrorCode::UnsupportedVersion {
+                                    this.persistence_blocked.insert(scope_id.clone());
+                                }
+                                this.persistence_failure(scope_id.clone(), cx);
                             }
                         }
-                        Err(error) => {
-                            if error == ErrorCode::UnsupportedVersion {
-                                this.persistence_blocked.insert(scope_id.clone());
-                            }
-                            this.persistence_failure(scope_id.clone(), cx);
-                        }
-                    },
+                    }
                     Err(_) => this.persistence_failure(scope_id.clone(), cx),
                     Ok(None) => {}
                 }
@@ -1222,6 +1278,7 @@ mod tests {
         FreshRequest {
             selector: Selector::default(),
             max_age: Duration::from_secs(120),
+            required_measurements: Vec::new(),
             deadline: 1300,
             allow_inference: false,
         }
@@ -1338,6 +1395,112 @@ mod tests {
         let read = service.update(cx, |service, cx| service.ensure_fresh(request(), cx));
         assert!(matches!(read.await, Err(RefreshError::NotInstalled)));
         cx.run_until_parked();
+        assert_eq!(source.calls.get(), 0);
+    }
+    #[gpui::test]
+    fn passive_recovery_emits_availability_transition(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, _| {
+            if let Some(account) = service.core.snapshot.accounts.get_mut("scope") {
+                account.availability = Availability::Error(ErrorCode::Transport);
+            }
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update({
+            let events = events.clone();
+            |cx| {
+                cx.subscribe(&service, move |_, event: &QuotaEvent, _| {
+                    events.borrow_mut().push(event.clone())
+                })
+            }
+        });
+        service.update(cx, |service, cx| {
+            assert!(
+                service
+                    .observe(
+                        Observation {
+                            scope: "scope".into(),
+                            generation: 1,
+                            source: SourceKind::CodexAppServerRead,
+                            source_version: "2.5.0".into(),
+                            observed_at: 1000,
+                            provider_sample_at: None,
+                            sequence: 1,
+                            start_sequence: None,
+                            windows: Vec::new(),
+                            complete: false,
+                            metadata: AccountMetadata {
+                                ordinary_usage_allowed: Some(true),
+                                ..Default::default()
+                            }
+                        },
+                        cx
+                    )
+                    .is_ok()
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            events
+                .borrow()
+                .contains(&QuotaEvent::AvailabilityChanged("scope".into()))
+        );
+    }
+
+    #[gpui::test]
+    async fn auth_invalidation_emits_changed_with_removed_windows(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        let read = service.update(cx, |service, cx| service.ensure_fresh(request(), cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        assert!(read.await.is_ok());
+        let removed = service.read_with(cx, |service, _| {
+            service
+                .core
+                .snapshot
+                .accounts
+                .get("scope")
+                .map(|account| account.windows.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        assert_eq!(removed.len(), 1);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update({
+            let events = events.clone();
+            |cx| {
+                cx.subscribe(&service, move |_, event: &QuotaEvent, _| {
+                    events.borrow_mut().push(event.clone())
+                })
+            }
+        });
+        service.update(cx, |service, cx| service.invalidate_auth(cx));
+        cx.run_until_parked();
+        assert!(events.borrow().iter().any(|event| matches!(event, QuotaEvent::Changed { scopes, windows, .. } if scopes == &["scope".to_string()] && windows == &removed)));
+    }
+    #[gpui::test]
+    fn unsupported_platform_is_explicit_and_suspends_reads(cx: &mut TestAppContext) {
+        let (service, _, source, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            assert!(matches!(
+                service.complete("scope", 1, Err(RefreshError::UnsupportedPlatform), cx),
+                Err(RefreshError::UnsupportedPlatform)
+            ));
+            service.evaluate(cx);
+        });
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert!(
+                service
+                    .core
+                    .snapshot
+                    .accounts
+                    .get("scope")
+                    .is_some_and(|account| account.availability
+                        == Availability::Unsupported(ErrorCode::UnsupportedPlatform)
+                        && account.refresh
+                            == RefreshState::Suspended(ErrorCode::UnsupportedPlatform))
+            );
+        });
         assert_eq!(source.calls.get(), 0);
     }
 }

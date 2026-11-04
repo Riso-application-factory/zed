@@ -78,3 +78,51 @@ fn retry_after_seconds_date_and_overflow_are_checked() {
     assert_eq!(retry_after("18446744073709551615", 1000), None);
     assert_eq!(retry_after("unknown", 1000), None);
 }
+
+#[test]
+fn restored_clock_rollback_guard_expires_monotonically() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("scope".into(), ProviderId::Codex, 1);
+    scheduler.restore_timing("scope", Some(1300), 0, 0, 1000, 0);
+    assert!(scheduler.start_due(1000, 0).is_empty());
+    assert!(scheduler.start_due(900, 119).is_empty());
+    assert_eq!(scheduler.start_due(900, 120), vec![("scope".into(), 1)]);
+}
+
+#[test]
+fn backoff_survives_a_clock_jump_during_the_read_without_permanent_deferral() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("scope".into(), ProviderId::Codex, 1);
+    assert_eq!(scheduler.start_due(1000, 0).len(), 1);
+    scheduler.complete("scope", 100000, 20, false, None);
+    assert!(scheduler.start_due(900, 139).is_empty());
+    assert_eq!(scheduler.start_due(900, 140).len(), 1);
+}
+
+#[test]
+fn reloading_restored_guards_does_not_renew_them_after_rollback() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("scope".into(), ProviderId::Codex, 1);
+    scheduler.restore_timing("scope", Some(1300), 1300, 1, 1000, 0);
+    scheduler.restore_timing("scope", Some(1300), 1300, 1, 900, 200);
+    assert!(scheduler.start_due(900, 299).is_empty());
+    assert_eq!(scheduler.start_due(900, 300).len(), 1);
+}
+
+#[test]
+fn rollback_does_not_revive_an_expired_restored_attempt() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("scope".into(), ProviderId::Codex, 1);
+    scheduler.restore_timing("scope", Some(100), 0, 0, 1000, 0);
+    assert_eq!(scheduler.start_due(0, 0).len(), 1);
+}
+
+#[test]
+fn newer_attempt_reservation_restores_a_floor_missing_from_the_snapshot() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("scope".into(), ProviderId::Codex, 1);
+    scheduler.restore_timing("scope", Some(100), 0, 0, 250, 0);
+    scheduler.restore_timing("scope", Some(200), 0, 0, 250, 0);
+    assert!(scheduler.start_due(250, 69).is_empty());
+    assert_eq!(scheduler.start_due(250, 70).len(), 1);
+}

@@ -204,7 +204,9 @@ impl QuotaCore {
                 }
             }
             for window in windows {
-                if window.freshness(now, request.max_age) != Freshness::Fresh {
+                if window.freshness_for(now, request.max_age, &request.required_measurements)
+                    != Freshness::Fresh
+                {
                     return Err(RefreshError::Partial);
                 }
                 coverage.push(window.key.clone());
@@ -229,13 +231,9 @@ impl QuotaCore {
     pub fn expire(&mut self, now: Timestamp) {
         let mut changed = false;
         for account in self.snapshot.accounts.values_mut() {
-            let previous_count = account.windows.len();
-            account.windows.retain(|_, window| {
-                window.used_fraction.as_ref().is_none_or(|sample| {
-                    now.saturating_sub(sample.observed_at) <= RETENTION_SECONDS
-                })
-            });
-            changed |= account.windows.len() != previous_count;
+            let previous_windows = account.windows.clone();
+            account.windows.retain(|_, window| window.expire(now));
+            changed |= account.windows != previous_windows;
         }
         if changed {
             self.snapshot.revision = self.snapshot.revision.saturating_add(1);
@@ -248,12 +246,9 @@ impl QuotaCore {
             .accounts
             .retain(|_, account| selector.matches(&account.scope));
         for account in snapshot.accounts.values_mut() {
-            account.windows.retain(|key, window| {
-                selector.matches_window(key)
-                    && window.used_fraction.as_ref().is_none_or(|sample| {
-                        now.saturating_sub(sample.observed_at) <= RETENTION_SECONDS
-                    })
-            });
+            account
+                .windows
+                .retain(|key, window| selector.matches_window(key) && window.expire(now));
         }
         snapshot
     }

@@ -117,6 +117,7 @@ pub enum ErrorCode {
     InvalidData,
     Persistence,
     UnsupportedVersion,
+    UnsupportedPlatform,
     CleanupFailed,
     Unknown,
 }
@@ -168,17 +169,64 @@ impl QuotaWindow {
     }
 
     pub fn freshness(&self, now: Timestamp, max_age: Duration) -> Freshness {
-        let Some(measurement) = self
-            .used_fraction
-            .as_ref()
-            .filter(|sample| sample.value.is_some())
-        else {
+        self.freshness_for(now, max_age, &[])
+    }
+
+    pub fn freshness_for(
+        &self,
+        now: Timestamp,
+        max_age: Duration,
+        required: &[MeasurementKind],
+    ) -> Freshness {
+        let measurements = [
+            (
+                MeasurementKind::UsedFraction,
+                self.used_fraction
+                    .as_ref()
+                    .filter(|sample| sample.value.is_some())
+                    .map(|sample| (sample.observed_at, sample.source)),
+            ),
+            (
+                MeasurementKind::Remaining,
+                self.remaining
+                    .as_ref()
+                    .filter(|sample| sample.value.is_some())
+                    .map(|sample| (sample.observed_at, sample.source)),
+            ),
+            (
+                MeasurementKind::Limit,
+                self.limit
+                    .as_ref()
+                    .filter(|sample| sample.value.is_some())
+                    .map(|sample| (sample.observed_at, sample.source)),
+            ),
+        ];
+        if required.iter().any(|kind| {
+            measurements
+                .iter()
+                .any(|(candidate, sample)| candidate == kind && sample.is_none())
+        }) {
             return Freshness::Unknown;
-        };
-        let age = Duration::from_secs(now.saturating_sub(measurement.observed_at).max(0) as u64);
-        let reason = if measurement.source == SourceKind::Persisted {
+        }
+        let samples = measurements
+            .into_iter()
+            .filter(|(kind, _)| required.is_empty() || required.contains(kind))
+            .filter_map(|(_, sample)| sample)
+            .collect::<Vec<_>>();
+        if samples.is_empty() {
+            return Freshness::Unknown;
+        }
+        let age = samples
+            .iter()
+            .map(|(at, _)| Duration::from_secs(now.saturating_sub(*at).max(0) as u64))
+            .max()
+            .unwrap_or_default();
+        let reason = if samples
+            .iter()
+            .any(|(_, source)| *source == SourceKind::Persisted)
+        {
             Some(StaleReason::Persisted)
-        } else if now < measurement.observed_at {
+        } else if samples.iter().any(|(at, _)| now < *at) {
             Some(StaleReason::ClockChanged)
         } else if self
             .reset_at
@@ -196,6 +244,28 @@ impl QuotaWindow {
             Some(reason) => Freshness::Stale { age, reason },
             None => Freshness::Fresh,
         }
+    }
+
+    pub(crate) fn expire(&mut self, now: Timestamp) -> bool {
+        fn expire<T>(sample: &mut Option<Measurement<T>>, now: Timestamp) {
+            if sample.as_ref().is_some_and(|sample| {
+                now.saturating_sub(sample.observed_at) > crate::RETENTION_SECONDS
+            }) {
+                *sample = None;
+            }
+        }
+        expire(&mut self.used_fraction, now);
+        expire(&mut self.remaining, now);
+        expire(&mut self.limit, now);
+        expire(&mut self.reset_at, now);
+        expire(&mut self.admission, now);
+        expire(&mut self.disabled, now);
+        self.used_fraction.is_some()
+            || self.remaining.is_some()
+            || self.limit.is_some()
+            || self.reset_at.is_some()
+            || self.admission.is_some()
+            || self.disabled.is_some()
     }
 }
 
@@ -301,10 +371,18 @@ impl Selector {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeasurementKind {
+    UsedFraction,
+    Remaining,
+    Limit,
+}
+
 #[derive(Clone, Debug)]
 pub struct FreshRequest {
     pub selector: Selector,
     pub max_age: Duration,
+    pub required_measurements: Vec<MeasurementKind>,
     pub deadline: Timestamp,
     pub allow_inference: bool,
 }
@@ -323,6 +401,7 @@ pub enum RefreshError {
     NotInstalled,
     NotLoggedIn,
     Unsupported,
+    UnsupportedPlatform,
     NotRefreshable,
     Deferred { retry_at: Timestamp },
     Failed(ErrorCode),

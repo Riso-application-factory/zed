@@ -8,7 +8,7 @@ owns = ["crates/crew_quota/**"]
 patches = ["Cargo.toml", "Cargo.lock", "crates/zed/Cargo.toml"]
 hooks = ["crew-quota-init"]
 watch = ["crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs"]
-relies_on = ["ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available"]
+relies_on = ["ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available"]
 contracts = ["cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
 obsolete_if = "Upstream supplies an app-wide attributed quota service with equivalent freshness, persistence, scheduling and Codex account read contracts."
 superseded_by = ""
@@ -40,7 +40,14 @@ and settings overrides in producer order, without inheriting the worker identity
 Send only initialize, initialized and account/rateLimits/read. Bound startup to
 15 seconds, reads to 25 seconds and output to 512 KiB; drain stderr without logging
 its contents. Close stdin after the read, allow three seconds for exit, then kill
-the owned process group; async-process reaps children, including cancellation.
+the owned Unix process group and await the direct child's exit; async-process
+also reaps cancellation paths. Windows reads fail closed as UnsupportedPlatform
+before spawning: the current std/async-process API cannot assign a kill-on-close
+Job Object atomically before the launcher executes. A post-spawn assignment
+would leave a descendant escape race, so Windows remains unsupported until an
+adapter can establish ownership at process creation. Synthetic subprocess tests
+exercise success, malformed protocol, timeout and cancellation on Unix; the same
+tests assert rejection without a launcher side effect on Windows.
 No inference, thread/session, login, renewal or credit mutation RPC is sent.
 No quota push is assumed. Prefer the map over its single-bucket fallback, retain
 actual window durations and epoch-second resets, and keep credits un-denominated.
@@ -55,8 +62,16 @@ the producer proves receives Partial, never a fabricated Fresh account.
 Persist bounded schema-v1 sanitized records and attempt guards in `crew_quota`
 scoped KVP through a serialized writer with five-second snapshot coalescing.
 Attempt reservations are durable before launching any read and are restored
-independently from snapshots; failure prevents launch. Future schemas are not
-overwritten.
+independently from snapshots; failure prevents launch. Attempts more than five
+minutes ahead of UTC and restored retry times beyond the supported one-hour
+backoff are rejected with a persistence diagnostic. Accepted restored guards and
+runtime cadence/backoff use monotonic deadlines, so clock rollback cannot renew
+a guard indefinitely. Future schemas are not overwritten.
+
+Freshness checks cover the consumer's requested fraction/remaining/limit fields;
+by default all known numeric fields must be fresh. Retention expires fields
+independently, preserving a fresh amount when an old fraction expires. Passive
+availability transitions and invalidation removals emit their typed events.
 Since an installation cannot prove the same account after restart, preserve its
 attempt guards but withhold numeric cache until a live read; decoder hydration
 always marks persisted observations stale. Auth/config-file notifications invalidate the runtime generation, cancel shared
