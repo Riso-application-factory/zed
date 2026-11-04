@@ -4,6 +4,7 @@ import json
 import io
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 from types import SimpleNamespace
@@ -466,13 +467,30 @@ class PrepareTests(unittest.TestCase):
 
     def test_workflow_pull_request_credentials_are_read_only(self):
         root = Path(__file__).resolve().parents[3]
-        workflow = (root / '.github/workflows/riso_checks.yml').read_text()
-        for name in ('riso-adr', 'riso-verify'):
-            block = workflow.split(f'\n  {name}:\n', 1)[1].split('\n  riso-', 1)[0]
+        workflow = (root / '.github/workflows/riso_ci.yml').read_text()
+        jobs = re.split(r'^  ([a-z0-9-]+):\n', workflow.split('\njobs:\n', 1)[1], flags=re.MULTILINE)
+        jobs = dict(zip(jobs[1::2], jobs[2::2]))
+        self.assertEqual(list(jobs), ['preflight', 'lint', 'adr-policy', 'clippy', 'build-and-test', 'ci-passed', 'notify-failure'])
+        for name in ('lint', 'adr-policy', 'clippy', 'build-and-test'):
+            block = jobs[name]
+            self.assertIn('    needs: preflight\n', block)
+            self.assertIn("    if: needs.preflight.outputs.run-checks == 'true'\n", block)
             self.assertIn('    permissions:\n      contents: read\n', block)
             self.assertNotIn(': write', block)
             self.assertIn('persist-credentials: false', block)
-        reporting = workflow.split('\n  riso-report-failure:\n', 1)[1]
+        preflight = jobs['preflight']
+        self.assertIn("github.repository_owner != 'zed-industries'", preflight)
+        self.assertIn('    permissions:\n      contents: read\n      pull-requests: read\n', preflight)
+        self.assertNotIn(': write', preflight)
+        self.assertNotIn('actions/checkout', preflight)
+        self.assertNotIn('python3 riso/', preflight)
+        aggregate = jobs['ci-passed']
+        self.assertIn('    permissions: {}\n', aggregate)
+        self.assertIn('!cancelled()', aggregate)
+        self.assertNotIn('actions/checkout', aggregate)
+        reporting = jobs['notify-failure']
+        self.assertIn('    needs: ci-passed\n', reporting)
+        self.assertIn("needs.ci-passed.result == 'failure'", reporting)
         self.assertIn("github.event_name == 'push'", reporting)
         self.assertIn("github.repository_owner != 'zed-industries'", reporting)
         self.assertIn('issues: write', reporting)
@@ -497,7 +515,7 @@ class PrepareTests(unittest.TestCase):
         self.assertIn("git config user.name 'riso-tech-bot[bot]'", workflow)
         self.assertIn("git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'", workflow)
         self.assertIn('    permissions:\n      contents: read\n      issues: write\n', workflow)
-        checks = (root / '.github/workflows/riso_checks.yml').read_text()
+        checks = (root / '.github/workflows/riso_ci.yml').read_text()
         self.assertIn('GH_TOKEN: ${{ github.token }}', checks)
         self.assertNotIn('app-token', checks)
 
