@@ -1,3 +1,4 @@
+mod panel;
 mod providers;
 
 use std::{
@@ -935,6 +936,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
         )
     });
     cx.set_global(GlobalQuota(service.clone()));
+    panel::init(cx);
     service.update(cx, |service, _| service._project = Some(project.clone()));
     let subscription = cx.subscribe(&store, {
         let service = service.downgrade();

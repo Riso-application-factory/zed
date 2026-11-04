@@ -1,14 +1,14 @@
 +++
 id = "ADR-0004"
-title = "Crew quota core and Codex source"
+title = "Crew quota service, Codex source and dock panel"
 status = "proposed"
 review = "human"
 intent = "Provide an app-wide attributed, freshness-aware quota API and a non-generative installed Codex source."
 owns = ["crates/crew_quota/**"]
 patches = ["Cargo.toml", "Cargo.lock", "crates/zed/Cargo.toml"]
 hooks = ["crew-quota-init"]
-watch = ["crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs"]
-relies_on = ["ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available"]
+watch = ["crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs", "crates/workspace/src/dock.rs", "crates/ui/src/components/button/button_like.rs"]
+relies_on = ["ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available", "Workspace observe_new receives its creation window before asynchronous dock restoration completes", "Workspace add_panel restores width through the stable panel_key", "Dock panel activation priorities must be unique; Crew quota reserves 100", "Dock relocation observes SettingsStore changes; Crew defers a SettingsStore pulse after changing its own KVP preference"]
 contracts = ["cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
 obsolete_if = "Upstream supplies an app-wide attributed quota service with equivalent freshness, persistence, scheduling and Codex account read contracts."
 superseded_by = ""
@@ -24,8 +24,8 @@ whose freshness does not change on a failed read, reset countdown or restart.
 
 Own a pure domain core, reducer, validation and scheduler in `crew_quota`; keep
 GPUI, inventory, process, registry and KVP types behind `upstream.rs` and its
-provider module. Initialize once through `crew-quota-init`. This PR adds no UI,
-HTTP observer, other provider adapters or credential mutations.
+provider and panel modules. Initialize once through `crew-quota-init`. The panel
+adds no HTTP observer, other provider adapters or credential mutations.
 
 The Codex adapter resolves the existing registry installation without calling
 `get_command`, which invokes npm installation even for an installed package.
@@ -90,9 +90,22 @@ exception avoids duplicating upstream Node settings and path selection. The whol
 launch resolver is bounded to fifteen seconds, and NotInstalled returns before
 any call to NodeRuntime::binary_path.
 
-This PR exposes the service API and Codex windows only. Later PRs add Claude,
-Antigravity, the native xAI passive HTTP decorator, the Left/Right dock panel and
-the status bar. Display defaults are Detailed/Remaining for the panel and
+The dock panel attaches synchronously through `observe_new::<Workspace>` without
+waiting for provider data. It owns a stable `CrewQuotaPanel` persistent name and
+`crew_quota` size key, uses generic workspace width persistence, and exposes the
+workspace dock button plus `crew_quota::ToggleFocus` and `RefreshQuota` actions
+without default keybindings. Crew-scoped KVP stores Left/Right placement and
+Detailed/Compact and Used/Remaining preferences. Preferences load before
+workspace creation; writes are serialized. Dock relocation requires a deferred
+SettingsStore notification because the upstream dock does not observe a panel
+position event. Panel activation holds a renewable service demand lease; one
+local minute timer updates countdowns without provider calls. Unsupported provider
+sources remain explicit and cached data retains stale/error labels. A workspace
+created without a window attaches on its first window render through a deferred
+action renderer; the usual creation-window path remains synchronous.
+
+Later commits add Claude, Antigravity, the native xAI passive HTTP decorator and
+the separate provider-summary status bar. Display defaults are Detailed/Remaining for the panel and
 Compact/Remaining for the status bar, with used-fraction colors at 60/80.
 
 ## Merge notes
