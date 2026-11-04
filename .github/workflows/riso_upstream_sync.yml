@@ -110,14 +110,6 @@ jobs:
             ${{ runner.temp }}/plan.json
             ${{ runner.temp }}/body-auto.md
             ${{ runner.temp }}/body-blocked.md
-      - name: Publish plan summary
-        if: always()
-        run: |
-          for body in body-auto.md body-blocked.md; do
-            if [ -f "$RUNNER_TEMP/$body" ]; then
-              cat "$RUNNER_TEMP/$body" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
   explain:
     name: 'Explain: describe upstream impact with Claude'
     needs: plan
@@ -181,15 +173,6 @@ jobs:
           name: riso-sync-explanations
           path: ${{ runner.temp }}/explanations
           if-no-files-found: ignore
-      - name: Publish explanation summary
-        run: |
-          for scope in auto blocked; do
-            if [ -f "$RUNNER_TEMP/explanations/$scope.json" ]; then
-              printf '\n### Claude: %s\n\n```json\n' "$scope" >> "$GITHUB_STEP_SUMMARY"
-              jq '.structured_output // .result' "$RUNNER_TEMP/explanations/$scope.json" >> "$GITHUB_STEP_SUMMARY" || cat "$RUNNER_TEMP/explanations/$scope.json" >> "$GITHUB_STEP_SUMMARY"
-              printf '```\n' >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
   apply:
     name: 'Apply: open sync pull requests'
     needs: [plan, explain]
@@ -249,7 +232,8 @@ jobs:
       #   Commit · Tiêu đề · Luật · Jev · Claude (tham khảo) · Level · Xử lý.
       #   Nhận định của Claude được đọc bằng riso_claude.load_review(); output hỏng thì bỏ qua.
       #   Ghi chú của Claude được chèn bằng riso_report.append_explanation(), sau khi vô hiệu hoá @mention và comment HTML.
-      # - Với --dry-run, nội dung PR/issue được in ra log thay vì gửi lên GitHub.
+      # - Nội dung PR/issue cuối cùng (bảng + ghi chú) được ghi vào summary của lần chạy (publish_step_summary()),
+      #   kể cả khi --dry-run; với --dry-run nó được in ra log thay vì gửi lên GitHub.
       # - --dry-run chỉ in các lệnh git/gh, không thay đổi gì.
       - name: Prepare review requests
         env:

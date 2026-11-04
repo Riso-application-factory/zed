@@ -60,6 +60,7 @@ class Executor:
             Path(path).write_text(text)
 
     def body_command(self, command, body):
+        publish_step_summary(command, body)
         if self.dry_run:
             output = self.run(*command, "--body-file", "<generated-body>")
             print(body)
@@ -68,6 +69,16 @@ class Executor:
             path = Path(directory) / "body.md"
             self.write(path, body)
             return self.run(*command, "--body-file", path)
+
+
+def publish_step_summary(command, body):
+    """Show every generated PR, issue or comment body on the workflow run page, including in dry runs."""
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary:
+        return
+    target = " ".join(argument for argument in command[1:3])
+    with open(summary, "a") as output:
+        output.write(f"<!-- {target} -->\n{body.rstrip()}\n\n---\n\n")
 
 
 def exists(root, reference):

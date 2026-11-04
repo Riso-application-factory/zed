@@ -428,6 +428,15 @@ class PrepareTests(unittest.TestCase):
             prepare(executor, self.config, self.plan(target), push=True, github=True)
         self.assertIn('Bản đồng bộ tự động', output.getvalue())
 
+    def test_generated_bodies_reach_the_step_summary(self):
+        target = self.upstream()
+        summary = Path(self.directory.name) / 'summary.md'
+        with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': str(summary)}):
+            prepare(Executor(self.root, True), self.config, self.plan(target), push=True, github=True)
+        written = summary.read_text()
+        self.assertIn('<!-- pr create -->\nBản đồng bộ tự động', written)
+        self.assertEqual(written.count('Bản đồng bộ'), 1)
+
     def test_waiting_blocked_exits_before_git_mutation(self):
         for kind in ('pr', 'issue'):
             with self.subTest(kind=kind):
