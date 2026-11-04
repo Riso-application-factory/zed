@@ -1,18 +1,12 @@
 use super::*;
 use gpui::{Action, FocusHandle, Focusable, Render, Window, actions, px, relative};
 use serde::{Deserialize, Serialize};
-use ui::{
-    Chip, Icon, IconButton, IconName, Label, ToggleButtonGroup, ToggleButtonGroupStyle,
-    ToggleButtonSimple, Tooltip, prelude::*,
-};
+use ui::{ButtonLike, Chip, Icon, IconButton, IconName, Label, Tooltip, prelude::*};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
-
-#[cfg(debug_assertions)]
-use ui::Button;
 
 actions!(crew_quota, [ToggleFocus, RefreshQuota]);
 
@@ -27,6 +21,7 @@ struct Preferences {
     left: bool,
     compact: bool,
     used: bool,
+    collapsed: BTreeSet<ProviderId>,
 }
 
 struct PanelPreferences {
@@ -160,6 +155,7 @@ pub struct QuotaPanel {
     #[cfg(debug_assertions)]
     preview: Option<preview::FixturePreview>,
     focus: FocusHandle,
+    provider_focus: BTreeMap<ProviderId, FocusHandle>,
     service: Option<Entity<QuotaService>>,
     preferences: Entity<PanelPreferences>,
     demand: Option<DemandLease>,
@@ -199,6 +195,15 @@ impl QuotaPanel {
             #[cfg(debug_assertions)]
             preview: preview::FixturePreview::from_environment(),
             focus: cx.focus_handle(),
+            provider_focus: [
+                ProviderId::Claude,
+                ProviderId::Codex,
+                ProviderId::Antigravity,
+                ProviderId::Grok,
+            ]
+            .into_iter()
+            .map(|provider| (provider, cx.focus_handle()))
+            .collect(),
             service,
             preferences,
             demand: None,
@@ -240,6 +245,19 @@ impl QuotaPanel {
             .log_err();
         }));
         cx.notify();
+    }
+
+    fn toggle_provider(&mut self, provider: ProviderId, cx: &mut Context<Self>) {
+        #[cfg(debug_assertions)]
+        if let Some(preview) = &mut self.preview {
+            toggle_collapsed(&mut preview.preferences, provider);
+            cx.notify();
+            return;
+        }
+        self.preferences.update(cx, |preferences, cx| {
+            toggle_collapsed(&mut preferences.value, provider);
+            preferences.save(cx);
+        });
     }
 
     fn change_preference(&mut self, compact: bool, cx: &mut Context<Self>) {
@@ -319,7 +337,7 @@ impl Panel for QuotaPanel {
         Some(px(280.))
     }
     fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::Clock)
+        Some(IconName::SignalHigh)
     }
     fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
         Some("Quota")
@@ -402,6 +420,7 @@ fn provider_rows(snapshot: &QuotaSnapshot) -> Vec<ProviderRow<'_>> {
         let used = accounts
             .iter()
             .flat_map(|account| account.windows.values())
+            .filter(|window| !window.disabled.as_ref().is_some_and(|sample| sample.value))
             .filter_map(used_fraction)
             .max_by(f64::total_cmp);
         ProviderRow {
@@ -511,6 +530,12 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
     }
     states.join(" · ")
 }
+fn toggle_collapsed(preferences: &mut Preferences, provider: ProviderId) {
+    if !preferences.collapsed.remove(&provider) {
+        preferences.collapsed.insert(provider);
+    }
+}
+
 fn badge(label: impl Into<SharedString>, color: Color, cx: &App) -> impl IntoElement {
     h_flex().child(
         Chip::new(label)
@@ -603,7 +628,7 @@ impl Render for QuotaPanel {
             })
             .min();
         let mut content = v_flex().gap_3();
-        for row in provider_rows(&snapshot) {
+        for (provider_index, row) in provider_rows(&snapshot).into_iter().enumerate() {
             let (name, icon) = match row.provider {
                 ProviderId::Claude => ("Claude", IconName::AiClaude),
                 ProviderId::Codex => ("Codex", IconName::AiOpenAi),
@@ -616,36 +641,117 @@ impl Render for QuotaPanel {
                 .flat_map(|account| account.windows.values())
                 .filter_map(|window| window.reset_at.as_ref()?.value)
                 .min();
-            let mut provider = v_flex()
-                .gap_2()
-                .pb_3()
-                .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .size_5()
-                                        .rounded_md()
-                                        .bg(cx.theme().colors().element_background)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(Icon::new(icon).size(IconSize::Small)),
-                                )
-                                .child(Label::new(name)),
-                        )
-                        .child(
+            let provider_id = row.provider;
+            let expanded = !preferences.collapsed.contains(&provider_id);
+            let headline = row
+                .used
+                .map(|used| {
+                    format!(
+                        "{:.0}% {}",
+                        display_fraction(used, preferences.used) * 100.,
+                        if preferences.used { "used" } else { "left" }
+                    )
+                })
+                .unwrap_or_else(|| "Unknown".into());
+            let mut provider =
+                v_flex()
+                    .gap_2()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        ButtonLike::new(format!("quota-provider-{provider_id:?}"))
+                            .width(relative(1.))
+                            .when_some(self.provider_focus.get(&provider_id), |button, focus| {
+                                button.track_focus(focus)
+                            })
+                            .tab_index(6 + provider_index as isize)
+                            .aria_label(format!("{name}, {headline}, quota windows"))
+                            .aria_expanded(expanded)
+                            .tooltip(Tooltip::text(format!(
+                                "{} {name} quota windows",
+                                if expanded { "Collapse" } else { "Expand" }
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_provider(provider_id, cx)
+                            }))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                Icon::new(if expanded {
+                                                    IconName::ChevronDown
+                                                } else {
+                                                    IconName::ChevronRight
+                                                })
+                                                .size(IconSize::XSmall),
+                                            )
+                                            .child(Icon::new(icon).size(IconSize::Small))
+                                            .child(Label::new(name)),
+                                    )
+                                    .child(
+                                        Label::new(headline)
+                                            .size(LabelSize::Small)
+                                            .color(row.used.map(severity).unwrap_or(Color::Muted)),
+                                    ),
+                            ),
+                    );
+            if !expanded {
+                let mut statuses = BTreeSet::new();
+                for account in &row.accounts {
+                    for state in account_status(account, now)
+                        .split(" · ")
+                        .filter(|state| !state.is_empty())
+                    {
+                        statuses.insert(state.to_string());
+                    }
+                }
+                if row
+                    .accounts
+                    .iter()
+                    .flat_map(|account| account.windows.values())
+                    .any(|window| window.disabled.as_ref().is_some_and(|sample| sample.value))
+                {
+                    statuses.insert("Disabled bucket".into());
+                }
+                if row.accounts.is_empty() {
+                    statuses.insert(if provider_id == ProviderId::Codex {
+                        "Unknown".into()
+                    } else {
+                        "Unsupported · source pending".into()
+                    });
+                }
+                provider = provider
+                    .child(
+                        h_flex()
+                            .flex_wrap()
+                            .gap_1()
+                            .children(statuses.into_iter().map(|state| {
+                                let color = if state.starts_with("Error") || state == "Exhausted" {
+                                    Color::Error
+                                } else if state == "Stale" {
+                                    Color::Warning
+                                } else {
+                                    Color::Muted
+                                };
+                                badge(state, color, cx)
+                            })),
+                    )
+                    .child(
+                        h_flex().justify_end().child(
                             Label::new(countdown(earliest, now))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         ),
-                );
+                    );
+                content = content.child(provider);
+                continue;
+            }
             if row.accounts.is_empty() {
                 provider = provider.child(badge(
                     if row.provider == ProviderId::Codex {
@@ -842,82 +948,122 @@ impl Render for QuotaPanel {
             }
             content = content.child(provider);
         }
-        let mut tab_index = 0;
-        let controls = v_flex()
-            .gap_2()
+        let controls = h_flex()
+            .id("quota-header-controls")
+            .debug_selector(|| "quota-header-controls".into())
+            .gap_1()
             .child(
-                ToggleButtonGroup::single_row(
-                    "quota-density",
-                    [
-                        ToggleButtonSimple::new(
-                            "Detailed",
-                            cx.listener(|this, _, _, cx| {
+                h_flex()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        IconButton::new("quota-detailed", IconName::ExpandVertical)
+                            .toggle_state(!preferences.compact)
+                            .tab_index(0_isize)
+                            .aria_label("Detailed quota view")
+                            .tooltip(Tooltip::text("Detailed: show every quota window"))
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if this.display_preferences(cx).compact {
                                     this.change_preference(true, cx);
                                 }
-                            }),
-                        )
-                        .tooltip(Tooltip::text("Show all quota windows")),
-                        ToggleButtonSimple::new(
-                            "Compact",
-                            cx.listener(|this, _, _, cx| {
+                            })),
+                    )
+                    .child(
+                        IconButton::new("quota-compact", IconName::FoldVertical)
+                            .toggle_state(preferences.compact)
+                            .tab_index(1_isize)
+                            .aria_label("Compact quota view")
+                            .tooltip(Tooltip::text("Compact: show the most constrained window"))
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if !this.display_preferences(cx).compact {
                                     this.change_preference(true, cx);
                                 }
-                            }),
-                        )
-                        .tooltip(Tooltip::text("Show the most constrained window")),
-                    ],
-                )
-                .selected_index(usize::from(preferences.compact))
-                .style(ToggleButtonGroupStyle::Filled)
-                .tab_index(&mut tab_index),
+                            })),
+                    ),
             )
             .child(
-                ToggleButtonGroup::single_row(
-                    "quota-values",
-                    [
-                        ToggleButtonSimple::new(
-                            "Remaining",
-                            cx.listener(|this, _, _, cx| {
+                h_flex()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        IconButton::new("quota-remaining", IconName::RotateCw)
+                            .toggle_state(!preferences.used)
+                            .tab_index(2_isize)
+                            .aria_label("Show remaining quota")
+                            .tooltip(Tooltip::text("Remaining quota; colors follow percent used"))
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if this.display_preferences(cx).used {
                                     this.change_preference(false, cx);
                                 }
-                            }),
-                        )
-                        .tooltip(Tooltip::text(
-                            "Show remaining quota; colors still follow usage",
-                        )),
-                        ToggleButtonSimple::new(
-                            "Used",
-                            cx.listener(|this, _, _, cx| {
+                            })),
+                    )
+                    .child(
+                        IconButton::new("quota-used", IconName::RotateCcw)
+                            .toggle_state(preferences.used)
+                            .tab_index(3_isize)
+                            .aria_label("Show used quota")
+                            .tooltip(Tooltip::text("Used quota"))
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 if !this.display_preferences(cx).used {
                                     this.change_preference(false, cx);
                                 }
-                            }),
-                        )
-                        .tooltip(Tooltip::text("Show consumed quota")),
-                    ],
-                )
-                .selected_index(usize::from(preferences.used))
-                .style(ToggleButtonGroupStyle::Filled)
-                .tab_index(&mut tab_index),
+                            })),
+                    ),
             );
+        #[cfg(debug_assertions)]
+        let controls = if let Some(preview) = &self.preview {
+            controls.child(
+                IconButton::new("quota-preview-scene", IconName::Eye)
+                    .toggle_state(preview.states)
+                    .tab_index(5_isize)
+                    .aria_label("Switch sample quota scene")
+                    .tooltip(Tooltip::text(if preview.states {
+                        "All states scene; switch to Overview"
+                    } else {
+                        "Overview scene; switch to All states"
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(preview) = &mut this.preview {
+                            let preferences = preview.preferences.clone();
+                            let left = preview.left;
+                            *preview = preview::FixturePreview::new(
+                                chrono::Utc::now().timestamp(),
+                                !preview.states,
+                            );
+                            preview.preferences = preferences;
+                            preview.left = left;
+                        }
+                        cx.notify();
+                    })),
+            )
+        } else {
+            controls
+        };
         let header = v_flex()
             .gap_2()
             .child(
-                h_flex().justify_between().child(Label::new("Quota")).child(
-                    IconButton::new("refresh-quota", IconName::RotateCw)
-                        .disabled(self.refresh_task.is_some())
-                        .tab_index(4_isize)
-                        .aria_label("Refresh quota")
-                        .tooltip(Tooltip::text(if self.is_preview() {
-                            "Reload sample data"
-                        } else {
-                            "Refresh quota"
-                        }))
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                ),
+                h_flex()
+                    .id("quota-header-row")
+                    .debug_selector(|| "quota-header-row".into())
+                    .justify_between()
+                    .gap_2()
+                    .child(Label::new("Quota"))
+                    .child(
+                        h_flex().gap_1().child(controls).child(
+                            IconButton::new("refresh-quota", IconName::RotateCw)
+                                .disabled(self.refresh_task.is_some())
+                                .tab_index(4_isize)
+                                .aria_label("Refresh quota")
+                                .tooltip(Tooltip::text(if self.is_preview() {
+                                    "Reload sample data"
+                                } else {
+                                    "Refresh quota"
+                                }))
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                        ),
+                    ),
             )
             .child(
                 Label::new(if self.refresh_task.is_some() {
@@ -929,36 +1075,8 @@ impl Render for QuotaPanel {
                 .color(Color::Muted),
             );
         #[cfg(debug_assertions)]
-        let header = if let Some(preview) = &self.preview {
-            header.child(
-                h_flex()
-                    .justify_between()
-                    .child(badge("Sample data · debug preview", Color::Warning, cx))
-                    .child(
-                        Button::new(
-                            "quota-preview-scene",
-                            if preview.states {
-                                "Overview"
-                            } else {
-                                "All states"
-                            },
-                        )
-                        .tab_index(5_isize)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if let Some(preview) = &mut this.preview {
-                                let preferences = preview.preferences.clone();
-                                let left = preview.left;
-                                *preview = preview::FixturePreview::new(
-                                    chrono::Utc::now().timestamp(),
-                                    !preview.states,
-                                );
-                                preview.preferences = preferences;
-                                preview.left = left;
-                            }
-                            cx.notify();
-                        })),
-                    ),
-            )
+        let header = if self.preview.is_some() {
+            header.child(badge("Sample data · debug preview", Color::Warning, cx))
         } else {
             header
         };
@@ -971,7 +1089,6 @@ impl Render for QuotaPanel {
             .font_features(gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
             .on_action(cx.listener(|this, _: &RefreshQuota, _, cx| this.refresh(cx)))
             .child(header)
-            .child(controls)
             .when_some(self.refresh_error.clone(), |element, error| {
                 element.child(Label::new(error).color(Color::Error))
             })
@@ -1080,6 +1197,58 @@ mod tests {
                         ),
                         |_, _| panel.clone().into_any_element(),
                     );
+                    panel.update_in(cx, |panel, window, cx| {
+                        let focus = panel
+                            .provider_focus
+                            .get(&ProviderId::Grok)
+                            .expect("provider focus");
+                        window.focus(focus, cx);
+                    });
+                    cx.update(|window, cx| window.draw(cx).clear(cx));
+                    cx.simulate_keystrokes("enter");
+                    cx.simulate_event(gpui::KeyUpEvent {
+                        keystroke: gpui::Keystroke::parse("enter").expect("enter key"),
+                    });
+                    panel.read_with(cx, |panel, cx| {
+                        assert!(
+                            panel
+                                .display_preferences(cx)
+                                .collapsed
+                                .contains(&ProviderId::Grok)
+                        )
+                    });
+                    cx.update(|window, cx| window.draw(cx).clear(cx));
+                    cx.simulate_keystrokes("space");
+                    cx.simulate_event(gpui::KeyUpEvent {
+                        keystroke: gpui::Keystroke::parse("space").expect("space key"),
+                    });
+                    panel.read_with(cx, |panel, cx| {
+                        assert!(
+                            !panel
+                                .display_preferences(cx)
+                                .collapsed
+                                .contains(&ProviderId::Grok)
+                        )
+                    });
+                    panel.update_in(cx, |panel, _, cx| {
+                        panel.toggle_provider(ProviderId::Antigravity, cx)
+                    });
+                    cx.draw(
+                        gpui::Point::default(),
+                        gpui::size(
+                            gpui::AvailableSpace::Definite(px(280.)),
+                            gpui::AvailableSpace::Definite(px(1000.)),
+                        ),
+                        |_, _| panel.clone().into_any_element(),
+                    );
+                    let header = cx.debug_bounds("quota-header-row").expect("header bounds");
+                    let controls = cx
+                        .debug_bounds("quota-header-controls")
+                        .expect("controls bounds");
+                    assert!(controls.right() <= header.right());
+                    panel.update_in(cx, |panel, _, cx| {
+                        panel.toggle_provider(ProviderId::Antigravity, cx)
+                    });
                 }
             }
         }
@@ -1210,6 +1379,7 @@ mod tests {
         panel.update_in(cx, |panel, _, cx| {
             panel.change_preference(true, cx);
             panel.change_preference(false, cx);
+            panel.toggle_provider(ProviderId::Codex, cx);
         });
         cx.run_until_parked();
         panel.read_with(cx, |_, cx| {
@@ -1221,6 +1391,7 @@ mod tests {
             let preferences: Preferences = serde_json::from_str(&value).expect("valid preferences");
             assert!(preferences.compact);
             assert!(preferences.used);
+            assert!(preferences.collapsed.contains(&ProviderId::Codex));
             assert!(!preferences.left);
         });
         panel.update_in(cx, |panel, window, cx| {
@@ -1321,6 +1492,25 @@ mod tests {
             provider_rows(&snapshot).first().map(|row| row.provider),
             Some(ProviderId::Codex)
         );
+    }
+
+    #[test]
+    fn provider_expansion_defaults_and_round_trips() {
+        let mut preferences: Preferences =
+            serde_json::from_str(r#"{"left":false,"used":false,"compact":false}"#)
+                .expect("legacy preferences");
+        assert!(preferences.collapsed.is_empty());
+        toggle_collapsed(&mut preferences, ProviderId::Codex);
+        toggle_collapsed(&mut preferences, ProviderId::Claude);
+        let encoded = serde_json::to_string(&preferences).expect("encode preferences");
+        let restored: Preferences = serde_json::from_str(&encoded).expect("restore preferences");
+        assert_eq!(
+            restored.collapsed,
+            BTreeSet::from([ProviderId::Codex, ProviderId::Claude])
+        );
+        toggle_collapsed(&mut preferences, ProviderId::Codex);
+        assert!(!preferences.collapsed.contains(&ProviderId::Codex));
+        assert!(preferences.collapsed.contains(&ProviderId::Claude));
     }
 
     #[test]

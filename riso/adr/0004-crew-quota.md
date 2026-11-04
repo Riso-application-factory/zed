@@ -7,7 +7,7 @@ intent = "Provide an app-wide attributed, freshness-aware quota API and a non-ge
 owns = ["crates/crew_quota/**"]
 patches = ["Cargo.toml", "Cargo.lock", "crates/zed/Cargo.toml"]
 hooks = ["crew-quota-init"]
-watch = ["crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs", "crates/workspace/src/dock.rs", "crates/ui/src/components/button/button_like.rs", "crates/ui/src/components/button/toggle_button.rs"]
+watch = ["crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs", "crates/workspace/src/dock.rs", "crates/ui/src/components/button/button_like.rs", "crates/ui/src/components/button/icon_button.rs", "crates/gpui/src/elements/div.rs"]
 relies_on = ["ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available", "Workspace observe_new receives its creation window before asynchronous dock restoration completes", "Workspace add_panel restores width through the stable panel_key", "Dock panel activation priorities must be unique; Crew quota reserves 100", "Dock relocation observes SettingsStore changes; Crew defers a SettingsStore pulse after changing its own KVP preference"]
 contracts = ["cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
 obsolete_if = "Upstream supplies an app-wide attributed quota service with equivalent freshness, persistence, scheduling and Codex account read contracts."
@@ -132,3 +132,18 @@ windows with rejected overage shown only as a note, Antigravity grouped limits
 and descriptions with explicit Disabled, and per-model Grok request/token
 amounts without invented resets. They are illustrative shapes, not captured
 account identities or evidence of provider connectivity.
+
+## Provider disclosure and compact header
+
+Crew KVP `panel_preferences.collapsed` records a set of provider IDs; a missing
+field or absent provider defaults to expanded. Disclosure state is shared across
+Detailed/Compact and workspace views. The debug fixture keeps this preference
+local like its other display controls; `CREW_QUOTA_PREVIEW_COLLAPSED=mixed`
+starts with Grok and Antigravity collapsed for review. Provider headers retain
+the most constrained known percentage and severity and expose keyboard
+activation plus expanded state. Their focus handles are stable per provider.
+
+The existing `SignalHigh` icon provides four rising usage bars for the dock
+button. No upstream icon list or assets change. Detailed/Compact and
+Remaining/Used use paired, labeled icon toggles beside Refresh on one header
+row, including at the panel minimum width of 280 px.

@@ -19,6 +19,12 @@ impl FixturePreview {
             std::env::var("CREW_QUOTA_PREVIEW_COMPACT").as_deref() == Ok("1");
         preview.preferences.used = std::env::var("CREW_QUOTA_PREVIEW_USED").as_deref() == Ok("1");
         preview.left = std::env::var("CREW_QUOTA_PREVIEW_LEFT").as_deref() == Ok("1");
+        if std::env::var("CREW_QUOTA_PREVIEW_COLLAPSED").as_deref() == Ok("mixed") {
+            preview
+                .preferences
+                .collapsed
+                .extend([ProviderId::Grok, ProviderId::Antigravity]);
+        }
         Some(preview)
     }
 
