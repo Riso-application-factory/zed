@@ -310,7 +310,14 @@ def record_auto_failure(executor, config, target, error):
     executor.body_command(command, body)
 
 
-def prepare(executor, config, plan, push=False, github=False):
+def explained(body, explanation):
+    if not explanation or not explanation.strip():
+        return body
+    from riso_report import append_explanation
+    return append_explanation(body, explanation)
+
+
+def prepare(executor, config, plan, push=False, github=False, explanations=None):
     from riso_report import render_auto_body, render_blocked_body, render_waiting_comment
 
     validate_plan(executor.root, config, plan)
@@ -332,7 +339,7 @@ def prepare(executor, config, plan, push=False, github=False):
             executor.run("git", "checkout", "-B", branch, plan["head"])
             if not merge(executor, target, f"Merge upstream {target[:7]} (riso sync, max L{auto['max_level']})"):
                 raise RuntimeError("Unexpected real conflict in auto prefix; merge aborted")
-            body = render_auto_body(plan, config) if github else None
+            body = explained(render_auto_body(plan, config), (explanations or {}).get("auto")) if github else None
             if push:
                 executor.run("git", "push", "--force-with-lease", "origin", branch)
         except (RuntimeError, OSError, ValueError) as error:
@@ -356,7 +363,7 @@ def prepare(executor, config, plan, push=False, github=False):
             clean = False
         else:
             clean = merge(executor, blocker["sha"])
-        body = render_blocked_body(plan, config)
+        body = explained(render_blocked_body(plan, config), (explanations or {}).get("blocked"))
         if not clean:
             if github:
                 label_arguments = labels(executor, config, blocker["level"], True)
@@ -371,14 +378,17 @@ def prepare(executor, config, plan, push=False, github=False):
     return 0
 
 
-def resolve(executor, config, target, finish=False):
+def resolve(executor, config, target, finish=False, start=None, claude_summary=None):
     target = git(executor.root, "rev-parse", "--verify", f"{target}^{{commit}}").strip()
     branch = config.branches.sync_blocked_prefix + target[:7]
     if not finish:
         require_clean(executor.root)
-        start = f"origin/{config.branches.sync_auto_branch}"
-        if not exists(executor.root, start):
-            start = f"origin/{config.branches.product}"
+        if start is None:
+            start = f"origin/{config.branches.sync_auto_branch}"
+            if not exists(executor.root, start):
+                start = f"origin/{config.branches.product}"
+        elif not exists(executor.root, start):
+            raise RuntimeError(f"Start reference {start} does not exist")
         executor.run("git", "checkout", "-B", branch, start)
         try:
             executor.run("git", "merge", "--no-ff", target)
@@ -404,9 +414,23 @@ def resolve(executor, config, target, finish=False):
     git(executor.root, "merge-base", "--is-ancestor", target, "HEAD")
     executor.github_repository(config)
     executor.run("git", "push", "--force-with-lease", "origin", branch)
-    publish_pull_request(executor, config, branch, f"Sync upstream → {target[:7]} (L3)",
-                         f"Đã xử lý thủ công upstream `{target}`.\n", 3, blocked=True)
+    if claude_summary is None:
+        body = f"Đã xử lý thủ công upstream `{target}`.\n"
+    else:
+        from riso_report import append_explanation
+        body = append_explanation(
+            f"Xung đột khi merge upstream `{target}` đã được giải tự động: Claude sửa các file mã (nếu có), "
+            "`cargo update --workspace` tạo lại Cargo.lock, hook được áp lại theo riso/hooks.toml. "
+            "Người review cần kiểm tra từng file trước khi merge rồi xoá review marker trong README.md.\n",
+            claude_summary, heading="Cách Claude giải xung đột",
+            note="Do Claude viết; hãy đối chiếu với diff thay vì tin vào phần tóm tắt này.")
+    publish_pull_request(executor, config, branch, f"Sync upstream → {target[:7]} (L3)", body, 3, blocked=True)
     return 0
+
+
+def optional_text(path):
+    """Read optional generated text; a missing file means the generator was skipped or failed."""
+    return Path(path).read_text() if path and Path(path).is_file() else ""
 
 
 def dispatch(arguments):
@@ -419,8 +443,12 @@ def dispatch(arguments):
         if arguments.command == "prepare":
             with Path(arguments.plan).open() as source:
                 plan = json.load(source)
-            return prepare(executor, config, plan, arguments.push, arguments.github)
-        return resolve(executor, config, arguments.sha, arguments.finish)
+            explanations = {scope: optional_text(getattr(arguments, f"explanation_{scope}", None))
+                            for scope in ("auto", "blocked")}
+            return prepare(executor, config, plan, arguments.push, arguments.github, explanations)
+        summary_path = getattr(arguments, "claude_summary", None)
+        summary = None if summary_path is None else optional_text(summary_path)
+        return resolve(executor, config, arguments.sha, arguments.finish, getattr(arguments, "start", None), summary)
     except (RuntimeError, ValueError, OSError) as error:
         print(str(error), file=sys.stderr)
         return 1
@@ -432,9 +460,13 @@ def register(subparsers):
     preparation.add_argument("--plan", required=True, help="Version 1 plan JSON file")
     preparation.add_argument("--push", action="store_true", help="Push prepared branches")
     preparation.add_argument("--github", action="store_true", help="Create or update GitHub review requests")
+    preparation.add_argument("--explanation-auto", help="Optional Claude notes for the auto pull request")
+    preparation.add_argument("--explanation-blocked", help="Optional Claude notes for the blocked pull request or issue")
     resolution = subparsers.add_parser("resolve", help="Resolve a blocked upstream merge locally")
     resolution.add_argument("sha", help="Blocked upstream commit")
     resolution.add_argument("--finish", action="store_true", help="Verify and publish a resolved merge")
+    resolution.add_argument("--start", help="Reference to start the blocked branch from")
+    resolution.add_argument("--claude-summary", help="Publish the pull request with Claude's resolution summary")
     for parser in (mirror, preparation, resolution):
         parser.add_argument("--dry-run", action="store_true", help="Log side effects without executing them")
         parser.set_defaults(func=dispatch)
