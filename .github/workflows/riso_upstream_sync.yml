@@ -60,6 +60,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    outputs:
+      auto-target: ${{ steps.targets.outputs.auto-target }}
+      blocker-sha: ${{ steps.targets.outputs.blocker-sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
@@ -93,6 +96,11 @@ jobs:
           JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
         run: |
           python3 riso/sync/riso_sync.py plan --out "$RUNNER_TEMP/plan.json" --body-auto "$RUNNER_TEMP/body-auto.md" --body-blocked "$RUNNER_TEMP/body-blocked.md"
+      - name: Expose plan targets
+        id: targets
+        run: |
+          echo "auto-target=$(jq -r '.auto.target // ""' "$RUNNER_TEMP/plan.json")" >> "$GITHUB_OUTPUT"
+          echo "blocker-sha=$(jq -r '.blocker.sha // ""' "$RUNNER_TEMP/plan.json")" >> "$GITHUB_OUTPUT"
       - name: Upload plan
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -110,9 +118,79 @@ jobs:
               cat "$RUNNER_TEMP/$body" >> "$GITHUB_STEP_SUMMARY"
             fi
           done
+  explain:
+    name: 'Explain: describe upstream impact with Claude'
+    needs: plan
+    if: needs.plan.outputs.auto-target != '' || needs.plan.outputs.blocker-sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: riso/main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+      - name: Download plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: riso-sync-plan
+          path: ${{ runner.temp }}/riso-sync-plan
+      # `riso_sync.py claude-explain-context` → riso_claude.write_explain_context():
+      # - Lấy các commit từ L1 trở lên sẽ nằm trong PR auto (scope auto) hoặc PR blocked (scope blocked).
+      # - Ghi `git show` của từng commit, danh sách commit kèm lý do chấm level (commits.json) và prompt.md.
+      # - Không có commit nào từ L1 trở lên thì không ghi prompt, và Claude không được gọi cho scope đó.
+      - name: Prepare Claude context
+        run: |
+          for scope in auto blocked; do
+            python3 riso/sync/riso_sync.py claude-explain-context --plan "$RUNNER_TEMP/riso-sync-plan/plan.json" --scope "$scope" --out "$RUNNER_TEMP/claude/$scope"
+          done
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install Claude Code
+        run: npm install --global @anthropic-ai/claude-code@2.1.318
+      # Claude chỉ được đọc file (--restricted, chỉ có Read/Grep/Glob, không Bash, không mạng).
+      # Ghi chú của Claude không ảnh hưởng tới level hay auto-merge; Claude lỗi thì PR vẫn được mở, chỉ thiếu ghi chú.
+      - name: Explain with Claude
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/explanations"
+          for scope in auto blocked; do
+            context="$RUNNER_TEMP/claude/$scope"
+            if [ ! -f "$context/prompt.md" ]; then continue; fi
+            if ! claude --print "$(cat "$context/prompt.md")" --restricted --strict-mcp-config --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode dontAsk --add-dir "$context" --no-session-persistence --output-format text > "$RUNNER_TEMP/explanations/$scope.md"; then
+              echo "::warning::Claude could not explain the $scope pull request; it will be opened without notes."
+              rm -f "$RUNNER_TEMP/explanations/$scope.md"
+            fi
+          done
+      - name: Upload explanations
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: riso-sync-explanations
+          path: ${{ runner.temp }}/explanations
+          if-no-files-found: ignore
+      - name: Publish explanation summary
+        run: |
+          for scope in auto blocked; do
+            if [ -f "$RUNNER_TEMP/explanations/$scope.md" ]; then
+              printf '\n### Claude: %s\n\n' "$scope" >> "$GITHUB_STEP_SUMMARY"
+              cat "$RUNNER_TEMP/explanations/$scope.md" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
   apply:
     name: 'Apply: open sync pull requests'
-    needs: plan
+    needs: [plan, explain]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -143,6 +221,13 @@ jobs:
         with:
           name: riso-sync-plan
           path: ${{ runner.temp }}/riso-sync-plan
+      - name: Download explanations
+        # Explanations are optional: the explain job may be skipped or Claude may have failed.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: riso-sync-explanations
+          path: ${{ runner.temp }}/riso-sync-explanations
       # `riso_sync.py prepare` → riso_prepare.prepare():
       # - validate_plan(): kiểm tra plan.json đúng định dạng và khớp với repo (head phải bằng đỉnh hiện tại
       #   của riso/main, danh sách commit phải đúng khoảng upstream). Plan cũ hoặc bị sửa sẽ bị từ chối.
@@ -157,6 +242,8 @@ jobs:
       # - Blocker: tạo nhánh riso/sync/blocked/<sha7> từ nhánh auto rồi merge commit bị chặn. Merge sạch thì push
       #   và mở PR nhãn riso-sync-blocked; có xung đột thì mở issue hướng dẫn chạy
       #   `python3 riso/sync/riso_sync.py resolve <sha>` trên máy.
+      # - Ghi chú của Claude (nếu có) được chèn vào nội dung PR/issue bằng riso_report.append_explanation(),
+      #   sau khi đã vô hiệu hoá @mention và comment HTML.
       # - --dry-run chỉ in các lệnh git/gh, không thay đổi gì.
       - name: Prepare review requests
         env:
@@ -165,12 +252,148 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           arguments=(--plan "$RUNNER_TEMP/riso-sync-plan/plan.json" --push --github)
+          arguments+=(--explanation-auto "$RUNNER_TEMP/riso-sync-explanations/auto.md")
+          arguments+=(--explanation-blocked "$RUNNER_TEMP/riso-sync-explanations/blocked.md")
           if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
           python3 riso/sync/riso_sync.py prepare "${arguments[@]}"
+  resolve:
+    name: 'Resolve: let Claude resolve blocker conflicts'
+    needs: [plan, apply]
+    if: ${{ !cancelled() && needs.apply.result == 'success' && needs.plan.outputs.blocker-sha != '' && inputs.dry_run != true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    env:
+      BLOCKER: ${{ needs.plan.outputs.blocker-sha }}
+    steps:
+      # No credentials are persisted: Claude must never run next to a token that can push.
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: riso/main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Configure git
+        run: |
+          git config user.name 'riso-tech-bot[bot]'
+          git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'
+          git config merge.conflictStyle zdiff3
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+      - name: Decide whether Claude should resolve
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          short=${BLOCKER:0:7}
+          if [ -n "$(gh pr list --state open --head "riso/sync/blocked/$short" --json number --jq '.[0].number // empty')" ]; then
+            echo "The blocker already has a pull request (clean merge or earlier resolution)."
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          issue=$(gh issue list --state open --label riso-sync-blocked --json number,title --jq "map(select(.title | contains(\"→ $short\"))) | .[0].number // empty")
+          if [ -z "$issue" ]; then
+            echo "No open conflict issue for $short."
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if gh issue view "$issue" --json comments --jq '.comments[].body' | grep -qF "<!-- riso-claude-resolve $BLOCKER -->"; then
+            echo "Claude already attempted $short on issue #$issue; leaving it to a human."
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'run=true' >> "$GITHUB_OUTPUT"
+          echo "issue=$issue" >> "$GITHUB_OUTPUT"
+      # `riso_sync.py resolve <sha> --start <ref>` → riso_prepare.resolve():
+      # - Tạo nhánh riso/sync/blocked/<sha7> từ nhánh auto vừa push (nếu đợt này có auto prefix) hoặc từ riso/main,
+      #   giống cách prepare() đã làm khi gặp xung đột.
+      # - Chạy `git merge --no-ff <sha>` và để nguyên các file xung đột cho bước sau.
+      - name: Start the conflicting merge
+        if: steps.gate.outputs.run == 'true'
+        env:
+          START: ${{ needs.plan.outputs.auto-target != '' && 'origin/riso/sync/auto' || 'origin/riso/main' }}
+        run: python3 riso/sync/riso_sync.py resolve "$BLOCKER" --start "$START"
+      # `riso_sync.py claude-resolve-context` → riso_claude.write_resolve_context():
+      # - Liệt kê file xung đột (trừ Cargo.lock, vì Cargo.lock luôn được tạo lại bằng cargo).
+      # - Ghi diff upstream (upstream.patch), phần fork đã sửa trên các file đó (fork.diff) và prompt.md.
+      # - Chỉ có Cargo.lock xung đột thì không ghi prompt và Claude không được gọi.
+      - name: Prepare Claude context
+        if: steps.gate.outputs.run == 'true'
+        run: python3 riso/sync/riso_sync.py claude-resolve-context --target "$BLOCKER" --out "$RUNNER_TEMP/claude"
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          node-version: '22'
+      - name: Install Claude Code
+        if: steps.gate.outputs.run == 'true'
+        run: npm install --global @anthropic-ai/claude-code@2.1.318
+      # Claude chỉ có Read/Grep/Glob/Edit (--restricted: không Bash, không mạng) và chỉ được sửa file xung đột.
+      # Bước sau từ chối mọi thay đổi ngoài danh sách đó.
+      - name: Resolve conflicts with Claude
+        if: steps.gate.outputs.run == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          if [ -f "$RUNNER_TEMP/claude/prompt.md" ]; then
+            claude --print "$(cat "$RUNNER_TEMP/claude/prompt.md")" --restricted --strict-mcp-config --tools Read,Grep,Glob,Edit --allowedTools Read,Grep,Glob,Edit --permission-mode dontAsk --add-dir "$RUNNER_TEMP/claude" --no-session-persistence --output-format text > "$RUNNER_TEMP/claude/summary.md"
+          fi
+      # `riso_sync.py claude-stage-resolution` → riso_claude.stage_resolution():
+      # - Từ chối nếu còn conflict marker trong file xung đột.
+      # - Cargo.lock: lấy bản upstream rồi chạy `cargo update --workspace`.
+      # - Áp lại hook theo riso/hooks.toml và thêm review marker vào README.md để bắt buộc có người review.
+      # - Từ chối nếu có file nào khác bị sửa hoặc tạo mới, rồi commit merge.
+      - name: Verify and commit the resolution
+        if: steps.gate.outputs.run == 'true'
+        run: python3 riso/sync/riso_sync.py claude-stage-resolution
+      - name: Mint bot token
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RISO_BOT_APP_ID }}
+          private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}
+      # `riso_sync.py resolve <sha> --finish --claude-summary` → riso_prepare.resolve(finish=True):
+      # - Kiểm tra lại: không còn xung đột hay conflict marker, hook đã áp, cây làm việc sạch, merge đã commit.
+      # - Push nhánh riso/sync/blocked/<sha7> và mở PR L3 nhãn riso-sync-blocked (auto-merge luôn tắt),
+      #   nội dung gồm phần tóm tắt của Claude.
+      - name: Publish the resolution for review
+        id: publish
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git"
+          python3 riso/sync/riso_sync.py resolve "$BLOCKER" --finish --claude-summary "$RUNNER_TEMP/claude/summary.md"
+      - name: Report on the blocked issue
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE: ${{ steps.gate.outputs.issue }}
+          OUTCOME: ${{ steps.publish.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # shellcheck disable=SC2016 # The backticks are Markdown code formatting for the comment.
+          if [ "$OUTCOME" = success ]; then
+            pull_request=$(gh pr view "riso/sync/blocked/${BLOCKER:0:7}" --json url --jq .url)
+            printf 'Claude đã đề xuất cách giải xung đột cho upstream `%s` tại %s.\n\nSau khi review và merge PR đó, hãy đóng issue này để pipeline đồng bộ tiếp.\n' "$BLOCKER" "$pull_request" > "$RUNNER_TEMP/claude-comment.md"
+          else
+            printf 'Claude không giải được xung đột cho upstream `%s`. Cần xử lý thủ công bằng `python3 riso/sync/riso_sync.py resolve %s`.\n\nNhật ký: %s\n' "$BLOCKER" "$BLOCKER" "$RUN_URL" > "$RUNNER_TEMP/claude-comment.md"
+          fi
+          printf '\n<!-- riso-claude-resolve %s -->\n' "$BLOCKER" >> "$RUNNER_TEMP/claude-comment.md"
+          gh issue comment "$ISSUE" --body-file "$RUNNER_TEMP/claude-comment.md"
   notify-failure:
     name: 'Notify: record sync failure'
     needs: [mirror, plan, apply]
-    if: ${{ failure() && github.repository_owner != 'zed-industries' }}
+    # Explicit results instead of failure(): a Claude job failing must not open an issue that blocks the sync.
+    if: ${{ !cancelled() && github.repository_owner != 'zed-industries' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

@@ -405,6 +405,20 @@ class PrepareTests(unittest.TestCase):
                     self.assertIn('resolve ' + target, executor.last_body)
                 git(self.root, 'checkout', 'product')
 
+    def test_explanations_are_appended_to_review_requests(self):
+        sys.modules['riso_report'].append_explanation = lambda body, text: f'{body}|{text}'
+        target = self.upstream()
+        executor = LocalExecutor(self.root)
+        prepare(executor, self.config, self.plan(target), push=True, github=True,
+                explanations={'auto': 'Ghi chú auto', 'blocked': ''})
+        self.assertEqual(executor.last_body, 'Bản đồng bộ tự động|Ghi chú auto')
+        git(self.root, 'checkout', 'product')
+        blocker = {'sha': self.upstream('file.txt', 'upstream\n'), 'level': 3, 'mechanical_conflicts': [], 'real_conflicts': []}
+        executor = LocalExecutor(self.root)
+        prepare(executor, self.config, self.plan(blocker=blocker), push=True, github=True,
+                explanations={'auto': '', 'blocked': 'Ghi chú blocked'})
+        self.assertEqual(executor.last_body, 'Bản đồng bộ bị chặn|Ghi chú blocked')
+
     def test_waiting_blocked_exits_before_git_mutation(self):
         for kind in ('pr', 'issue'):
             with self.subTest(kind=kind):
@@ -451,6 +465,24 @@ class PrepareTests(unittest.TestCase):
         resolve(executor, self.config, target, True)
         self.assertIn(['git', 'push', '--force-with-lease', 'origin', 'riso/sync/blocked/' + target[:7]], executor.commands)
         self.assertFalse(any('--auto' in command for command in executor.commands))
+
+    def test_resolve_from_explicit_start_and_publish_claude_summary(self):
+        target = self.conflict()
+        fork = git(self.root, 'rev-parse', 'HEAD').strip()
+        git(self.root, 'update-ref', 'refs/remotes/origin/riso/sync/auto', self.base)
+        executor = LocalExecutor(self.root)
+        with self.assertRaisesRegex(RuntimeError, 'does not exist'):
+            resolve(executor, self.config, target, start='origin/missing')
+        resolve(executor, self.config, target, start=fork)
+        self.assertIn(['git', 'checkout', '-B', 'riso/sync/blocked/' + target[:7], fork], executor.commands)
+        self.write('file.txt', 'resolved\n')
+        self.commit('resolved')
+        sys.modules['riso_report'].append_explanation = lambda body, text, **keywords: f'{body}|{keywords["heading"]}|{text}'
+        resolve(executor, self.config, target, True, claude_summary='Giữ cả hai thay đổi')
+        self.assertIn('Claude sửa các file mã', executor.last_body)
+        self.assertTrue(executor.last_body.endswith('|Cách Claude giải xung đột|Giữ cả hai thay đổi'))
+        self.assertTrue(any(command[:3] == ['gh', 'pr', 'create'] and '--label' in command and 'riso-sync-blocked' in command
+                            for command in executor.commands))
 
     def test_disable_auto_handles_only_not_enabled_errors(self):
         executor = Executor(self.root)
@@ -502,7 +534,7 @@ class PrepareTests(unittest.TestCase):
 
     def test_workflow_uses_app_token_and_bot_identity(self):
         jobs = workflow_jobs('riso_upstream_sync.yml')
-        self.assertEqual(list(jobs), ['mirror', 'plan', 'apply', 'notify-failure'])
+        self.assertEqual(list(jobs), ['mirror', 'plan', 'explain', 'apply', 'resolve', 'notify-failure'])
         for name in ('mirror', 'apply', 'notify-failure'):
             first_step = jobs[name].split('    steps:\n', 1)[1].split('\n      - ', 1)[0]
             self.assertIn('uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2', first_step)
@@ -514,7 +546,8 @@ class PrepareTests(unittest.TestCase):
         for name in ('mirror', 'apply'):
             self.assertIn('token: ${{ steps.app-token.outputs.token }}', jobs[name])
         apply = jobs['apply']
-        self.assertIn('    needs: plan\n', apply)
+        self.assertIn('    needs: [plan, explain]\n', apply)
+        self.assertIn("needs.plan.result == 'success'", apply)
         preparation = apply.split('      - name: Prepare review requests\n', 1)[1]
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token }}', preparation)
         self.assertIn('GH_REPO: ${{ github.repository }}', preparation)
@@ -535,13 +568,45 @@ class PrepareTests(unittest.TestCase):
         self.assertNotIn(': write', plan)
         self.assertNotIn('app-token', plan)
         self.assertNotIn('RISO_BOT', plan)
-        for name in ('mirror', 'apply', 'notify-failure'):
+        for name in ('mirror', 'explain', 'apply', 'resolve', 'notify-failure'):
             self.assertNotIn('JEV_API_KEY', jobs[name])
+
+    def test_workflow_runs_claude_without_write_credentials(self):
+        jobs = workflow_jobs('riso_upstream_sync.yml')
+        for name in ('mirror', 'plan', 'apply', 'notify-failure'):
+            self.assertNotIn('CLAUDE_CODE_OAUTH_TOKEN', jobs[name])
+        for name in ('explain', 'resolve'):
+            block = jobs[name]
+            self.assertIn('persist-credentials: false', block)
+            invocations = [line for line in block.splitlines() if 'claude --print' in line]
+            self.assertTrue(invocations)
+            for line in invocations:
+                self.assertIn('--restricted', line)
+                self.assertIn('--strict-mcp-config', line)
+                self.assertIn('--permission-mode dontAsk', line)
+                tools = line.split('--tools ', 1)[1].split()[0].split(',')
+                self.assertNotIn('Bash', tools)
+                self.assertNotIn('WebFetch', tools)
+        explain = jobs['explain']
+        self.assertIn('    permissions:\n      contents: read\n    steps:', explain)
+        self.assertNotIn('app-token', explain)
+        self.assertNotIn('--tools Read,Grep,Glob,Edit', explain)
+        resolve = jobs['resolve']
+        self.assertIn('    needs: [plan, apply]\n', resolve)
+        self.assertIn('inputs.dry_run != true', resolve)
+        claude_step = resolve.split('      - name: Resolve conflicts with Claude\n', 1)[1].split('\n      - ', 1)[0]
+        self.assertIn('CLAUDE_CODE_OAUTH_TOKEN', claude_step)
+        self.assertNotIn('GH_TOKEN', claude_step)
+        self.assertNotIn('github.token', claude_step)
+        self.assertLess(resolve.index('Resolve conflicts with Claude'), resolve.index('uses: actions/create-github-app-token'))
+        self.assertLess(resolve.index('claude-stage-resolution'), resolve.index('git remote set-url origin'))
 
     def test_workflow_records_sync_failure_and_honors_dry_run(self):
         reporting = workflow_jobs('riso_upstream_sync.yml')['notify-failure']
         self.assertIn('    needs: [mirror, plan, apply]\n', reporting)
-        self.assertIn('if: ${{ failure()', reporting)
+        condition = next(line for line in reporting.splitlines() if line.startswith('    if: '))
+        self.assertIn("contains(needs.*.result, 'failure')", condition)
+        self.assertNotIn('failure()', condition)
         self.assertNotIn('actions/checkout', reporting)
         handler = reporting.split('      - name: Record unexpected sync failure\n', 1)[1]
         self.assertIn('GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}', handler)
