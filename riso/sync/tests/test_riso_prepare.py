@@ -526,7 +526,7 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(list(jobs), ['preflight', 'lint', 'adr-policy', 'clippy', 'build-and-test', 'ci-passed', 'notify-failure'])
         for name in ('lint', 'adr-policy', 'clippy', 'build-and-test'):
             block = jobs[name]
-            self.assertIn('    needs: preflight\n', block)
+            self.assertIn('    needs: preflight\n' if name in ('lint', 'adr-policy') else '    needs: [preflight, lint]\n', block)
             self.assertIn("    if: needs.preflight.outputs.run-checks == 'true'\n", block)
             self.assertIn('    permissions:\n      contents: read\n', block)
             self.assertNotIn(': write', block)

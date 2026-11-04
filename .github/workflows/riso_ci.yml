@@ -112,7 +112,9 @@ jobs:
           PY
   clippy:
     name: 'Lint: clippy on fork-owned crates'
-    needs: preflight
+    # Waits for the one-minute lint job so broken formatting or workflows skip this expensive job; the ADR policy
+    # is deliberately not a prerequisite because it fails until a human removes the review marker.
+    needs: [preflight, lint]
     if: needs.preflight.outputs.run-checks == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -131,7 +133,9 @@ jobs:
         run: ./script/clippy -p jev
   build-and-test:
     name: 'Build and test: Zed and ADR contracts'
-    needs: preflight
+    # Waits for the one-minute lint job so broken formatting or workflows skip this expensive job; the ADR policy
+    # is deliberately not a prerequisite because it fails until a human removes the review marker.
+    needs: [preflight, lint]
     if: needs.preflight.outputs.run-checks == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 150
