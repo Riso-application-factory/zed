@@ -4203,6 +4203,8 @@ dependencies = [
  "futures 0.3.34",
  "gpui",
  "http_client",
+ "language_model",
+ "language_models",
  "libc",
  "log",
  "node_runtime",

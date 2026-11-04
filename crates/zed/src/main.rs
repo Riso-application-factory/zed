@@ -519,6 +519,7 @@ fn main() {
                 .expect("could not start HTTP client")
         };
         cx.set_http_client(Arc::new(http));
+        crew_quota::install_http_observer(cx);
 
         <dyn Fs>::set_global(fs.clone(), cx);
 

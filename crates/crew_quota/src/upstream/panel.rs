@@ -502,6 +502,9 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
         }
         Availability::NotInstalled => "Not installed",
         Availability::NotLoggedIn => "Not logged in",
+        Availability::Unavailable(ErrorCode::AttributionAmbiguous) => {
+            "Unavailable · cannot attribute: SuperGrok and API key both signed in"
+        }
         Availability::Unavailable(_) => "Unavailable",
         Availability::Error(ErrorCode::CleanupFailed) => "Error — session pending cleanup",
         Availability::Error(_) if account.windows.is_empty() => "Error — quota unavailable",
@@ -690,10 +693,11 @@ impl Render for QuotaPanel {
                             .tab_index(6 + provider_index as isize)
                             .aria_label(format!("{name}, {headline}, quota windows"))
                             .aria_expanded(expanded)
-                            .tooltip(Tooltip::text(format!(
-                                "{} {name} quota windows",
-                                if expanded { "Collapse" } else { "Expand" }
-                            )))
+                            .tooltip(Tooltip::text(if provider_id == ProviderId::Grok {
+                                "Latest xAI response from recent usage only. Limits are per model and reflect the most recent request’s model; model is unknown unless exposed without reading bodies. Capture is unavailable when both providers are signed in: cannot attribute: SuperGrok and API key both signed in".to_string()
+                            } else {
+                                format!("{} {name} quota windows", if expanded { "Collapse" } else { "Expand" })
+                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_provider(provider_id, cx)
                             }))
@@ -742,16 +746,10 @@ impl Render for QuotaPanel {
                     statuses.insert("Disabled bucket".into());
                 }
                 if row.accounts.is_empty() {
-                    statuses.insert(
-                        if matches!(
-                            provider_id,
-                            ProviderId::Codex | ProviderId::Claude | ProviderId::Antigravity
-                        ) {
-                            "Unknown".into()
-                        } else {
-                            "Unsupported · source pending".into()
-                        },
-                    );
+                    statuses.insert("Unknown".into());
+                }
+                if provider_id == ProviderId::Grok {
+                    statuses.insert("Latest xAI response · recent usage only".into());
                 }
                 provider = provider
                     .child(
@@ -780,15 +778,11 @@ impl Render for QuotaPanel {
                 continue;
             }
             if row.accounts.is_empty() {
+                provider = provider.child(badge("Unknown", Color::Muted, cx));
+            }
+            if row.provider == ProviderId::Grok {
                 provider = provider.child(badge(
-                    if matches!(
-                        row.provider,
-                        ProviderId::Codex | ProviderId::Claude | ProviderId::Antigravity
-                    ) {
-                        "Unknown"
-                    } else {
-                        "Unsupported · source pending"
-                    },
+                    "Latest xAI response · recent usage only · limits are per model; this reflects the most recent request’s model (Unknown model)",
                     Color::Muted,
                     cx,
                 ));
@@ -899,7 +893,11 @@ impl Render for QuotaPanel {
                         .bucket
                         .strip_prefix("agy-v1/")
                         .unwrap_or(&window.key.bucket.bucket);
-                    let title = format!("{} · {}", bucket, window.key.role);
+                    let title = if account.scope.provider == ProviderId::Grok {
+                        format!("Latest xAI response · Unknown model · {}", window.key.role)
+                    } else {
+                        format!("{} · {}", bucket, window.key.role)
+                    };
                     let mut section = v_flex().gap_1().pl_6().child(
                         h_flex()
                             .justify_between()

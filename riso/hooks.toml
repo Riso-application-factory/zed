@@ -31,3 +31,10 @@ file = "crates/zed/src/main.rs"
 anchor = "        crew_model_catalog::init(app_state.clone(), cx);"
 position = "after"
 text = "        crew_quota::init(app_state.clone(), cx);"
+
+[[hooks]]
+id = "crew-quota-http"
+file = "crates/zed/src/main.rs"
+anchor = "        cx.set_http_client(Arc::new(http));"
+position = "after"
+text = "        crew_quota::install_http_observer(cx);"

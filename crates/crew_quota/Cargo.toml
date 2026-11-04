@@ -13,6 +13,9 @@ path = "src/crew_quota.rs"
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
+language_model.workspace = true
+language_models.workspace = true
 acp_thread.workspace = true
 agent_servers.workspace = true
 http_client.workspace = true

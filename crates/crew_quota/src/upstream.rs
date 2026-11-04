@@ -1,5 +1,7 @@
 mod antigravity;
 mod claude;
+mod grok;
+pub use grok::install_http_observer;
 mod panel;
 mod providers;
 
@@ -135,6 +137,8 @@ pub struct QuotaService {
     _writer: Task<()>,
     pending_persistence: BTreeMap<String, Task<()>>,
     _inventory: Option<Task<()>>,
+    grok_task: Option<Task<()>>,
+    grok_identity: Option<(String, bool)>,
     claude: claude::ClaudeState,
     antigravity_inventory: Option<Task<()>>,
     antigravity_identity: Option<(Vec<String>, Availability)>,
@@ -217,6 +221,8 @@ impl QuotaService {
             _writer: writer,
             pending_persistence: BTreeMap::new(),
             _inventory: None,
+            grok_task: None,
+            grok_identity: None,
             claude: Default::default(),
             antigravity_inventory: None,
             antigravity_identity: None,
@@ -277,6 +283,11 @@ impl QuotaService {
                 | RefreshError::Unsupported),
             ) => return Task::ready(Err(error)),
             Err(_) => {}
+        }
+        if self.core.snapshot.accounts.values().any(|account| {
+            request.selector.matches(&account.scope) && account.scope.provider == ProviderId::Grok
+        }) {
+            return Task::ready(Err(RefreshError::NotRefreshable));
         }
         if request.deadline <= self.ports.clock.now() {
             return Task::ready(Err(RefreshError::Deadline));
@@ -350,6 +361,9 @@ impl QuotaService {
             self.scheduler.force(&account.scope.id);
         }
         self.evaluate(cx);
+        if selector.provider == Some(ProviderId::Grok) {
+            return Task::ready(Err(RefreshError::NotRefreshable));
+        }
         let mut pending = Vec::new();
         for account in self
             .core
@@ -358,6 +372,9 @@ impl QuotaService {
             .values()
             .filter(|account| selector.matches(&account.scope))
         {
+            if account.scope.provider == ProviderId::Grok {
+                continue;
+            }
             if let Some(task) = self.tasks.get(&account.scope.id) {
                 pending.push(task.clone());
             } else {
@@ -381,7 +398,15 @@ impl QuotaService {
             }
         }
         if pending.is_empty() {
-            return Task::ready(Err(RefreshError::Unknown));
+            return Task::ready(Err(
+                if self.core.snapshot.accounts.values().any(|account| {
+                    selector.matches(&account.scope) && account.scope.provider == ProviderId::Grok
+                }) {
+                    RefreshError::NotRefreshable
+                } else {
+                    RefreshError::Unknown
+                },
+            ));
         }
         cx.spawn(async move |_, _| {
             for task in pending {
@@ -1011,6 +1036,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
         )
     });
     cx.set_global(GlobalQuota(service.clone()));
+    grok::init(&service, cx);
     panel::init(cx);
     claude::init(&service, &project, cx);
     antigravity::init(&service, &project, cx);
