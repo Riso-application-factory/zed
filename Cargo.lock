@@ -4194,6 +4194,7 @@ version = "0.1.0"
 dependencies = [
  "acp_thread",
  "agent_servers",
+ "agent_ui",
  "anyhow",
  "async-channel 2.5.0",
  "async-process",
@@ -4210,6 +4211,7 @@ dependencies = [
  "node_runtime",
  "paths",
  "project",
+ "remote_connection",
  "semver",
  "serde",
  "serde_json",

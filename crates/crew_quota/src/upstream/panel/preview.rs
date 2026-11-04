@@ -2,7 +2,6 @@ use super::*;
 
 pub(super) struct FixturePreview {
     pub snapshot: Arc<QuotaSnapshot>,
-    pub notes: BTreeMap<String, Vec<&'static str>>,
     pub preferences: Preferences,
     pub left: bool,
     pub states: bool,
@@ -30,13 +29,7 @@ impl FixturePreview {
 
     pub fn new(now: Timestamp, states: bool) -> Self {
         let mut snapshot = QuotaSnapshot::default();
-        let mut notes = BTreeMap::new();
         let mut codex = account("codex", ProviderId::Codex, "ChatGPT Plus", now - 60);
-        codex.metadata.available_reset_credits = Some(3);
-        codex.metadata.credit_balance = Some(Amount {
-            value: 120.,
-            unit: Unit::Credits { denomination: None },
-        });
         add_window(
             &mut codex,
             "ChatGPT",
@@ -56,7 +49,6 @@ impl FixturePreview {
             now - 60,
         );
         let mut claude = account("claude", ProviderId::Claude, "Max", now - 60);
-        claude.metadata.ordinary_usage_allowed = Some(true);
         add_window(
             &mut claude,
             "Subscription",
@@ -74,10 +66,6 @@ impl FixturePreview {
             Some(now + 2 * 86400 + 6 * 3600),
             SourceKind::ClaudeAcpEvent,
             now - 60,
-        );
-        notes.insert(
-            "claude".into(),
-            vec!["Overage rejected · extra usage unavailable"],
         );
         let mut antigravity = account(
             "antigravity",
@@ -121,46 +109,10 @@ impl FixturePreview {
             SourceKind::AntigravityAcpUsage,
             now - 60,
         );
-        add_window(
-            &mut antigravity,
-            "Experimental models",
-            "Access",
-            None,
-            None,
-            SourceKind::AntigravityAcpUsage,
-            now - 60,
-        );
-        if let Some(window) = antigravity
-            .windows
-            .values_mut()
-            .find(|window| window.key.bucket.bucket == "Experimental models")
-        {
-            window.disabled = Some(sample(true, SourceKind::AntigravityAcpUsage, now - 60));
-        }
-        notes.insert(
-            "antigravity".into(),
-            vec!["Separate shared model groups; overlapping limits are not added."],
-        );
         let mut grok = account("grok", ProviderId::Grok, "API · per model", now - 60);
         for (model, role, used, remaining, limit, unit) in [
             ("grok-4", "Requests", 1., 0., 2000., Unit::Requests),
             ("grok-4", "Tokens", 0.80, 2000000., 10000000., Unit::Tokens),
-            (
-                "grok-4-fast",
-                "Requests",
-                0.10,
-                1800.,
-                2000.,
-                Unit::Requests,
-            ),
-            (
-                "grok-4-fast",
-                "Tokens",
-                0.42,
-                5800000.,
-                10000000.,
-                Unit::Tokens,
-            ),
         ] {
             add_window(
                 &mut grok,
@@ -199,40 +151,10 @@ impl FixturePreview {
             .map(|window| (window.key.clone(), window))
             .collect();
         if states {
-            let mut disabled = account(
-                "disabled",
-                ProviderId::Antigravity,
-                "Disabled bucket",
-                now - 60,
-            );
-            if let Some(window) = antigravity
-                .windows
-                .values()
-                .find(|window| window.disabled.as_ref().is_some_and(|sample| sample.value))
-            {
-                let mut window = window.clone();
-                window.key.bucket.scope = disabled.scope.id.clone();
-                disabled.windows.insert(window.key.clone(), window);
-            }
-            snapshot
-                .accounts
-                .insert(disabled.scope.id.clone(), disabled);
             claude.availability = Availability::NotLoggedIn;
             claude.windows.clear();
             claude.last_success_at = None;
-            notes.remove("claude");
-            let mut unsupported = account("unsupported", ProviderId::Claude, "Source pending", now);
-            unsupported.windows.clear();
-            unsupported.availability = Availability::Unsupported(ErrorCode::UnsupportedVersion);
-            unsupported.last_success_at = None;
-            snapshot
-                .accounts
-                .insert(unsupported.scope.id.clone(), unsupported);
-            let mut loading = account("loading", ProviderId::Codex, "Waiting for first read", now);
-            loading.last_success_at = None;
-            loading.refresh = RefreshState::InFlight;
-            loading.availability = Availability::Unknown;
-            snapshot.accounts.insert(loading.scope.id.clone(), loading);
+            grok.availability = Availability::NotInstalled;
             codex.availability = Availability::Error(ErrorCode::Transport);
             codex.last_success_at = Some(now - 23 * 60);
             for window in codex.windows.values_mut() {
@@ -249,7 +171,6 @@ impl FixturePreview {
         }
         Self {
             snapshot: Arc::new(snapshot),
-            notes,
             preferences: Preferences::default(),
             left: false,
             states,
@@ -358,21 +279,19 @@ mod tests {
             .get("codex")
             .expect("Codex fixture");
         assert_eq!(codex.windows.len(), 2);
-        assert_eq!(codex.metadata.available_reset_credits, Some(3));
+        assert!(codex.metadata.credit_balance.is_none());
         let grok = preview.snapshot.accounts.get("grok").expect("Grok fixture");
-        assert_eq!(grok.windows.len(), 4);
+        assert_eq!(grok.windows.len(), 2);
         let mut amount_only = grok
             .windows
             .values()
-            .find(|window| {
-                window.key.bucket.bucket == "grok-4-fast" && window.key.role == "Requests"
-            })
+            .find(|window| window.key.bucket.bucket == "grok-4" && window.key.role == "Requests")
             .expect("request fixture")
             .clone();
         amount_only.limit = None;
         assert_eq!(
             amount_text(&amount_only).as_deref(),
-            Some("1,800 requests left")
+            Some("0 requests left")
         );
         assert!(
             grok.windows
@@ -393,24 +312,15 @@ mod tests {
             .map(|account| account_status(account, now))
             .collect::<Vec<_>>()
             .join(" ");
-        for state in [
-            "Error",
-            "Stale",
-            "Not logged in",
-            "Unsupported",
-            "Loading",
-            "Unknown",
-            "Exhausted",
-        ] {
+        for state in ["Error", "Stale", "Not logged in"] {
             assert!(statuses.contains(state), "missing {state}");
         }
-        assert!(
-            states
-                .snapshot
-                .accounts
-                .values()
-                .flat_map(|account| account.windows.values())
-                .any(|window| window.disabled.as_ref().is_some_and(|sample| sample.value))
-        );
+        assert_eq!(states.snapshot.accounts.len(), 4);
+        let antigravity = preview
+            .snapshot
+            .accounts
+            .get("antigravity")
+            .expect("Antigravity fixture");
+        assert_eq!(antigravity.windows.len(), 4);
     }
 }

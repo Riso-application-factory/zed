@@ -114,7 +114,7 @@ fn register_workspace(
     cx: &mut Context<Workspace>,
 ) {
     workspace.register_action(|workspace, _: &OpenQuotaSummary, window, cx| {
-        workspace.focus_panel::<QuotaPanel>(window, cx);
+        workspace.toggle_panel_focus::<QuotaPanel>(window, cx);
     });
     workspace.register_action(|_, _: &ToggleStatusSummary, _, cx| {
         let preferences = cx.global::<GlobalPreferences>().0.clone();
@@ -143,7 +143,7 @@ fn register_workspace(
                 cx.defer(|cx| cx.update_global::<SettingsStore, _>(|_, _| {}));
                 cx.notify();
             });
-            workspace.focus_panel::<QuotaPanel>(window, cx);
+            workspace.toggle_panel_focus::<QuotaPanel>(window, cx);
         }
     });
     workspace.register_action(|workspace, _: &RefreshQuota, _, cx| {
@@ -435,11 +435,16 @@ fn provider_rows(snapshot: &QuotaSnapshot) -> Vec<ProviderRow<'_>> {
     ]
     .into_iter()
     .map(|provider| {
-        let accounts = snapshot
+        let mut accounts = snapshot
             .accounts
             .values()
-            .filter(|account| account.scope.provider == provider)
+            .filter(|account| {
+                account.scope.provider == provider
+                    && account.availability != Availability::NotInstalled
+            })
             .collect::<Vec<_>>();
+        accounts.sort_by_key(|account| std::cmp::Reverse(account.last_success_at));
+        accounts.truncate(1);
         let used = accounts
             .iter()
             .flat_map(|account| account.windows.values())
@@ -452,6 +457,7 @@ fn provider_rows(snapshot: &QuotaSnapshot) -> Vec<ProviderRow<'_>> {
             used,
         }
     })
+    .filter(|row| !row.accounts.is_empty())
     .collect::<Vec<_>>();
     rows.sort_by(|left, right| {
         right
@@ -461,6 +467,157 @@ fn provider_rows(snapshot: &QuotaSnapshot) -> Vec<ProviderRow<'_>> {
     });
     rows
 }
+fn visible_windows(account: &AccountState) -> Vec<&QuotaWindow> {
+    let mut windows = account
+        .windows
+        .values()
+        .filter(|window| {
+            !window.disabled.as_ref().is_some_and(|sample| sample.value)
+                && if account.scope.provider == ProviderId::Grok {
+                    matches!(
+                        window.key.role.as_str(),
+                        "Requests" | "Tokens" | "requests" | "tokens"
+                    )
+                } else {
+                    matches!(window.key.duration_seconds, Some(18000 | 604800))
+                }
+        })
+        .collect::<Vec<_>>();
+    if account.scope.provider == ProviderId::Grok {
+        windows.sort_by_key(|window| {
+            std::cmp::Reverse(window.remaining.as_ref().map(|sample| sample.observed_at))
+        });
+        let mut roles = BTreeSet::new();
+        windows.retain(|window| roles.insert(window.key.role.to_lowercase()));
+    }
+    windows.sort_by(|left, right| left.key.cmp(&right.key));
+    windows
+}
+
+fn window_title(account: &AccountState, window: &QuotaWindow) -> String {
+    let role = match window.key.duration_seconds {
+        Some(18000) => "5h",
+        Some(604800) => "Week",
+        _ => window.key.role.as_str(),
+    };
+    if account.scope.provider == ProviderId::Antigravity {
+        format!(
+            "{} · {role}",
+            window
+                .key
+                .bucket
+                .bucket
+                .strip_prefix("agy-v1/")
+                .unwrap_or(&window.key.bucket.bucket)
+                .replace("Claude and GPT models", "Claude / GPT")
+        )
+    } else {
+        role.to_string()
+    }
+}
+
+fn compact_summary(account: &AccountState, show_used: bool, now: Timestamp) -> String {
+    let windows = visible_windows(account);
+    if account.scope.provider == ProviderId::Grok {
+        let number = |value: f64| {
+            if value >= 1_000_000. {
+                format!("{:.1}M", value / 1_000_000.)
+            } else if value >= 1000. {
+                format!("{:.0}k", value / 1000.)
+            } else {
+                format!("{value:.0}")
+            }
+        };
+        let amounts = windows
+            .iter()
+            .filter_map(|window| {
+                let remaining = window.remaining.as_ref()?.value.as_ref()?;
+                let limit = window
+                    .limit
+                    .as_ref()
+                    .and_then(|sample| sample.value.as_ref());
+                Some(format!(
+                    "{} {}/{}",
+                    if remaining.unit == Unit::Requests {
+                        "Req"
+                    } else {
+                        "Tok"
+                    },
+                    number(remaining.value),
+                    limit
+                        .map(|amount| number(amount.value))
+                        .unwrap_or_else(|| "?".into())
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        return format!(
+            "{amounts} · {}m ago",
+            account
+                .last_success_at
+                .map(|time| now.saturating_sub(time).max(0) / 60)
+                .unwrap_or(0)
+        );
+    }
+    let mut groups: BTreeMap<&str, Vec<&QuotaWindow>> = BTreeMap::new();
+    for window in windows {
+        groups
+            .entry(&window.key.bucket.bucket)
+            .or_default()
+            .push(window);
+    }
+    groups
+        .into_iter()
+        .map(|(group, mut windows)| {
+            windows.sort_by_key(|window| window.key.duration_seconds);
+            let values = windows
+                .iter()
+                .map(|window| {
+                    used_fraction(window)
+                        .map(|used| format!("{:.0}", display_fraction(used, show_used) * 100.))
+                        .unwrap_or_else(|| "—".into())
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            if account.scope.provider == ProviderId::Antigravity {
+                format!(
+                    "{} {values}%",
+                    if group.contains("Gemini") {
+                        "Gemini"
+                    } else {
+                        "Claude/GPT"
+                    }
+                )
+            } else {
+                format!("{values}%")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn window_value(window: &QuotaWindow, show_used: bool) -> String {
+    if matches!(
+        window
+            .remaining
+            .as_ref()
+            .and_then(|sample| sample.value.as_ref())
+            .map(|amount| &amount.unit),
+        Some(Unit::Requests | Unit::Tokens)
+    ) {
+        return amount_text(window).unwrap_or_else(|| "—".into());
+    }
+    used_fraction(window)
+        .map(|used| {
+            format!(
+                "{:.0}% {}",
+                display_fraction(used, show_used) * 100.,
+                if show_used { "used" } else { "left" }
+            )
+        })
+        .unwrap_or_else(|| "—".into())
+}
+
 fn used_fraction(window: &QuotaWindow) -> Option<f64> {
     window
         .used_fraction
@@ -486,7 +643,7 @@ fn severity(used: f64) -> Color {
 }
 fn countdown(reset: Option<Timestamp>, now: Timestamp) -> String {
     match reset {
-        None => "Reset unknown".into(),
+        None => String::new(),
         Some(reset) if reset <= now => "Resets now".into(),
         Some(reset) => {
             let minutes = (reset - now + 59) / 60;
@@ -627,16 +784,6 @@ fn amount_text(window: &QuotaWindow) -> Option<String> {
     })
 }
 
-fn credit_text(balance: &Amount, reset_credits: Option<u64>) -> String {
-    let reset_credits = reset_credits
-        .map(|count| format!("{count} reset credits"))
-        .unwrap_or_else(|| "Reset credits unknown".into());
-    format!(
-        "{} credits · {reset_credits}",
-        grouped_number(balance.value)
-    )
-}
-
 fn grouped_number(number: f64) -> String {
     let digits = format!("{number:.0}");
     let mut result = String::new();
@@ -683,260 +830,101 @@ impl Render for QuotaPanel {
                 ProviderId::Antigravity => ("Antigravity", IconName::AiGemini),
                 ProviderId::Grok => ("Grok", IconName::AiXAi),
             };
-            let earliest = row
-                .accounts
-                .iter()
-                .flat_map(|account| account.windows.values())
-                .filter_map(|window| window.reset_at.as_ref()?.value)
-                .min();
             let provider_id = row.provider;
             let expanded = !preferences.collapsed.contains(&provider_id);
-            let headline = row
-                .used
-                .map(|used| {
-                    format!(
-                        "{:.0}% {}",
-                        display_fraction(used, preferences.used) * 100.,
-                        if preferences.used { "used" } else { "left" }
-                    )
-                })
-                .unwrap_or_else(|| "Unknown".into());
-            let mut provider =
-                v_flex()
-                    .gap_2()
-                    .pb_3()
-                    .border_b_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .child(
+            let mut provider = v_flex()
+                .gap_2()
+                .pb_3()
+                .border_b_1()
+                .border_color(cx.theme().colors().border_variant);
+            for account in &row.accounts {
+                let status = account_status(account, now);
+                let logged_out = account.availability == Availability::NotLoggedIn;
+                let mut header = h_flex().w_full().justify_between().gap_2().child(
+                    h_flex()
+                        .gap_2()
+                        .child(Icon::new(icon).size(IconSize::Small))
+                        .child(Label::new(name)),
+                );
+                if logged_out {
+                    provider =
+                        provider.child(header.child(badge("Not logged in", Color::Muted, cx)));
+                    continue;
+                }
+                let windows = visible_windows(account);
+                if preferences.compact {
+                    let summary = compact_summary(account, preferences.used, now);
+                    header = header.child(
+                        Label::new(if status.is_empty() {
+                            summary
+                        } else {
+                            format!("{status} · {summary}")
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    );
+                } else if !status.is_empty() {
+                    header = header.child(badge(
+                        status.clone(),
+                        if status.contains("Error") {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        },
+                        cx,
+                    ));
+                }
+                provider =
+                    provider.child(
                         ButtonLike::new(format!("quota-provider-{provider_id:?}"))
                             .width(relative(1.))
                             .when_some(self.provider_focus.get(&provider_id), |button, focus| {
                                 button.track_focus(focus)
                             })
                             .tab_index(6 + provider_index as isize)
-                            .aria_label(format!("{name}, {headline}, quota windows"))
+                            .aria_label(format!("{name} quota windows"))
                             .aria_expanded(expanded)
-                            .tooltip(Tooltip::text(if provider_id == ProviderId::Grok {
-                                "Latest xAI response from recent usage only. Limits are per model and reflect the most recent request’s model; model is unknown unless exposed without reading bodies. Capture is unavailable when both providers are signed in: cannot attribute: SuperGrok and API key both signed in".to_string()
-                            } else {
-                                format!("{} {name} quota windows", if expanded { "Collapse" } else { "Expand" })
-                            }))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_provider(provider_id, cx)
                             }))
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(
-                                        h_flex()
-                                            .gap_2()
-                                            .child(
-                                                Icon::new(if expanded {
-                                                    IconName::ChevronDown
-                                                } else {
-                                                    IconName::ChevronRight
-                                                })
-                                                .size(IconSize::XSmall),
-                                            )
-                                            .child(Icon::new(icon).size(IconSize::Small))
-                                            .child(Label::new(name)),
-                                    )
-                                    .child(
-                                        Label::new(headline)
-                                            .size(LabelSize::Small)
-                                            .color(row.used.map(severity).unwrap_or(Color::Muted)),
-                                    ),
-                            ),
+                            .child(header),
                     );
-            if !expanded {
-                let mut statuses = BTreeSet::new();
-                for account in &row.accounts {
-                    for state in account_status(account, now)
-                        .split(" · ")
-                        .filter(|state| !state.is_empty())
-                    {
-                        statuses.insert(state.to_string());
-                    }
+                if preferences.compact || !expanded {
+                    continue;
                 }
-                if row
-                    .accounts
-                    .iter()
-                    .flat_map(|account| account.windows.values())
-                    .any(|window| window.disabled.as_ref().is_some_and(|sample| sample.value))
+                if matches!(provider_id, ProviderId::Codex | ProviderId::Antigravity)
+                    && let Some(plan) = &account.metadata.plan
                 {
-                    statuses.insert("Disabled bucket".into());
-                }
-                if row.accounts.is_empty() {
-                    statuses.insert("Unknown".into());
-                }
-                if provider_id == ProviderId::Grok {
-                    statuses.insert("Latest xAI response · recent usage only".into());
-                }
-                provider = provider
-                    .child(
-                        h_flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .children(statuses.into_iter().map(|state| {
-                                let color = if state.starts_with("Error") || state == "Exhausted" {
-                                    Color::Error
-                                } else if state == "Stale" {
-                                    Color::Warning
-                                } else {
-                                    Color::Muted
-                                };
-                                badge(state, color, cx)
-                            })),
-                    )
-                    .child(
-                        h_flex().justify_end().child(
-                            Label::new(countdown(earliest, now))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                    );
-                content = content.child(provider);
-                continue;
-            }
-            if row.accounts.is_empty() {
-                provider = provider.child(badge("Unknown", Color::Muted, cx));
-            }
-            if row.provider == ProviderId::Grok {
-                provider = provider.child(badge(
-                    "Latest xAI response · recent usage only · limits are per model; this reflects the most recent request’s model (Unknown model)",
-                    Color::Muted,
-                    cx,
-                ));
-            }
-            for (index, account) in row.accounts.iter().enumerate() {
-                let mut account_header = h_flex().justify_between().gap_2();
-                if let Some(plan) = &account.metadata.plan {
-                    account_header = account_header.child(
+                    provider = provider.child(
                         Label::new(plan.name.clone())
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     );
-                } else if row.accounts.len() > 1 {
-                    account_header = account_header.child(
-                        Label::new(format!("Login {}", index + 1))
+                }
+                if provider_id == ProviderId::Grok || status.contains("Stale") {
+                    provider = provider.child(
+                        Label::new(age(account.last_success_at, now))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     );
                 }
-                account_header = account_header.child(
-                    Label::new(
-                        if account.scope.provider == ProviderId::Claude
-                            && account
-                                .windows
-                                .values()
-                                .filter_map(|window| window.used_fraction.as_ref())
-                                .any(|sample| sample.source == SourceKind::Persisted)
-                        {
-                            "Cached · age unknown".into()
-                        } else {
-                            age(account.last_success_at, now)
-                        },
-                    )
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                );
-                provider = provider.child(account_header);
-                let status = account_status(account, now);
-                let mut badges = h_flex().flex_wrap().gap_1();
-                for state in status.split(" · ").filter(|state| !state.is_empty()) {
-                    let color = if state.starts_with("Error") || state == "Exhausted" {
-                        Color::Error
-                    } else if state == "Stale" {
-                        Color::Warning
-                    } else {
-                        Color::Muted
-                    };
-                    let label = if state.starts_with("Error")
-                        && !state.contains("pending cleanup")
-                        && !account.windows.is_empty()
-                    {
-                        "Error · cached data"
-                    } else {
-                        state
-                    };
-                    badges = badges.child(badge(label.to_string(), color, cx));
-                }
-                if !status.is_empty() {
-                    provider = provider.child(badges);
-                }
-                #[cfg(debug_assertions)]
-                if let Some(notes) = self
-                    .preview
-                    .as_ref()
-                    .and_then(|preview| preview.notes.get(&account.scope.id))
-                {
-                    for note in notes {
-                        provider = provider.child(
-                            Label::new(*note)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        );
-                    }
-                }
-                if let Some(balance) = &account.metadata.credit_balance {
-                    provider = provider.child(
-                        Label::new(credit_text(
-                            balance,
-                            account.metadata.available_reset_credits,
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                    );
-                }
-                let mut windows = account.windows.values().collect::<Vec<_>>();
-                windows.sort_by(|left, right| {
-                    used_fraction(right)
-                        .partial_cmp(&used_fraction(left))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                for (index, window) in windows.iter().enumerate() {
-                    if preferences.compact && index > 0 {
-                        continue;
-                    }
-                    let disabled = window.disabled.as_ref().is_some_and(|sample| sample.value);
-                    let used = used_fraction(window).filter(|_| !disabled);
-                    let percentage = used.map(|used| {
-                        format!(
-                            "{:.0}% {}",
-                            display_fraction(used, preferences.used) * 100.,
-                            if preferences.used { "used" } else { "left" }
-                        )
-                    });
-                    let reset = window.reset_at.as_ref().and_then(|sample| sample.value);
-                    let bucket = window
-                        .key
-                        .bucket
-                        .bucket
-                        .strip_prefix("agy-v1/")
-                        .unwrap_or(&window.key.bucket.bucket);
-                    let title = if account.scope.provider == ProviderId::Grok {
-                        format!("Latest xAI response · Unknown model · {}", window.key.role)
-                    } else {
-                        format!("{} · {}", bucket, window.key.role)
-                    };
-                    let mut section = v_flex().gap_1().pl_6().child(
+                for (index, quota_window) in windows.iter().enumerate() {
+                    let used = used_fraction(quota_window);
+                    let mut section = v_flex().gap_1().child(
                         h_flex()
                             .justify_between()
                             .gap_2()
-                            .child(Label::new(title).size(LabelSize::Small))
-                            .when_some(percentage, |element, percentage| {
-                                element.child(
-                                    Label::new(percentage)
-                                        .size(LabelSize::Small)
-                                        .color(used.map(severity).unwrap_or(Color::Muted)),
-                                )
-                            }),
+                            .child(
+                                Label::new(window_title(account, quota_window))
+                                    .size(LabelSize::Small),
+                            )
+                            .child(
+                                Label::new(window_value(quota_window, preferences.used))
+                                    .size(LabelSize::Small)
+                                    .color(used.map(severity).unwrap_or(Color::Muted)),
+                            ),
                     );
-                    if let Some(used) = used
-                        && !preferences.compact
-                    {
+                    if let Some(used) = used {
                         section =
                             section.child(
                                 div()
@@ -955,75 +943,20 @@ impl Render for QuotaPanel {
                                     ),
                             );
                     }
-                    if let Some(amount) = amount_text(window) {
+                    if provider_id != ProviderId::Grok
+                        && let Some(reset) = quota_window
+                            .reset_at
+                            .as_ref()
+                            .and_then(|sample| sample.value)
+                    {
                         section = section.child(
-                            Label::new(amount)
+                            Label::new(countdown(Some(reset), now))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         );
                     }
-                    let state = if disabled {
-                        Some(("Disabled", Color::Muted))
-                    } else {
-                        match used {
-                            Some(used) if used >= 1. => Some(("Exhausted", Color::Error)),
-                            Some(used) if used >= 0.8 => Some(("Critical", Color::Error)),
-                            Some(used) if used >= 0.6 => Some(("Warning", Color::Warning)),
-                            None => Some(("Unknown", Color::Muted)),
-                            _ => None,
-                        }
-                    };
-                    section = section.child(
-                        h_flex()
-                            .w_full()
-                            .justify_between()
-                            .gap_2()
-                            .child(h_flex().when_some(state, |element, (label, color)| {
-                                element.child(badge(label, color, cx))
-                            }))
-                            .child(
-                                Label::new(countdown(reset, now))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    );
-                    provider = provider.child(
-                        section
-                            .id(format!("quota-window-{}-{index}", account.scope.id))
-                            .tooltip(Tooltip::text(format!(
-                                "Reset UTC: {} · Precision: {:?} · {}",
-                                reset
-                                    .and_then(|reset| chrono::DateTime::from_timestamp(reset, 0))
-                                    .map(|reset| reset.to_rfc3339())
-                                    .unwrap_or_else(|| "unknown".into()),
-                                window.precision,
-                                if window
-                                    .used_fraction
-                                    .as_ref()
-                                    .is_some_and(|sample| sample.source == SourceKind::Persisted)
-                                {
-                                    "Cached · age unknown".into()
-                                } else {
-                                    age(
-                                        window
-                                            .used_fraction
-                                            .as_ref()
-                                            .map(|sample| sample.observed_at),
-                                        now,
-                                    )
-                                }
-                            ))),
-                    );
-                }
-                if preferences.compact && account.windows.len() > 1 {
-                    provider = provider.child(
-                        Label::new(format!(
-                            "{} windows · Detailed shows all",
-                            account.windows.len()
-                        ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                    );
+                    provider = provider
+                        .child(section.id(format!("quota-window-{}-{index}", account.scope.id)));
                 }
             }
             content = content.child(provider);
@@ -1156,6 +1089,8 @@ impl Render for QuotaPanel {
             .child(
                 Label::new(if self.refresh_task.is_some() {
                     format!("Refreshing · {}", age(updated, now))
+                } else if preferences.compact {
+                    format!("{} · 5h / Week", age(updated, now))
                 } else {
                     age(updated, now)
                 })
@@ -1288,7 +1223,7 @@ mod tests {
                     panel.update_in(cx, |panel, window, cx| {
                         let focus = panel
                             .provider_focus
-                            .get(&ProviderId::Grok)
+                            .get(&ProviderId::Codex)
                             .expect("provider focus");
                         window.focus(focus, cx);
                     });
@@ -1302,7 +1237,7 @@ mod tests {
                             panel
                                 .display_preferences(cx)
                                 .collapsed
-                                .contains(&ProviderId::Grok)
+                                .contains(&ProviderId::Codex)
                         )
                     });
                     cx.update(|window, cx| window.draw(cx).clear(cx));
@@ -1315,7 +1250,7 @@ mod tests {
                             !panel
                                 .display_preferences(cx)
                                 .collapsed
-                                .contains(&ProviderId::Grok)
+                                .contains(&ProviderId::Codex)
                         )
                     });
                     panel.update_in(cx, |panel, _, cx| {
@@ -1601,19 +1536,28 @@ mod tests {
         assert!(preferences.collapsed.contains(&ProviderId::Claude));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn unknown_credit_count_is_not_zero() {
-        let balance = Amount {
-            value: 120.,
-            unit: Unit::Credits { denomination: None },
-        };
+    fn presentation_uses_real_windows_and_hides_uninstalled_agents() {
+        let preview = preview::FixturePreview::new(100000, false);
+        let codex = preview
+            .snapshot
+            .accounts
+            .get("codex")
+            .expect("Codex fixture");
+        assert_eq!(compact_summary(codex, false, 100000), "74/97%");
+        assert_eq!(visible_windows(codex).len(), 2);
+        let states = preview::FixturePreview::new(100000, true);
+        let rows = provider_rows(&states.snapshot);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.provider != ProviderId::Grok));
+        let claude = rows
+            .iter()
+            .find(|row| row.provider == ProviderId::Claude)
+            .expect("Claude row");
         assert_eq!(
-            credit_text(&balance, None),
-            "120 credits · Reset credits unknown"
-        );
-        assert_eq!(
-            credit_text(&balance, Some(3)),
-            "120 credits · 3 reset credits"
+            claude.accounts.first().expect("one account").availability,
+            Availability::NotLoggedIn
         );
     }
 
@@ -1625,14 +1569,14 @@ mod tests {
         assert_eq!(severity(0.60), Color::Warning);
         assert_eq!(severity(0.80), Color::Error);
         assert_eq!(countdown(Some(60), 61), "Resets now");
-        assert_eq!(countdown(None, 0), "Reset unknown");
+        assert_eq!(countdown(None, 0), "");
     }
 
     #[test]
     fn empty_snapshot_keeps_pending_providers_honest() {
         let snapshot = QuotaSnapshot::default();
         let rows = provider_rows(&snapshot);
-        assert_eq!(rows.len(), 4);
+        assert!(rows.is_empty());
         assert!(rows.iter().all(|row| row.accounts.is_empty()));
         assert!(!Preferences::default().used);
         assert!(!Preferences::default().compact);

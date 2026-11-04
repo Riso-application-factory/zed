@@ -1,4 +1,5 @@
 use super::*;
+use agent_ui::{AgentPanel, ConversationView};
 
 pub(super) fn attach(
     workspace: &Workspace,
@@ -6,13 +7,53 @@ pub(super) fn attach(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    let workspace_handle = cx.entity();
     let item = cx.new(|cx| {
-        let subscription = cx.observe(&panel, |_, _, cx| cx.notify());
+        let mut subscriptions = vec![cx.observe(&panel, |_, _, cx| cx.notify())];
+        for dock in workspace.all_docks() {
+            subscriptions.push(cx.observe(dock, |_, _, cx| cx.notify()));
+        }
+        if let Some(agent_panel) = workspace.panel::<AgentPanel>(cx) {
+            subscriptions.push(cx.observe(&agent_panel, |_, _, cx| cx.notify()));
+            let conversation = agent_panel.read(cx).active_conversation_view().cloned();
+            if let Some(conversation) = conversation {
+                subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
+            }
+        }
         QuotaStatusItem {
             panel,
-            _subscription: subscription,
+            workspace: Some(workspace_handle.downgrade()),
+            _subscriptions: subscriptions,
         }
     });
+    let weak = item.downgrade();
+    let subscription = cx.observe_new::<AgentPanel>(move |_, _, cx| {
+        let panel = cx.entity();
+        let weak = weak.clone();
+        cx.defer(move |cx| {
+            weak.update(cx, |item, cx| {
+                let subscription = cx.observe(&panel, |_, _, cx| cx.notify());
+                item._subscriptions.push(subscription);
+                cx.notify();
+            })
+            .log_err();
+        });
+    });
+    item.update(cx, |item, _| item._subscriptions.push(subscription));
+    let weak = item.downgrade();
+    let subscription = cx.observe_new::<ConversationView>(move |_, _, cx| {
+        let conversation = cx.entity();
+        let weak = weak.clone();
+        cx.defer(move |cx| {
+            weak.update(cx, |item, cx| {
+                let subscription = cx.observe(&conversation, |_, _, cx| cx.notify());
+                item._subscriptions.push(subscription);
+                cx.notify();
+            })
+            .log_err();
+        });
+    });
+    item.update(cx, |item, _| item._subscriptions.push(subscription));
     workspace
         .status_bar()
         .update(cx, |bar, cx| bar.add_right_item(item, window, cx));
@@ -20,7 +61,8 @@ pub(super) fn attach(
 
 struct QuotaStatusItem {
     panel: Entity<QuotaPanel>,
-    _subscription: Subscription,
+    workspace: Option<gpui::WeakEntity<Workspace>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl workspace::StatusItemView for QuotaStatusItem {
@@ -28,22 +70,57 @@ impl workspace::StatusItemView for QuotaStatusItem {
         &mut self,
         _: Option<&dyn workspace::ItemHandle>,
         _: &mut Window,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        cx.notify();
     }
     fn hide_setting(&self, _: &App) -> Option<workspace::HideStatusItem> {
         None
     }
 }
 
+impl QuotaStatusItem {
+    fn visible_provider(&self, cx: &App) -> Option<ProviderId> {
+        let workspace = self.workspace.as_ref()?.upgrade()?;
+        if !AgentPanel::is_visible(&workspace, cx) {
+            return None;
+        }
+        let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
+        let conversation = panel.read(cx).active_conversation_view()?;
+        let conversation = conversation.read(cx);
+        if conversation.agent_key().is_native() {
+            let thread = conversation.as_native_thread(cx)?;
+            return thread
+                .read(cx)
+                .model()
+                .filter(|model| {
+                    model.provider_id() == language_model::LanguageModelProviderId::new("x_ai")
+                })
+                .map(|_| ProviderId::Grok);
+        }
+        let agent = conversation.agent_key().id();
+        provider_for_thread(true, Some(agent.as_ref()))
+    }
+}
+
+fn provider_for_thread(visible: bool, agent: Option<&str>) -> Option<ProviderId> {
+    if !visible {
+        return None;
+    }
+    match agent? {
+        "codex-acp" => Some(ProviderId::Codex),
+        "claude-acp" => Some(ProviderId::Claude),
+        "antigravity" | "antigravity-acp" => Some(ProviderId::Antigravity),
+        "grok" | "grok-acp" => Some(ProviderId::Grok),
+        _ => None,
+    }
+}
+
 impl Render for QuotaStatusItem {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let provider = self.visible_provider(cx);
         let panel = self.panel.read(cx);
         let preferences = panel.display_preferences(cx);
-        let mut content = h_flex().gap_1();
-        if preferences.hide_status {
-            return content;
-        }
         let now = chrono::Utc::now().timestamp();
         let snapshot = panel
             .service
@@ -56,131 +133,45 @@ impl Render for QuotaStatusItem {
             .as_ref()
             .map(|preview| preview.snapshot.clone())
             .unwrap_or(snapshot);
-        let rows = provider_rows(&snapshot);
-        let capacity = if window.viewport_size().width < px(1000.) {
-            1
-        } else {
-            4
-        };
-        let mut hidden = Vec::new();
-        let mut hidden_used: f64 = 0.;
-        for (index, row) in rows.iter().enumerate() {
-            let (name, icon) = match row.provider {
-                ProviderId::Claude => ("Claude", IconName::AiClaude),
-                ProviderId::Codex => ("Codex", IconName::AiOpenAi),
-                ProviderId::Antigravity => ("Antigravity", IconName::AiGemini),
-                ProviderId::Grok => ("Grok", IconName::AiXAi),
-            };
-            let mut details = vec![name.to_string()];
-            let mut headline = None;
-            let mut reset = None;
-            let mut headline_label = String::new();
-            let mut fresh = false;
-            for account in &row.accounts {
-                details.push(account_status(account, now));
-                for quota_window in account.windows.values() {
-                    if quota_window
-                        .disabled
-                        .as_ref()
-                        .is_some_and(|sample| sample.value)
-                    {
-                        continue;
-                    }
-                    let Some(used) = used_fraction(quota_window) else {
-                        continue;
-                    };
-                    let label = match quota_window.key.role.as_str() {
-                        "Weekly" | "7d" => "wk",
-                        role => role,
-                    };
-                    details.push(format!(
-                        "{} · {}: {:.0}% {} · {}",
-                        quota_window.key.bucket.bucket,
-                        label,
-                        display_fraction(used, preferences.used) * 100.,
-                        if preferences.used {
-                            "Used"
-                        } else {
-                            "Remaining"
-                        },
-                        countdown(
-                            quota_window
-                                .reset_at
-                                .as_ref()
-                                .and_then(|sample| sample.value),
-                            now
-                        )
-                    ));
-                    if headline.is_none_or(|previous| used > previous) {
-                        headline = Some(used);
-                        headline_label = label.to_string();
-                        reset = quota_window
-                            .reset_at
-                            .as_ref()
-                            .and_then(|sample| sample.value);
-                        fresh = account.availability == Availability::Ready
-                            && matches!(
-                                quota_window.freshness(now, Duration::from_secs(900)),
-                                Freshness::Fresh
-                            );
-                    }
-                }
-            }
-            let color = headline
-                .filter(|_| fresh)
-                .map(severity)
-                .unwrap_or(Color::Muted);
-            let text = headline
-                .map(|used| {
-                    format!(
-                        "{} {:.0}%{}",
-                        headline_label,
-                        display_fraction(used, preferences.used) * 100.,
-                        if fresh { "" } else { " ◷" }
-                    )
-                })
-                .unwrap_or_else(|| "--".into());
-            if index >= capacity {
-                hidden.push(details.join("\n"));
-                if fresh {
-                    hidden_used = hidden_used.max(headline.unwrap_or(0.));
-                }
-                continue;
-            }
-            content = content.child(
-                ButtonLike::new(("quota-summary", index))
-                    .tooltip(Tooltip::text(details.join("\n")))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(OpenQuotaSummary), cx)
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(Icon::new(icon).size(IconSize::Small).color(color))
-                            .child(Label::new(text).size(LabelSize::Small).color(color))
-                            .when(headline.is_some_and(|used| used >= 0.8), |element| {
-                                element.child(
-                                    Label::new(
-                                        countdown(reset, now)
-                                            .replace("Resets in ", "")
-                                            .replace("Reset unknown", ""),
-                                    )
-                                    .size(LabelSize::Small)
-                                    .color(color),
+        let mut content = h_flex().gap_1();
+        if !preferences.hide_status
+            && let Some(provider) = provider
+        {
+            for row in provider_rows(&snapshot)
+                .into_iter()
+                .filter(|row| row.provider == provider)
+            {
+                for account in row.accounts {
+                    let status = account_status(account, now);
+                    let summary = if account.availability == Availability::NotLoggedIn {
+                        "Not logged in".to_string()
+                    } else {
+                        visible_windows(account)
+                            .iter()
+                            .map(|window| {
+                                format!(
+                                    "{} {}",
+                                    window_title(account, window),
+                                    window_value(window, preferences.used)
                                 )
-                            }),
-                    ),
-            );
-        }
-        if !hidden.is_empty() {
-            content = content.child(
-                ButtonLike::new("quota-overflow")
-                    .tooltip(Tooltip::text(hidden.join("\n\n")))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(OpenQuotaSummary), cx)
-                    })
-                    .child(Label::new(format!("+{}", hidden.len())).color(severity(hidden_used))),
-            );
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    };
+                    let summary =
+                        if status.is_empty() || account.availability == Availability::NotLoggedIn {
+                            summary
+                        } else {
+                            format!("{status} · {summary}")
+                        };
+                    content = content.child(
+                        div()
+                            .id("quota-active-thread")
+                            .tooltip(Tooltip::text(status))
+                            .child(Label::new(summary).size(LabelSize::Small)),
+                    );
+                }
+            }
         }
         content
     }
@@ -189,6 +180,21 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follows_visible_thread_and_hides_for_other_surfaces() {
+        assert_eq!(
+            provider_for_thread(true, Some("codex-acp")),
+            Some(ProviderId::Codex)
+        );
+        assert_eq!(
+            provider_for_thread(true, Some("claude-acp")),
+            Some(ProviderId::Claude)
+        );
+        assert_eq!(provider_for_thread(false, Some("codex-acp")), None);
+        assert_eq!(provider_for_thread(true, None), None);
+        assert_eq!(provider_for_thread(true, Some("zed")), None);
+    }
 
     #[gpui::test]
     fn footer_keeps_service_idle(cx: &mut gpui::TestAppContext) {
@@ -220,7 +226,8 @@ mod tests {
             let subscription = cx.observe(&panel, |_, _, cx| cx.notify());
             QuotaStatusItem {
                 panel,
-                _subscription: subscription,
+                _subscriptions: vec![subscription],
+                workspace: None,
             }
         });
         cx.draw(
