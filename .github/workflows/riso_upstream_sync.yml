@@ -1,4 +1,5 @@
 name: Riso upstream sync
+run-name: Sync upstream into riso/main${{ inputs.dry_run && ' (dry run)' || '' }}
 on:
   schedule:
     - cron: '0 1 * * *'
@@ -14,15 +15,16 @@ concurrency:
 permissions:
   contents: read
 jobs:
-  sync:
+  mirror:
+    name: 'Mirror: fast-forward main to upstream'
     if: github.repository_owner != 'zed-industries'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
-      issues: write
     steps:
       - name: Mint bot token
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         id: app-token
         with:
           app-id: ${{ secrets.RISO_BOT_APP_ID }}
@@ -32,7 +34,100 @@ jobs:
           ref: riso/main
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/zed-industries/zed.git
+      # `riso_sync.py sync-mirror` → riso_prepare.sync_mirror():
+      # - Chạy `git fetch upstream main`.
+      # - Từ chối nếu origin/main không phải tổ tiên của upstream/main, tức là nhánh mirror
+      #   đã bị sửa tay. Nhờ vậy lịch sử của mirror không bao giờ bị ghi đè.
+      # - Push upstream/main lên origin/main (chỉ fast-forward). Với --dry-run thì chỉ in lệnh push.
+      - name: Fast-forward the mirror branch
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          arguments=()
+          if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
+          python3 riso/sync/riso_sync.py sync-mirror "${arguments[@]}"
+  plan:
+    name: 'Plan: classify upstream commits'
+    if: github.repository_owner != 'zed-industries'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: riso/main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/zed-industries/zed.git
+          git fetch upstream main
+      # `riso_sync.py plan` → riso_triage.build_plan():
+      # - Lấy các commit upstream (first-parent) từ merge-base(riso/main, upstream/main) tới upstream/main.
+      # - Chấm level cho từng commit bằng luật cố định, dựa trên các ADR trong riso/adr và riso/hooks.toml:
+      #     L0: không liên quan tới custom.
+      #     L1: sửa file có hook (hook vẫn áp được), sửa crate mà custom phụ thuộc,
+      #         hoặc chỉ xung đột cơ học (Cargo.lock, phần hook).
+      #     L2: sửa file upstream mà custom đã patch, file trong `watch`,
+      #         hoặc định nghĩa của symbol mà custom đang dùng.
+      #     L3: xung đột thật; chạm vào ADR có `review = "human"`; Jev không chắc chắn hoặc không gọi được.
+      #     L4: xoá hoặc đổi tên file mà custom dựa vào; anchor của hook biến mất.
+      # - Với commit L2 (hoặc L1 do sửa crate phụ thuộc), hỏi Jev qua riso_jev.evaluate().
+      #   Jev chỉ được nâng level, không bao giờ hạ.
+      # - Chuỗi commit liên tiếp từ đầu có level < L3 là "auto prefix". Commit L3+ đầu tiên là "blocker";
+      #   việc phân loại dừng lại ở đó.
+      # - Ghi plan.json và nội dung PR tiếng Việt (riso_report.render_auto_body / render_blocked_body).
+      - name: Classify upstream commits
+        env:
+          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
+        run: |
+          python3 riso/sync/riso_sync.py plan --out "$RUNNER_TEMP/plan.json" --body-auto "$RUNNER_TEMP/body-auto.md" --body-blocked "$RUNNER_TEMP/body-blocked.md"
+      - name: Upload plan
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: riso-sync-plan
+          path: |
+            ${{ runner.temp }}/plan.json
+            ${{ runner.temp }}/body-auto.md
+            ${{ runner.temp }}/body-blocked.md
+      - name: Publish plan summary
+        if: always()
+        run: |
+          for body in body-auto.md body-blocked.md; do
+            if [ -f "$RUNNER_TEMP/$body" ]; then
+              cat "$RUNNER_TEMP/$body" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+  apply:
+    name: 'Apply: open sync pull requests'
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Mint bot token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RISO_BOT_APP_ID }}
+          private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: riso/main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
       - name: Configure git
@@ -41,43 +136,54 @@ jobs:
           git config user.email '351886810+riso-tech-bot[bot]@users.noreply.github.com'
           git remote add upstream https://github.com/zed-industries/zed.git
           git fetch upstream main
-      - name: Update mirror
-        env:
-          DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          arguments=()
-          if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
-          python3 riso/sync/riso_sync.py sync-mirror "${arguments[@]}"
-      - name: Plan upstream sync
-        env:
-          JEV_API_KEY: ${{ secrets.JEV_API_KEY }}
-        run: |
-          python3 riso/sync/riso_sync.py plan --out "$RUNNER_TEMP/plan.json" --body-auto "$RUNNER_TEMP/body-auto.md" --body-blocked "$RUNNER_TEMP/body-blocked.md"
+      - name: Download plan
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: riso-sync-plan
+          path: ${{ runner.temp }}/riso-sync-plan
+      # `riso_sync.py prepare` → riso_prepare.prepare():
+      # - validate_plan(): kiểm tra plan.json đúng định dạng và khớp với repo (head phải bằng đỉnh hiện tại
+      #   của riso/main, danh sách commit phải đúng khoảng upstream). Plan cũ hoặc bị sửa sẽ bị từ chối.
+      # - Nếu còn PR hoặc issue mang nhãn riso-sync-blocked chưa đóng: chỉ comment "đang chờ" rồi dừng,
+      #   không đồng bộ chồng lên.
+      # - Auto prefix: tạo nhánh riso/sync/auto từ riso/main rồi `merge --no-ff` tới commit cuối của prefix.
+      #   Xung đột Cargo.lock được giải bằng `cargo update --workspace`; xung đột chỉ do hook được giải bằng
+      #   cách áp lại hook. Xung đột khác thì huỷ merge và mở issue L3. Merge xong thì push --force-with-lease
+      #   và mở hoặc cập nhật PR có nhãn riso-sync và sync:L<n>.
+      # - Auto-merge chỉ bật khi policy.shadow = false và level ≤ policy.auto_merge_max_level
+      #   (riso/config.toml). Hiện shadow = true nên auto-merge luôn tắt.
+      # - Blocker: tạo nhánh riso/sync/blocked/<sha7> từ nhánh auto rồi merge commit bị chặn. Merge sạch thì push
+      #   và mở PR nhãn riso-sync-blocked; có xung đột thì mở issue hướng dẫn chạy
+      #   `python3 riso/sync/riso_sync.py resolve <sha>` trên máy.
+      # - --dry-run chỉ in các lệnh git/gh, không thay đổi gì.
       - name: Prepare review requests
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          arguments=(--plan "$RUNNER_TEMP/plan.json" --push --github)
+          arguments=(--plan "$RUNNER_TEMP/riso-sync-plan/plan.json" --push --github)
           if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
           python3 riso/sync/riso_sync.py prepare "${arguments[@]}"
-      - uses: actions/upload-artifact@v4
-        if: always()
+  notify-failure:
+    name: 'Notify: record sync failure'
+    needs: [mirror, plan, apply]
+    if: ${{ failure() && github.repository_owner != 'zed-industries' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Mint bot token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        id: app-token
+        # The issue is still recorded with GITHUB_TOKEN when the App credentials caused the failure.
+        continue-on-error: true
         with:
-          name: riso-sync-plan
-          path: |
-            ${{ runner.temp }}/plan.json
-            ${{ runner.temp }}/body-auto.md
-            ${{ runner.temp }}/body-blocked.md
-      - name: Publish summary
-        if: always()
-        run: |
-          if [ -f "$RUNNER_TEMP/body-auto.md" ]; then
-            cat "$RUNNER_TEMP/body-auto.md" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          app-id: ${{ secrets.RISO_BOT_APP_ID }}
+          private-key: ${{ secrets.RISO_BOT_PRIVATE_KEY }}
       - name: Record unexpected sync failure
-        if: failure()
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
           GH_REPO: ${{ github.repository }}
