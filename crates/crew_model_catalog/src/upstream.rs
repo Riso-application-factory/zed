@@ -134,17 +134,7 @@ impl ModelProbe for AcpModelProbe {
         let project = self.project.clone();
         let fs = self.fs.clone();
         let directory = self.directory.clone();
-        let agent = agent.clone();
-        cx.spawn(async move |cx| {
-            let timeout = cx.background_executor().timer(PROBE_TIMEOUT);
-            futures::select_biased! {
-                outcome = run_probe(agent_id, project, fs, directory, cx).fuse() => outcome,
-                _ = timeout.fuse() => {
-                    log::info!("model_catalog: probe_timeout agent={agent}");
-                    ProbeOutcome::Failed(FailureKind::Timeout)
-                }
-            }
-        })
+        cx.spawn(async move |cx| run_probe(agent_id, project, fs, directory, cx).await)
     }
 }
 
@@ -155,7 +145,46 @@ async fn run_probe(
     directory: PathBuf,
     cx: &mut AsyncApp,
 ) -> ProbeOutcome {
-    let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+    let timeout = cx.background_executor().timer(PROBE_TIMEOUT).fuse();
+    futures::pin_mut!(timeout);
+    let prepare = async {
+        let store = project.read_with(cx, |project, _| project.agent_server_store().clone());
+        let status = cx.update(|cx| {
+            store.update(cx, |store, cx| {
+                store
+                    .get_external_agent(&agent_id)
+                    .map(|agent| agent.install_status(cx))
+            })
+        });
+        let Some(status) = status else {
+            return Err(ProbeOutcome::NotInstalled);
+        };
+        let before_connect = match status.await {
+            Ok(AgentInstallStatus::NotInstalled) | Err(_) => {
+                return Err(ProbeOutcome::NotInstalled);
+            }
+            Ok(status) => installation(status),
+        };
+        if fs.create_dir(&directory).await.is_err() {
+            return Err(ProbeOutcome::Failed(FailureKind::ConnectionFailed));
+        }
+        let server = Rc::new(CustomAgentServer::new(agent_id.clone()));
+        let connect = cx.update(|cx| {
+            server.connect(
+                AgentServerDelegate::new(store.clone(), None, None),
+                project.clone(),
+                cx,
+            )
+        });
+        connect
+            .await
+            .map(|connection| (connection, store, before_connect))
+            .map_err(|_| ProbeOutcome::Failed(FailureKind::ConnectionFailed))
+    };
+    let (connection, store, before_connect) = futures::select_biased! {
+        result = prepare.fuse() => match result { Ok(result) => result, Err(outcome) => return outcome },
+        _ = timeout => return ProbeOutcome::Failed(FailureKind::Timeout),
+    };
     let status = cx.update(|cx| {
         store.update(cx, |store, cx| {
             store
@@ -163,41 +192,47 @@ async fn run_probe(
                 .map(|agent| agent.install_status(cx))
         })
     });
-    let Some(status) = status else {
-        return ProbeOutcome::NotInstalled;
-    };
-    let installation = match status.await {
-        Ok(AgentInstallStatus::NotInstalled) | Err(_) => return ProbeOutcome::NotInstalled,
-        Ok(status) => installation(status),
-    };
-
-    if fs.create_dir(&directory).await.is_err() {
-        return ProbeOutcome::Failed(FailureKind::ConnectionFailed);
-    }
-
-    let server = Rc::new(CustomAgentServer::new(agent_id));
-    let connect = cx.update(|cx| {
-        server.connect(
-            AgentServerDelegate::new(store.clone(), None, None),
-            project.clone(),
-            cx,
-        )
-    });
-    match connect.await {
-        Ok(connection) => {
-            probe_connection(connection, project, directory, installation, cx).await
+    let installation = futures::select_biased! {
+        installation = installed_after_connect(status, before_connect).fuse() => installation,
+        _ = timeout => {
+            connection.shutdown();
+            return ProbeOutcome::Failed(FailureKind::Timeout);
         }
-        Err(_) => ProbeOutcome::Failed(FailureKind::ConnectionFailed),
+    };
+    probe_connection(
+        connection,
+        project,
+        directory,
+        installation,
+        &mut timeout,
+        cx,
+    )
+    .await
+}
+
+async fn installed_after_connect(
+    status: Option<Task<Result<AgentInstallStatus>>>,
+    before_connect: Installation,
+) -> Installation {
+    match status {
+        Some(status) => match status.await {
+            Ok(status) => installation(status),
+            Err(_) => before_connect,
+        },
+        None => before_connect,
     }
 }
 
 /// Opens a throwaway session on a connection the probe owns, reads its models, then closes
 /// the session and shuts the connection down whatever the outcome.
-async fn probe_connection(
+async fn probe_connection<
+    F: futures::Future<Output = ()> + Unpin + futures::future::FusedFuture,
+>(
     connection: Rc<dyn AgentConnection>,
     project: Entity<Project>,
     directory: PathBuf,
     installation: Installation,
+    mut timeout: &mut F,
     cx: &mut AsyncApp,
 ) -> ProbeOutcome {
     let agent_version = connection.agent_version();
@@ -207,7 +242,14 @@ async fn probe_connection(
             .clone()
             .new_session(project.clone(), PathList::new(&[directory]), cx)
     });
-    let thread = match new_session.await {
+    let session = futures::select_biased! {
+        result = new_session.fuse() => result,
+        _ = timeout => {
+            connection.shutdown();
+            return ProbeOutcome::Failed(FailureKind::Timeout);
+        }
+    };
+    let thread = match session {
         Ok(thread) => thread,
         Err(error) => {
             connection.shutdown();
@@ -219,7 +261,10 @@ async fn probe_connection(
         }
     };
 
-    let options = read_offered_options(&connection, &thread, cx).await;
+    let options = futures::select_biased! {
+        options = read_offered_options(&connection, &thread, cx).fuse() => options,
+        _ = timeout => Err(FailureKind::Timeout),
+    };
     close_probe_session(&connection, &thread, cx).await;
     connection.shutdown();
 
@@ -308,11 +353,12 @@ fn translate_options(
     options: &[acp::SessionConfigOption],
 ) -> Result<Option<Vec<OfferedOption>>, FailureKind> {
     let select = options.iter().find_map(|option| {
-        let is_model = matches!(option.category, Some(acp::SessionConfigOptionCategory::Model));
+        let is_model = matches!(
+            option.category,
+            Some(acp::SessionConfigOptionCategory::Model)
+        );
         match &option.kind {
-            acp::SessionConfigKind::Select(select) if is_model && !is_empty(select) => {
-                Some(select)
-            }
+            acp::SessionConfigKind::Select(select) if is_model && !is_empty(select) => Some(select),
             _ => None,
         }
     });
@@ -490,6 +536,7 @@ mod tests {
         thread: RefCell<Option<Entity<AcpThread>>>,
         close_calls: Cell<usize>,
         shutdown_calls: Cell<usize>,
+        hang_new_session: Cell<bool>,
     }
 
     impl OptionsConnection {
@@ -501,6 +548,7 @@ mod tests {
                 thread: RefCell::default(),
                 close_calls: Cell::default(),
                 shutdown_calls: Cell::default(),
+                hang_new_session: Cell::default(),
             })
         }
     }
@@ -528,6 +576,9 @@ mod tests {
             work_dirs: PathList,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
+            if self.hang_new_session.get() {
+                return cx.spawn(async |_| futures::future::pending().await);
+            }
             if let Some(error) = self.new_session_error.borrow_mut().take() {
                 return Task::ready(Err(error));
             }
@@ -609,11 +660,14 @@ mod tests {
         let project = project.clone();
         cx.update(|cx| {
             cx.spawn(async move |cx| {
+                let timeout = cx.background_executor().timer(PROBE_TIMEOUT).fuse();
+                futures::pin_mut!(timeout);
                 probe_connection(
                     connection,
                     project,
                     PathBuf::from("/probe"),
                     Installation::Unmanaged,
+                    &mut timeout,
                     cx,
                 )
                 .await
@@ -630,6 +684,70 @@ mod tests {
             .iter()
             .map(|model| model.model_id.to_string())
             .collect()
+    }
+
+    #[gpui::test]
+    async fn probe_timeout_shuts_down_during_new_session(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = test_project(cx).await;
+        let connection = OptionsConnection::new("agent");
+        connection.hang_new_session.set(true);
+        let probe = start_probe(&connection, &project, cx);
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(PROBE_TIMEOUT + Duration::from_secs(1));
+        assert!(matches!(
+            probe.await,
+            ProbeOutcome::Failed(FailureKind::Timeout)
+        ));
+        assert_eq!(connection.shutdown_calls.get(), 1);
+        assert_eq!(connection.close_calls.get(), 0);
+    }
+
+    #[gpui::test]
+    async fn installation_is_read_again_after_connect(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = test_project(cx).await;
+        let connection = OptionsConnection::new("agent");
+        *connection.options.borrow_mut() = model_options(&["default"]);
+        let before = Installation::Installed {
+            version: Some("old".into()),
+        };
+        let after = installed_after_connect(
+            Some(Task::ready(Ok(AgentInstallStatus::Installed {
+                version: Some("new".into()),
+            }))),
+            before.clone(),
+        )
+        .await;
+        let outcome = cx
+            .update(|cx| {
+                cx.spawn(async move |cx| {
+                    let timeout = cx.background_executor().timer(PROBE_TIMEOUT).fuse();
+                    futures::pin_mut!(timeout);
+                    probe_connection(
+                        connection,
+                        project,
+                        PathBuf::from("/probe"),
+                        after,
+                        &mut timeout,
+                        cx,
+                    )
+                    .await
+                })
+            })
+            .await;
+        assert!(matches!(outcome, ProbeOutcome::Models {
+            installation: Installation::Installed { version: Some(version) }, ..
+        } if version.as_ref() == "new"));
+        assert_eq!(
+            installed_after_connect(
+                Some(Task::ready(Err(anyhow::anyhow!("read failed")))),
+                before.clone()
+            )
+            .await,
+            before
+        );
     }
 
     #[gpui::test]

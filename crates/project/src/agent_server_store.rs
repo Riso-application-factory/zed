@@ -1132,22 +1132,53 @@ fn npx_install_dir(registry_id: &str) -> PathBuf {
 
 async fn npx_install_status(
     fs: Arc<dyn Fs>,
-    package_json_path: &Path,
+    node_modules_dir: &Path,
+    package_name: &str,
 ) -> Result<AgentInstallStatus> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Executable {
+        Path(String),
+        Named(HashMap<String, String>),
+    }
     #[derive(Deserialize)]
     struct PackageVersion {
         version: Option<String>,
+        bin: Option<Executable>,
     }
-
-    if !fs.is_file(package_json_path).await {
+    let package_dir = node_modules_dir.join(package_name);
+    let package_json_path = package_dir.join("package.json");
+    if !fs.is_file(&package_json_path).await {
         return Ok(AgentInstallStatus::NotInstalled);
     }
     let contents = fs
-        .load(package_json_path)
+        .load(&package_json_path)
         .await
         .with_context(|| format!("reading {package_json_path:?}"))?;
     let package = serde_json::from_str::<PackageVersion>(&contents)
         .with_context(|| format!("parsing {package_json_path:?}"))?;
+    if find_incomplete_npm_package(fs.as_ref(), node_modules_dir)
+        .await?
+        .is_some()
+    {
+        return Ok(AgentInstallStatus::Installed { version: None });
+    }
+    let executable = match &package.bin {
+        Some(Executable::Path(path)) => Some(path),
+        Some(Executable::Named(executables)) if executables.len() == 1 => {
+            executables.values().next()
+        }
+        Some(Executable::Named(executables)) => {
+            executables.get(package_name.rsplit('/').next().unwrap_or(package_name))
+        }
+        None => None,
+    };
+    let Some(executable) = executable else {
+        return Ok(AgentInstallStatus::Installed { version: None });
+    };
+    if !fs.is_file(&package_dir.join(executable)).await {
+        return Ok(AgentInstallStatus::Installed { version: None });
+    }
     Ok(AgentInstallStatus::Installed {
         version: package.version.map(SharedString::from),
     })
@@ -1487,12 +1518,12 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
 
     fn install_status(&self, cx: &App) -> Task<Result<AgentInstallStatus>> {
         let (package_name, _) = bounded_npm_package_spec(&self.package);
-        let package_json_path = npx_install_dir(&self.registry_id)
-            .join("node_modules")
-            .join(package_name)
-            .join("package.json");
+        let node_modules_dir = npx_install_dir(&self.registry_id).join("node_modules");
+        let package_name = package_name.to_string();
         let fs = self.fs.clone();
-        cx.background_spawn(async move { npx_install_status(fs, &package_json_path).await })
+        cx.background_spawn(async move {
+            npx_install_status(fs, &node_modules_dir, &package_name).await
+        })
     }
 
     fn get_command(
@@ -2443,7 +2474,7 @@ mod tests {
             npx_install_dir("scoped-agent").join("node_modules"),
             serde_json::json!({
                 "@scope": {
-                    "agent-package": { "package.json": r#"{"version":"1.2.1"}"# },
+                    "agent-package": { "package.json": r#"{"version":"1.2.1","bin":{"agent-package":"cli.js"}}"#, "cli.js": "" },
                 },
             }),
         )
@@ -2453,6 +2484,33 @@ mod tests {
             AgentInstallStatus::Installed {
                 version: Some("1.2.1".into())
             }
+        );
+        let node_modules = npx_install_dir("scoped-agent").join("node_modules");
+        fs.remove_file(
+            &node_modules.join("@scope/agent-package/cli.js"),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::Installed { version: None }
+        );
+        fs.insert_tree(
+            &node_modules,
+            serde_json::json!({
+                "@scope": { "agent-package": { "cli.js": "" } },
+                "broken-dependency": {},
+            }),
+        )
+        .await;
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::Installed { version: None }
+        );
+        assert!(
+            !fs.is_file(&node_modules.join("broken-dependency/package.json"))
+                .await
         );
     }
 
