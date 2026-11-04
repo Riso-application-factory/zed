@@ -146,7 +146,8 @@ jobs:
           path: ${{ runner.temp }}/riso-sync-plan
       # `riso_sync.py claude-explain-context` → riso_claude.write_explain_context():
       # - Lấy các commit từ L1 trở lên sẽ nằm trong PR auto (scope auto) hoặc PR blocked (scope blocked).
-      # - Ghi `git show` của từng commit, danh sách commit kèm lý do chấm level (commits.json) và prompt.md.
+      # - Ghi `git show` của từng commit, danh sách commit kèm lý do chấm level (commits.json), prompt.md
+      #   và schema.json (định dạng JSON mà Claude phải trả về: nhận định cho từng commit + ghi chú).
       # - Không có commit nào từ L1 trở lên thì không ghi prompt, và Claude không được gọi cho scope đó.
       - name: Prepare Claude context
         run: |
@@ -158,8 +159,9 @@ jobs:
           node-version: '22'
       - name: Install Claude Code
         run: npm install --global @anthropic-ai/claude-code@2.1.318
-      # Claude chỉ được đọc file (--restricted, chỉ có Read/Grep/Glob, không Bash, không mạng).
-      # Ghi chú của Claude không ảnh hưởng tới level hay auto-merge; Claude lỗi thì PR vẫn được mở, chỉ thiếu ghi chú.
+      # Claude chỉ được đọc file (--restricted, chỉ có Read/Grep/Glob, không Bash, không mạng) và trả về JSON theo schema.json:
+      # mỗi commit một nhận định tham khảo (safe / review / risky) kèm lý do, cộng phần ghi chú.
+      # Nhận định không ảnh hưởng tới level hay auto-merge; Claude lỗi thì PR vẫn được mở, chỉ thiếu cột Claude và ghi chú.
       - name: Explain with Claude
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -168,9 +170,9 @@ jobs:
           for scope in auto blocked; do
             context="$RUNNER_TEMP/claude/$scope"
             if [ ! -f "$context/prompt.md" ]; then continue; fi
-            if ! claude --print "$(cat "$context/prompt.md")" --restricted --strict-mcp-config --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode dontAsk --add-dir "$context" --no-session-persistence --output-format text > "$RUNNER_TEMP/explanations/$scope.md"; then
-              echo "::warning::Claude could not explain the $scope pull request; it will be opened without notes."
-              rm -f "$RUNNER_TEMP/explanations/$scope.md"
+            if ! claude --print "$(cat "$context/prompt.md")" --restricted --strict-mcp-config --tools Read,Grep,Glob --allowedTools Read,Grep,Glob --permission-mode dontAsk --add-dir "$context" --no-session-persistence --output-format json --json-schema "$(cat "$context/schema.json")" > "$RUNNER_TEMP/explanations/$scope.json"; then
+              echo "::warning::Claude could not review the $scope pull request; it will be opened without Claude's column and notes."
+              rm -f "$RUNNER_TEMP/explanations/$scope.json"
             fi
           done
       - name: Upload explanations
@@ -182,9 +184,10 @@ jobs:
       - name: Publish explanation summary
         run: |
           for scope in auto blocked; do
-            if [ -f "$RUNNER_TEMP/explanations/$scope.md" ]; then
-              printf '\n### Claude: %s\n\n' "$scope" >> "$GITHUB_STEP_SUMMARY"
-              cat "$RUNNER_TEMP/explanations/$scope.md" >> "$GITHUB_STEP_SUMMARY"
+            if [ -f "$RUNNER_TEMP/explanations/$scope.json" ]; then
+              printf '\n### Claude: %s\n\n```json\n' "$scope" >> "$GITHUB_STEP_SUMMARY"
+              jq '.structured_output // .result' "$RUNNER_TEMP/explanations/$scope.json" >> "$GITHUB_STEP_SUMMARY" || cat "$RUNNER_TEMP/explanations/$scope.json" >> "$GITHUB_STEP_SUMMARY"
+              printf '```\n' >> "$GITHUB_STEP_SUMMARY"
             fi
           done
   apply:
@@ -242,8 +245,11 @@ jobs:
       # - Blocker: tạo nhánh riso/sync/blocked/<sha7> từ nhánh auto rồi merge commit bị chặn. Merge sạch thì push
       #   và mở PR nhãn riso-sync-blocked; có xung đột thì mở issue hướng dẫn chạy
       #   `python3 riso/sync/riso_sync.py resolve <sha>` trên máy.
-      # - Ghi chú của Claude (nếu có) được chèn vào nội dung PR/issue bằng riso_report.append_explanation(),
-      #   sau khi đã vô hiệu hoá @mention và comment HTML.
+      # - Nội dung PR/issue (riso_report.render): một bảng gồm mọi commit trong PR với các cột
+      #   Commit · Tiêu đề · Luật · Jev · Claude (tham khảo) · Level · Xử lý.
+      #   Nhận định của Claude được đọc bằng riso_claude.load_review(); output hỏng thì bỏ qua.
+      #   Ghi chú của Claude được chèn bằng riso_report.append_explanation(), sau khi vô hiệu hoá @mention và comment HTML.
+      # - Với --dry-run, nội dung PR/issue được in ra log thay vì gửi lên GitHub.
       # - --dry-run chỉ in các lệnh git/gh, không thay đổi gì.
       - name: Prepare review requests
         env:
@@ -252,8 +258,8 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           arguments=(--plan "$RUNNER_TEMP/riso-sync-plan/plan.json" --push --github)
-          arguments+=(--explanation-auto "$RUNNER_TEMP/riso-sync-explanations/auto.md")
-          arguments+=(--explanation-blocked "$RUNNER_TEMP/riso-sync-explanations/blocked.md")
+          arguments+=(--claude-auto "$RUNNER_TEMP/riso-sync-explanations/auto.json")
+          arguments+=(--claude-blocked "$RUNNER_TEMP/riso-sync-explanations/blocked.json")
           if [ "$DRY_RUN" = true ]; then arguments+=(--dry-run); fi
           python3 riso/sync/riso_sync.py prepare "${arguments[@]}"
   resolve:

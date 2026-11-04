@@ -10,7 +10,7 @@ class ReportTest(unittest.TestCase):
     def setUp(self):
         self.config = load_config(Path(__file__).resolve().parents[3])
         self.commit = {'sha': 'a' * 40, 'short': 'aaaaaaa', 'subject': 'Hello @person | new\nline (#123)',
-                       'upstream_pr': 123, 'level': 1, 'adrs': ['ADR-0001'],
+                       'upstream_pr': 123, 'level': 1, 'baseline_level': 1, 'adrs': ['ADR-0001'],
                        'reasons': [{'level': 1, 'adr': 'ADR-0001', 'code': 'hook_file', 'paths': ['hook.rs'], 'message': 'hook @person'}],
                        'conflicts': {'mechanical': ['hook.rs'], 'real': []}, 'jev': []}
         self.plan = {'head': 'b' * 40, 'upstream': 'a' * 40, 'base': 'c' * 40,
@@ -20,7 +20,9 @@ class ReportTest(unittest.TestCase):
 
     def test_body_and_sanitization(self):
         body = render_auto_body(self.plan, self.config)
-        self.assertIn('Ảnh hưởng tới custom', body)
+        self.assertIn('| Commit | Tiêu đề | Luật | Jev | Claude (tham khảo) | Level | Xử lý |', body)
+        self.assertIn('L1: file có hook hook.rs (ADR-0001)', body)
+        self.assertIn('✅ tự động; giải tự động: hook.rs', body)
         self.assertIn('⏸ (shadow)', body)
         self.assertIn('`123`', body)
         self.assertNotIn('/pull/', body)
@@ -43,21 +45,59 @@ class ReportTest(unittest.TestCase):
         self.assertIn('Cần người kiểm tra', render_blocked_body(self.plan, self.config))
         self.assertIn('`27`', render_waiting_comment(self.plan, 27))
 
-    def test_truncation_preserves_marker(self):
+    def test_truncation_collapses_level_zero_rows_first(self):
         zero = copy.deepcopy(self.commit)
-        zero['level'] = 0
-        zero['subject'] = 'zero' * 20000
-        self.plan['commits'].append(zero)
-        self.plan['auto']['count'] = 2
+        zero.update(level=0, baseline_level=0, reasons=[], adrs=[], conflicts={'mechanical': [], 'real': []})
+        self.plan['commits'].extend(dict(zero, sha=f'{index:040x}', short=f'{index:07x}', subject='zero ' * 60) for index in range(300))
+        self.plan['auto']['count'] = len(self.plan['commits'])
         body = render_auto_body(self.plan, self.config)
         self.assertLess(len(body), 60000)
-        self.assertNotIn('<details>', body)
-        self.assertIn('riso-sync-plan', body)
+        self.assertIn('300 commit L0 đã được rút gọn', body)
+        self.assertIn('aaaaaaa', body)
+        self.assertTrue(body.rstrip().endswith('-->'))
+
+    def test_truncation_preserves_marker(self):
         self.commit['subject'] = 'huge' * 20000
         body = render_auto_body(self.plan, self.config)
         self.assertLess(len(body), 60000)
         self.assertTrue(body.rstrip().endswith('-->'))
         self.assertIn('Đã rút gọn', body)
+
+    def test_every_commit_row_shows_rule_jev_and_claude(self):
+        zero = dict(copy.deepcopy(self.commit), sha='d' * 40, short='ddddddd', subject='Unrelated', upstream_pr=None,
+                    level=0, baseline_level=0, reasons=[], adrs=[], conflicts={'mechanical': [], 'real': []})
+        self.commit['jev'] = [{'adr': 'ADR-0001', 'model': 'jev-1.14.0', 'decision_level': 1, 'notes': 'safe',
+                               'answers': {'impact': {'score': 0.4, 'confidence': 0.92}}}]
+        self.commit['reasons'].append({'level': 1, 'adr': 'ADR-0001', 'code': 'jev_safe', 'paths': ['hook.rs'], 'message': 'jev'})
+        self.plan['commits'].append(zero)
+        self.plan['auto']['count'] = 2
+        verdicts = {'aaaaaaa': {'verdict': 'risky', 'reason': 'Hook @team | sẽ mất anchor ' + 'x' * 400}}
+        body = render_auto_body(self.plan, self.config, verdicts)
+        rows = [line for line in body.splitlines() if line.startswith('| [')]
+        self.assertEqual(len(rows), 2)
+        self.assertIn('L1 an toàn (impact 0.4, tin cậy 92%)', rows[0])
+        self.assertIn('⚠️ có thể hỏng: Hook @\u200bteam \\| sẽ mất anchor', rows[0])
+        self.assertIn('…', rows[0])
+        self.assertNotIn('x' * 300, rows[0])
+        self.assertNotIn('jev_safe', rows[0])
+        self.assertIn('Chi tiết câu trả lời của Jev', body)
+        self.assertEqual(rows[1].split(' | ')[2:], ['L0', '—', '—', 'L0', '✅ tự động |'])
+        self.assertIn('Số commit theo level: L0: 1 · L1: 1', body)
+
+    def test_jev_level_one_check_shows_relied_behavior_probability(self):
+        self.commit['jev'] = [{'adr': 'ADR-0001', 'model': 'jev-1.14.0', 'decision_level': 1, 'notes': 'safe',
+                               'answers': {'relied_behavior_changed': {'type': 'noul', 'noul': 0.09}}}]
+        self.assertIn('L1 an toàn (khả năng đổi hành vi custom dựa vào: 9%)', render_auto_body(self.plan, self.config))
+
+    def test_jev_and_claude_cells_explain_missing_values(self):
+        for baseline, reasons, expected in ((3, [], '— (luật đã chặn)'), (2, [], '— (không cần)'),
+                                            (2, [{'level': 3, 'adr': 'ADR-0001', 'code': 'jev_unavailable', 'paths': [], 'message': 'x'}], '⚠️ không gọi được')):
+            with self.subTest(expected=expected):
+                commit = dict(copy.deepcopy(self.commit), baseline_level=baseline, level=max(baseline, 1), reasons=reasons)
+                self.plan['commits'] = [commit]
+                body = render_auto_body(self.plan, self.config, {'aaaaaaa': {'verdict': 'unknown', 'reason': 'x'}})
+                row = next(line for line in body.splitlines() if line.startswith('| ['))
+                self.assertEqual(row.split(' | ')[3:5], [expected, '—'])
 
     def test_explanation_sits_above_footer_and_is_neutralized(self):
         body = render_auto_body(self.plan, self.config)

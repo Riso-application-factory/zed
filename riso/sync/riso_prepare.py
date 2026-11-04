@@ -61,7 +61,9 @@ class Executor:
 
     def body_command(self, command, body):
         if self.dry_run:
-            return self.run(*command, "--body-file", "<generated-body>")
+            output = self.run(*command, "--body-file", "<generated-body>")
+            print(body)
+            return output
         with tempfile.TemporaryDirectory(prefix="riso-sync-") as directory:
             path = Path(directory) / "body.md"
             self.write(path, body)
@@ -317,7 +319,7 @@ def explained(body, explanation):
     return append_explanation(body, explanation)
 
 
-def prepare(executor, config, plan, push=False, github=False, explanations=None):
+def prepare(executor, config, plan, push=False, github=False, reviews=None):
     from riso_report import render_auto_body, render_blocked_body, render_waiting_comment
 
     validate_plan(executor.root, config, plan)
@@ -339,7 +341,8 @@ def prepare(executor, config, plan, push=False, github=False, explanations=None)
             executor.run("git", "checkout", "-B", branch, plan["head"])
             if not merge(executor, target, f"Merge upstream {target[:7]} (riso sync, max L{auto['max_level']})"):
                 raise RuntimeError("Unexpected real conflict in auto prefix; merge aborted")
-            body = explained(render_auto_body(plan, config), (explanations or {}).get("auto")) if github else None
+            review = (reviews or {}).get("auto") or {}
+            body = explained(render_auto_body(plan, config, review.get("verdicts")), review.get("notes")) if github else None
             if push:
                 executor.run("git", "push", "--force-with-lease", "origin", branch)
         except (RuntimeError, OSError, ValueError) as error:
@@ -363,7 +366,8 @@ def prepare(executor, config, plan, push=False, github=False, explanations=None)
             clean = False
         else:
             clean = merge(executor, blocker["sha"])
-        body = explained(render_blocked_body(plan, config), (explanations or {}).get("blocked"))
+        review = (reviews or {}).get("blocked") or {}
+        body = explained(render_blocked_body(plan, config, review.get("verdicts")), review.get("notes"))
         if not clean:
             if github:
                 label_arguments = labels(executor, config, blocker["level"], True)
@@ -443,9 +447,9 @@ def dispatch(arguments):
         if arguments.command == "prepare":
             with Path(arguments.plan).open() as source:
                 plan = json.load(source)
-            explanations = {scope: optional_text(getattr(arguments, f"explanation_{scope}", None))
-                            for scope in ("auto", "blocked")}
-            return prepare(executor, config, plan, arguments.push, arguments.github, explanations)
+            from riso_claude import load_review
+            reviews = {scope: load_review(getattr(arguments, f"claude_{scope}", None)) for scope in ("auto", "blocked")}
+            return prepare(executor, config, plan, arguments.push, arguments.github, reviews)
         summary_path = getattr(arguments, "claude_summary", None)
         summary = None if summary_path is None else optional_text(summary_path)
         return resolve(executor, config, arguments.sha, arguments.finish, getattr(arguments, "start", None), summary)
@@ -460,8 +464,8 @@ def register(subparsers):
     preparation.add_argument("--plan", required=True, help="Version 1 plan JSON file")
     preparation.add_argument("--push", action="store_true", help="Push prepared branches")
     preparation.add_argument("--github", action="store_true", help="Create or update GitHub review requests")
-    preparation.add_argument("--explanation-auto", help="Optional Claude notes for the auto pull request")
-    preparation.add_argument("--explanation-blocked", help="Optional Claude notes for the blocked pull request or issue")
+    preparation.add_argument("--claude-auto", help="Optional Claude review JSON for the auto pull request")
+    preparation.add_argument("--claude-blocked", help="Optional Claude review JSON for the blocked pull request or issue")
     resolution = subparsers.add_parser("resolve", help="Resolve a blocked upstream merge locally")
     resolution.add_argument("sha", help="Blocked upstream commit")
     resolution.add_argument("--finish", action="store_true", help="Verify and publish a resolved merge")
