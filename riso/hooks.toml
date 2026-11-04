@@ -24,3 +24,10 @@ file = "crates/zed/src/main.rs"
 anchor = "        settings_ui::init(cx);"
 position = "after"
 text = "        crew_model_catalog::init(app_state.clone(), cx);"
+
+[[hooks]]
+id = "crew-quota-init"
+file = "crates/zed/src/main.rs"
+anchor = "        crew_model_catalog::init(app_state.clone(), cx);"
+position = "after"
+text = "        crew_quota::init(app_state.clone(), cx);"

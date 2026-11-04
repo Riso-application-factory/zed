@@ -1,0 +1,49 @@
+{
+  "mode": "live",
+  "passthrough": false,
+  "offline": true,
+  "results": [
+    {
+      "initialize_ms": 54,
+      "shape": {
+        "id": "number",
+        "result": {}
+      }
+    },
+    {
+      "read_ms": 4,
+      "shape": {
+        "error": {
+          "code": -32603
+        },
+        "id": "number"
+      }
+    }
+  ],
+  "notifications": {
+    "remoteControl/status/changed": 1
+  },
+  "stderr_categories": [],
+  "exit_code": 0,
+  "auth_file_unchanged": true,
+  "temporary_files": [
+    "auth.json",
+    "goals_1.sqlite",
+    "goals_1.sqlite-wal",
+    "installation_id",
+    "logs_2.sqlite",
+    "logs_2.sqlite-shm",
+    "logs_2.sqlite-wal",
+    "memories_1.sqlite",
+    "memories_1.sqlite-shm",
+    "memories_1.sqlite-wal",
+    "queue_1.sqlite",
+    "queue_1.sqlite-shm",
+    "queue_1.sqlite-wal",
+    "skills",
+    "state_5.sqlite",
+    "state_5.sqlite-shm",
+    "state_5.sqlite-wal"
+  ],
+  "temporary_auth_is_symlink": true
+}

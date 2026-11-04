@@ -4189,6 +4189,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew_quota"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-process",
+ "chrono",
+ "db",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "libc",
+ "log",
+ "node_runtime",
+ "paths",
+ "project",
+ "semver",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "tempfile",
+ "uuid",
+ "workspace",
+]
+
+[[package]]
 name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22488,6 +22514,7 @@ dependencies = [
  "copilot_ui",
  "crashes",
  "crew_model_catalog",
+ "crew_quota",
  "dap_adapters",
  "db",
  "debug_adapter_extension",
