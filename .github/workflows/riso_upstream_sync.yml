@@ -89,6 +89,7 @@ jobs:
             printf 'Dry run: would open/update blocked issue for failed run %s\n' "$RUN_URL"
             exit 0
           fi
+          # shellcheck disable=SC2016 # The backticks are Markdown code formatting for the issue body.
           printf 'Đồng bộ upstream thất bại ngoài dự kiến.\n\nCommit sản phẩm: `%s`\n\nĐường dẫn và lỗi: xem nhật ký %s\n' "$PRODUCT_SHA" "$RUN_URL" > "$RUNNER_TEMP/sync-failure.md"
           gh label create riso-sync --force
           gh label create riso-sync-blocked --force
