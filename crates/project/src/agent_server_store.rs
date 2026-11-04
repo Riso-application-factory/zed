@@ -11,8 +11,8 @@ use fs::{Fs, RemoveOptions};
 use futures::StreamExt;
 use github_releases::AssetKind;
 use gpui::{
-    AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
-    TaskExt,
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription,
+    Task, TaskExt,
 };
 use http_client::HttpClient;
 use node_runtime::NodeRuntime;
@@ -139,8 +139,24 @@ pub trait ExternalAgentServer {
 
     fn set_loading_status_tx(&mut self, _tx: watch::Sender<Option<String>>) {}
 
+    /// Reports the local installation without downloading, installing or creating directories,
+    /// so callers can tell whether `get_command` would have to install the agent first.
+    fn install_status(&self, _cx: &App) -> Task<Result<AgentInstallStatus>> {
+        Task::ready(Ok(AgentInstallStatus::Unmanaged))
+    }
+
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentInstallStatus {
+    /// Zed does not install this agent, e.g. a custom command or an agent on a remote host.
+    Unmanaged,
+    NotInstalled,
+    /// `version` is `None` when only an installation of another version is present, which
+    /// `get_command` replaces with the current one.
+    Installed { version: Option<SharedString> },
 }
 
 enum AgentServerStoreState {
@@ -1053,6 +1069,90 @@ fn versioned_archive_cache_dir(
 // so we only ever remove directories that we created ourselves.
 const VERSIONED_ARCHIVE_CACHE_DIR_PREFIX: &str = "v_";
 
+// Must match the platform key `LocalRegistryArchiveAgent::get_command` selects targets with.
+fn registry_platform_key() -> Option<String> {
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        return None;
+    };
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        return None;
+    };
+    Some(format!("{os}-{arch}"))
+}
+
+async fn archive_install_status(
+    fs: Arc<dyn Fs>,
+    installation_dir: &Path,
+    current_version: SharedString,
+    current_version_dir: &Path,
+) -> Result<AgentInstallStatus> {
+    if fs.is_dir(current_version_dir).await {
+        return Ok(AgentInstallStatus::Installed {
+            version: Some(current_version),
+        });
+    }
+    if !fs.is_dir(installation_dir).await {
+        return Ok(AgentInstallStatus::NotInstalled);
+    }
+
+    let mut entries = fs
+        .read_dir(installation_dir)
+        .await
+        .with_context(|| format!("reading archive cache directory {installation_dir:?}"))?;
+    while let Some(entry) = entries.next().await {
+        let entry = entry.with_context(|| format!("reading entry in {installation_dir:?}"))?;
+        let is_versioned_dir_name = entry.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with(VERSIONED_ARCHIVE_CACHE_DIR_PREFIX)
+        });
+        if is_versioned_dir_name && fs.is_dir(&entry).await {
+            return Ok(AgentInstallStatus::Installed { version: None });
+        }
+    }
+    Ok(AgentInstallStatus::NotInstalled)
+}
+
+// Must match the directory `LocalRegistryNpxAgent::get_command` installs into.
+fn npx_install_dir(registry_id: &str) -> PathBuf {
+    paths::external_agents_dir()
+        .join("registry")
+        .join("npx")
+        .join(sanitize_path_component(registry_id))
+}
+
+async fn npx_install_status(
+    fs: Arc<dyn Fs>,
+    package_json_path: &Path,
+) -> Result<AgentInstallStatus> {
+    #[derive(Deserialize)]
+    struct PackageVersion {
+        version: Option<String>,
+    }
+
+    if !fs.is_file(package_json_path).await {
+        return Ok(AgentInstallStatus::NotInstalled);
+    }
+    let contents = fs
+        .load(package_json_path)
+        .await
+        .with_context(|| format!("reading {package_json_path:?}"))?;
+    let package = serde_json::from_str::<PackageVersion>(&contents)
+        .with_context(|| format!("parsing {package_json_path:?}"))?;
+    Ok(AgentInstallStatus::Installed {
+        version: package.version.map(SharedString::from),
+    })
+}
+
 async fn remove_stale_versioned_archive_cache_dirs(
     fs: Arc<dyn Fs>,
     base_dir: &Path,
@@ -1147,6 +1247,26 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
 
     fn set_loading_status_tx(&mut self, tx: watch::Sender<Option<String>>) {
         self.loading_status_tx = Some(tx);
+    }
+
+    fn install_status(&self, cx: &App) -> Task<Result<AgentInstallStatus>> {
+        let Some(target_config) =
+            registry_platform_key().and_then(|platform_key| self.targets.get(&platform_key))
+        else {
+            return Task::ready(Ok(AgentInstallStatus::NotInstalled));
+        };
+        let current_version_dir = versioned_archive_cache_dir(
+            &self.installation_dir,
+            Some(self.version.as_ref()),
+            &target_config.archive,
+            target_config.sha256.as_deref(),
+        );
+        let fs = self.fs.clone();
+        let installation_dir = self.installation_dir.clone();
+        let version = self.version.clone();
+        cx.background_spawn(async move {
+            archive_install_status(fs, &installation_dir, version, &current_version_dir).await
+        })
     }
 
     fn get_command(
@@ -1363,6 +1483,16 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
 
     fn set_new_version_available_tx(&mut self, tx: watch::Sender<Option<String>>) {
         self.new_version_available_tx = Some(tx);
+    }
+
+    fn install_status(&self, cx: &App) -> Task<Result<AgentInstallStatus>> {
+        let (package_name, _) = bounded_npm_package_spec(&self.package);
+        let package_json_path = npx_install_dir(&self.registry_id)
+            .join("node_modules")
+            .join(package_name)
+            .join("package.json");
+        let fs = self.fs.clone();
+        cx.background_spawn(async move { npx_install_status(fs, &package_json_path).await })
     }
 
     fn get_command(
@@ -2220,6 +2350,110 @@ mod tests {
                 .join("agent")
         );
         assert_eq!(std::fs::read(command.path).unwrap(), contents);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui::test]
+    async fn registry_archive_install_status_reports_without_installing(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        cx.executor().allow_parking();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let installation_dir = temp_dir.path().join("agent");
+        let agent = make_registry_archive_agent(
+            cx,
+            installation_dir.clone(),
+            static_http_client(Vec::new()),
+            None,
+        );
+        let install_status = |cx: &mut TestAppContext| cx.update(|cx| agent.install_status(cx));
+
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::NotInstalled
+        );
+        assert!(!installation_dir.exists());
+
+        std::fs::create_dir_all(installation_dir.join("staging")).unwrap();
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::NotInstalled
+        );
+
+        std::fs::create_dir_all(versioned_archive_cache_dir(
+            &installation_dir,
+            Some("0.9.0"),
+            TEST_ARCHIVE_URL,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::Installed { version: None }
+        );
+
+        std::fs::create_dir_all(versioned_archive_cache_dir(
+            &installation_dir,
+            Some("1.0.0"),
+            TEST_ARCHIVE_URL,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::Installed {
+                version: Some("1.0.0".into())
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn registry_npx_install_status_reads_installed_package_version(cx: &mut TestAppContext) {
+        init_test_settings(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        let agent = cx.update(|cx| {
+            let agent_fs: Arc<dyn Fs> = fs.clone();
+            let worktree_store = cx.new(|cx| {
+                WorktreeStore::local(false, agent_fs.clone(), WorktreeIdCounter::get(cx))
+            });
+            let project_environment = cx.new(|cx| {
+                crate::ProjectEnvironment::new(None, worktree_store.downgrade(), None, false, cx)
+            });
+            LocalRegistryNpxAgent {
+                fs: agent_fs,
+                node_runtime: NodeRuntime::unavailable(),
+                project_environment,
+                registry_id: "scoped-agent".into(),
+                version: "1.2.3".into(),
+                package: "@scope/agent-package@1.2.3".into(),
+                args: Vec::new(),
+                distribution_env: HashMap::default(),
+                settings_env: HashMap::default(),
+                new_version_available_tx: None,
+            }
+        });
+        let install_status = |cx: &mut TestAppContext| cx.update(|cx| agent.install_status(cx));
+
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::NotInstalled
+        );
+        assert!(!fs.is_dir(&npx_install_dir("scoped-agent")).await);
+
+        fs.insert_tree(
+            npx_install_dir("scoped-agent").join("node_modules"),
+            serde_json::json!({
+                "@scope": {
+                    "agent-package": { "package.json": r#"{"version":"1.2.1"}"# },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            install_status(cx).await.unwrap(),
+            AgentInstallStatus::Installed {
+                version: Some("1.2.1".into())
+            }
+        );
     }
 
     #[gpui::test]

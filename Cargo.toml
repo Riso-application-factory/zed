@@ -47,6 +47,7 @@ members = [
     "crates/copilot_chat",
     "crates/crashes",
     "crates/credentials_provider",
+    "crates/crew_model_catalog",
     "crates/dap",
     "crates/dap_adapters",
     "crates/db",
@@ -330,6 +331,7 @@ copilot_chat = { path = "crates/copilot_chat" }
 copilot_ui = { path = "crates/copilot_ui" }
 crashes = { path = "crates/crashes" }
 credentials_provider = { path = "crates/credentials_provider" }
+crew_model_catalog = { path = "crates/crew_model_catalog" }
 dap = { path = "crates/dap" }
 dap_adapters = { path = "crates/dap_adapters" }
 db = { path = "crates/db" }
