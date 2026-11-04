@@ -792,6 +792,7 @@ fn main() {
         svg_preview::init(cx);
         onboarding::init(cx);
         settings_ui::init(cx);
+        crew_model_catalog::init(app_state.clone(), cx);
         keymap_editor::init(cx);
         extensions_ui::init(cx);
         edit_prediction::init(cx);

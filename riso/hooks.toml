@@ -17,3 +17,10 @@ text = """        jev::init(
             jev_shell_env_loaded_rx,
             cx,
         );"""
+
+[[hooks]]
+id = "crew-model-catalog-init"
+file = "crates/zed/src/main.rs"
+anchor = "        settings_ui::init(cx);"
+position = "after"
+text = "        crew_model_catalog::init(app_state.clone(), cx);"

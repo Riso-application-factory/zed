@@ -4164,6 +4164,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "crew_model_catalog"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "agent-client-protocol",
+ "agent_servers",
+ "anyhow",
+ "chrono",
+ "collections",
+ "db",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "paths",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "smol",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22462,6 +22487,7 @@ dependencies = [
  "copilot_chat",
  "copilot_ui",
  "crashes",
+ "crew_model_catalog",
  "dap_adapters",
  "db",
  "debug_adapter_extension",
