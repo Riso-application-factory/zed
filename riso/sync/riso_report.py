@@ -98,7 +98,9 @@ def claude_cell(commit, verdicts):
     reason = " ".join(str(verdict.get("reason", "")).split())
     if len(reason) > CLAUDE_REASON_LIMIT:
         reason = reason[:CLAUDE_REASON_LIMIT].rstrip() + "…"
-    return CLAUDE_LABELS[verdict["verdict"]] + (f": {sanitize(reason)}" if reason else "")
+    # Code spans are safe inside a table cell (pipes stay escaped) and make file and symbol names readable.
+    reason = sanitize(reason).replace("\\`", "`")
+    return CLAUDE_LABELS[verdict["verdict"]] + (f": {reason}" if reason else "")
 
 
 def action_cell(commit):

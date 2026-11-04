@@ -71,12 +71,12 @@ class ReportTest(unittest.TestCase):
         self.commit['reasons'].append({'level': 1, 'adr': 'ADR-0001', 'code': 'jev_safe', 'paths': ['hook.rs'], 'message': 'jev'})
         self.plan['commits'].append(zero)
         self.plan['auto']['count'] = 2
-        verdicts = {'aaaaaaa': {'verdict': 'risky', 'reason': 'Hook @team | sẽ mất anchor ' + 'x' * 400}}
+        verdicts = {'aaaaaaa': {'verdict': 'risky', 'reason': 'Hook @team | `jev::init` [link](x) sẽ mất anchor ' + 'x' * 400}}
         body = render_auto_body(self.plan, self.config, verdicts)
         rows = [line for line in body.splitlines() if line.startswith('| [')]
         self.assertEqual(len(rows), 2)
         self.assertIn('L1 an toàn (impact 0.4, tin cậy 92%)', rows[0])
-        self.assertIn('⚠️ có thể hỏng: Hook @\u200bteam \\| sẽ mất anchor', rows[0])
+        self.assertIn('⚠️ có thể hỏng: Hook @\u200bteam \\| `jev::init` \\[link\\](x) sẽ mất anchor', rows[0])
         self.assertIn('…', rows[0])
         self.assertNotIn('x' * 300, rows[0])
         self.assertNotIn('jev_safe', rows[0])
