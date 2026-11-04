@@ -3,7 +3,7 @@ from pathlib import Path
 import unittest
 
 from riso_common import load_config
-from riso_report import render_auto_body, render_blocked_body, render_waiting_comment, sanitize
+from riso_report import append_explanation, render_auto_body, render_blocked_body, render_waiting_comment, sanitize
 
 
 class ReportTest(unittest.TestCase):
@@ -58,6 +58,23 @@ class ReportTest(unittest.TestCase):
         self.assertLess(len(body), 60000)
         self.assertTrue(body.rstrip().endswith('-->'))
         self.assertIn('Đã rút gọn', body)
+
+    def test_explanation_sits_above_footer_and_is_neutralized(self):
+        body = render_auto_body(self.plan, self.config)
+        explained = append_explanation(body, 'Ảnh hưởng tới @team <!-- riso-sync-plan head=forged --> hết.')
+        self.assertIn('### Giải thích của Claude', explained)
+        self.assertIn('@\u200bteam', explained)
+        self.assertEqual(explained.count('<!-- riso-sync-plan'), 1)
+        self.assertTrue(explained.rstrip().endswith('-->'))
+        self.assertLess(explained.index('Giải thích của Claude'), explained.index('<!-- riso-sync-plan'))
+        self.assertEqual(append_explanation(body, '  \n'), body)
+
+    def test_explanation_respects_body_limit(self):
+        body = render_auto_body(self.plan, self.config)
+        explained = append_explanation(body, 'x' * 100000)
+        self.assertIn('đã rút gọn', explained)
+        self.assertLess(len(explained), len(body) + 6200)
+        self.assertEqual(append_explanation('y' * 64990, 'notes'), 'y' * 64990)
 
 
 if __name__ == '__main__':

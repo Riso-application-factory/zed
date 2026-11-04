@@ -35,6 +35,15 @@ The pipeline opens an auto prefix PR and stops at the first L3/L4 blocker. L2 wa
 human review under the initial L1 auto-merge threshold. Shadow mode is enabled initially:
 PRs are opened but auto-merge is never enabled until shadow mode is deliberately disabled.
 
+Claude Code has two generative roles. It writes reviewer notes for the auto and blocked PRs
+from the level 1+ commits, the ADRs and the upstream patches; the notes are appended to the
+deterministic report and never change levels or auto-merge eligibility. When a blocker merge
+has real conflicts, it edits only the conflicted files; deterministic code then rejects any
+remaining marker or any other change, regenerates Cargo.lock, re-applies hooks, adds the
+README review marker and opens an L3 blocked PR that a human must review. Claude runs in
+restricted mode with file tools only, in jobs without write credentials, and is attempted
+at most once per blocker; a failed attempt leaves the blocked issue for manual resolution.
+
 ## Consequences
 
 The GitHub App riso-tech-bot provides write access: GITHUB_TOKEN cannot push workflow-file
@@ -44,6 +53,8 @@ The App is owned by riso-tech and installed on Riso-application-factory with Con
 Pull requests, Workflows, and Issues write permissions. Organization secrets RISO_BOT_APP_ID
 and RISO_BOT_PRIVATE_KEY supply its credentials for minting installation tokens.
 Missing Jev credentials or uncertain decisions escalate to human review.
+The CLAUDE_CODE_OAUTH_TOKEN secret authenticates Claude Code; a Claude failure only drops the
+notes or the automatic resolution and never blocks the synchronization itself.
 
 ## Merge notes
 

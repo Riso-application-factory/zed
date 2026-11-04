@@ -4,6 +4,9 @@ import html
 import json
 import re
 
+BODY_LIMIT = 65000
+EXPLANATION_LIMIT = 6000
+
 
 def sanitize(value, title=False):
     value = str(value)
@@ -84,6 +87,22 @@ def render(plan, config, blocked=False):
         kept.append(line)
         length += len(line) + 1
     return "\n".join(kept) + note + marker + "\n"
+
+
+def append_explanation(body, explanation, heading="Giải thích của Claude",
+                       note="Do Claude viết, chỉ để tham khảo; không ảnh hưởng tới level hay auto-merge."):
+    """Insert untrusted Claude prose above the plan footer; it can neither mention users nor hide markup."""
+    text = explanation.strip().replace("<!--", "&lt;!--").replace("@", "@\u200b")
+    section = f"\n### {heading}\n\n_{note}_\n\n"
+    footer_start = body.rfind("<!-- riso-sync-plan")
+    main, footer = (body, "") if footer_start == -1 else (body[:footer_start], body[footer_start:])
+    # GitHub rejects bodies over 65536 characters; keep a margin for the truncation note.
+    budget = min(EXPLANATION_LIMIT, BODY_LIMIT - len(body) - len(section) - 32)
+    if not text or budget <= 0:
+        return body
+    if len(text) > budget:
+        text = text[:budget].rstrip() + "\n\n…(đã rút gọn)"
+    return main.rstrip("\n") + "\n" + section + text + "\n\n" + footer
 
 
 def render_auto_body(plan, config):
