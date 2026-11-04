@@ -1,14 +1,25 @@
 use super::*;
 use gpui::{Action, FocusHandle, Focusable, Render, Window, actions, px, relative};
 use serde::{Deserialize, Serialize};
-use ui::{Button, Icon, IconButton, IconName, Label, Tooltip, prelude::*};
+use ui::{
+    Chip, Icon, IconButton, IconName, Label, ToggleButtonGroup, ToggleButtonGroupStyle,
+    ToggleButtonSimple, Tooltip, prelude::*,
+};
 use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
 };
 
+#[cfg(debug_assertions)]
+use ui::Button;
+
 actions!(crew_quota, [ToggleFocus, RefreshQuota]);
+
+#[cfg(debug_assertions)]
+mod preview;
+#[cfg(debug_assertions)]
+actions!(crew_quota, [ToggleFixturePreview]);
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -99,6 +110,26 @@ fn register_workspace(
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
         workspace.toggle_panel_focus::<QuotaPanel>(window, cx);
     });
+    #[cfg(debug_assertions)]
+    workspace.register_action(|workspace, _: &ToggleFixturePreview, window, cx| {
+        if let Some(panel) = workspace.panel::<QuotaPanel>(cx) {
+            panel.update(cx, |panel, cx| {
+                panel.set_active(false, window, cx);
+                panel.preview = if panel.preview.is_some() {
+                    None
+                } else {
+                    Some(preview::FixturePreview::new(
+                        chrono::Utc::now().timestamp(),
+                        false,
+                    ))
+                };
+                panel.set_active(true, window, cx);
+                cx.defer(|cx| cx.update_global::<SettingsStore, _>(|_, _| {}));
+                cx.notify();
+            });
+            workspace.focus_panel::<QuotaPanel>(window, cx);
+        }
+    });
     workspace.register_action(|workspace, _: &RefreshQuota, _, cx| {
         if let Some(panel) = workspace.panel::<QuotaPanel>(cx) {
             panel.update(cx, |panel, cx| panel.refresh(cx));
@@ -126,6 +157,8 @@ fn register_workspace(
 }
 
 pub struct QuotaPanel {
+    #[cfg(debug_assertions)]
+    preview: Option<preview::FixturePreview>,
     focus: FocusHandle,
     service: Option<Entity<QuotaService>>,
     preferences: Entity<PanelPreferences>,
@@ -136,6 +169,25 @@ pub struct QuotaPanel {
     _subscriptions: Vec<Subscription>,
 }
 impl QuotaPanel {
+    fn display_preferences(&self, cx: &App) -> Preferences {
+        #[cfg(debug_assertions)]
+        if let Some(preview) = &self.preview {
+            return preview.preferences.clone();
+        }
+        self.preferences.read(cx).value.clone()
+    }
+
+    fn is_preview(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            self.preview.is_some()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
     fn new(cx: &mut Context<Self>) -> Self {
         let service = QuotaService::global(cx);
         let preferences = cx.global::<GlobalPreferences>().0.clone();
@@ -144,6 +196,8 @@ impl QuotaPanel {
             subscriptions.push(cx.subscribe(service, |_, _, _: &QuotaEvent, cx| cx.notify()));
         }
         Self {
+            #[cfg(debug_assertions)]
+            preview: preview::FixturePreview::from_environment(),
             focus: cx.focus_handle(),
             service,
             preferences,
@@ -156,6 +210,16 @@ impl QuotaPanel {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        #[cfg(debug_assertions)]
+        if let Some(preview) = &mut self.preview {
+            let preferences = preview.preferences.clone();
+            let left = preview.left;
+            *preview = preview::FixturePreview::new(chrono::Utc::now().timestamp(), preview.states);
+            preview.preferences = preferences;
+            preview.left = left;
+            cx.notify();
+            return;
+        }
         if self.refresh_task.is_some() {
             return;
         }
@@ -179,6 +243,16 @@ impl QuotaPanel {
     }
 
     fn change_preference(&mut self, compact: bool, cx: &mut Context<Self>) {
+        #[cfg(debug_assertions)]
+        if let Some(preview) = &mut self.preview {
+            if compact {
+                preview.preferences.compact = !preview.preferences.compact;
+            } else {
+                preview.preferences.used = !preview.preferences.used;
+            }
+            cx.notify();
+            return;
+        }
         self.preferences.update(cx, |preferences, cx| {
             if compact {
                 preferences.value.compact = !preferences.value.compact;
@@ -203,6 +277,14 @@ impl Panel for QuotaPanel {
         "crew_quota"
     }
     fn position(&self, _: &Window, cx: &App) -> DockPosition {
+        #[cfg(debug_assertions)]
+        if let Some(preview) = &self.preview {
+            return if preview.left {
+                DockPosition::Left
+            } else {
+                DockPosition::Right
+            };
+        }
         if self.preferences.read(cx).value.left {
             DockPosition::Left
         } else {
@@ -214,6 +296,13 @@ impl Panel for QuotaPanel {
     }
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         if !self.position_is_valid(position) {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if let Some(preview) = &mut self.preview {
+            preview.left = position == DockPosition::Left;
+            cx.defer(|cx| cx.update_global::<SettingsStore, _>(|_, _| {}));
+            cx.notify();
             return;
         }
         self.preferences.update(cx, |preferences, cx| {
@@ -238,6 +327,9 @@ impl Panel for QuotaPanel {
     fn toggle_action(&self) -> Box<dyn Action> {
         Box::new(ToggleFocus)
     }
+    fn starts_open(&self, _: &Window, _: &App) -> bool {
+        self.is_preview()
+    }
     fn activation_priority(&self) -> u32 {
         100
     }
@@ -251,7 +343,9 @@ impl Panel for QuotaPanel {
             return;
         }
         let now = chrono::Utc::now().timestamp();
-        if let Some(service) = &self.service {
+        if let Some(service) = &self.service
+            && !self.is_preview()
+        {
             self.demand = Some(service.update(cx, |service, cx| {
                 service.acquire_demand(
                     FreshRequest {
@@ -417,6 +511,71 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
     }
     states.join(" · ")
 }
+fn badge(label: impl Into<SharedString>, color: Color, cx: &App) -> impl IntoElement {
+    h_flex().child(
+        Chip::new(label)
+            .label_color(color)
+            .bg_color(color.color(cx).opacity(0.10))
+            .border_color(color.color(cx).opacity(0.20)),
+    )
+}
+
+fn amount_text(window: &QuotaWindow) -> Option<String> {
+    let remaining = window.remaining.as_ref()?.value.as_ref()?;
+    if !remaining.value.is_finite() {
+        return None;
+    }
+    let unit = match &remaining.unit {
+        Unit::Requests => "requests".into(),
+        Unit::Tokens => "tokens".into(),
+        Unit::UnspecifiedUnits => "units".into(),
+        unit => format!("{unit:?}"),
+    };
+    let numeric_value = |value| {
+        if matches!(remaining.unit, Unit::Requests | Unit::Tokens) {
+            grouped_number(value)
+        } else {
+            format!("{value}")
+        }
+    };
+    let remaining_value = numeric_value(remaining.value);
+    let limit = window
+        .limit
+        .as_ref()
+        .and_then(|sample| sample.value.as_ref())
+        .filter(|limit| limit.unit == remaining.unit && limit.value.is_finite());
+    Some(if let Some(limit) = limit {
+        format!(
+            "{remaining_value} / {} {unit} left",
+            numeric_value(limit.value)
+        )
+    } else {
+        format!("{remaining_value} {unit} left")
+    })
+}
+
+fn credit_text(balance: &Amount, reset_credits: Option<u64>) -> String {
+    let reset_credits = reset_credits
+        .map(|count| format!("{count} reset credits"))
+        .unwrap_or_else(|| "Reset credits unknown".into());
+    format!(
+        "{} credits · {reset_credits}",
+        grouped_number(balance.value)
+    )
+}
+
+fn grouped_number(number: f64) -> String {
+    let digits = format!("{number:.0}");
+    let mut result = String::new();
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            result.push(',');
+        }
+        result.push(digit);
+    }
+    result.chars().rev().collect()
+}
+
 impl Render for QuotaPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let now = chrono::Utc::now().timestamp();
@@ -426,6 +585,12 @@ impl Render for QuotaPanel {
             .as_ref()
             .map(|service| service.read(cx).snapshot(&Selector::default(), now))
             .unwrap_or_default();
+        #[cfg(debug_assertions)]
+        let (preferences, snapshot) = self
+            .preview
+            .as_ref()
+            .map(|preview| (preview.preferences.clone(), preview.snapshot.clone()))
+            .unwrap_or((preferences, snapshot));
         let updated = snapshot
             .accounts
             .values()
@@ -458,9 +623,23 @@ impl Render for QuotaPanel {
                 .border_color(cx.theme().colors().border_variant)
                 .child(
                     h_flex()
+                        .justify_between()
                         .gap_2()
-                        .child(Icon::new(icon).size(IconSize::Small))
-                        .child(Label::new(name))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .size_5()
+                                        .rounded_md()
+                                        .bg(cx.theme().colors().element_background)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(Icon::new(icon).size(IconSize::Small)),
+                                )
+                                .child(Label::new(name)),
+                        )
                         .child(
                             Label::new(countdown(earliest, now))
                                 .size(LabelSize::XSmall)
@@ -468,39 +647,81 @@ impl Render for QuotaPanel {
                         ),
                 );
             if row.accounts.is_empty() {
-                provider = provider.child(
-                    Label::new(if row.provider == ProviderId::Codex {
-                        "Unknown — waiting for installation discovery"
+                provider = provider.child(badge(
+                    if row.provider == ProviderId::Codex {
+                        "Unknown"
                     } else {
-                        "Unsupported — provider source pending"
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                );
+                        "Unsupported · source pending"
+                    },
+                    Color::Muted,
+                    cx,
+                ));
             }
             for (index, account) in row.accounts.iter().enumerate() {
-                if row.accounts.len() > 1 {
-                    provider = provider
-                        .child(Label::new(format!("Login {}", index + 1)).size(LabelSize::Small));
-                }
+                let mut account_header = h_flex().justify_between().gap_2();
                 if let Some(plan) = &account.metadata.plan {
-                    provider = provider.child(
+                    account_header = account_header.child(
                         Label::new(plan.name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    );
-                }
-                provider = provider
-                    .child(
-                        Label::new(account_status(account, now))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new(age(account.last_success_at, now))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     );
+                } else if row.accounts.len() > 1 {
+                    account_header = account_header.child(
+                        Label::new(format!("Login {}", index + 1))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    );
+                }
+                account_header = account_header.child(
+                    Label::new(age(account.last_success_at, now))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                );
+                provider = provider.child(account_header);
+                let status = account_status(account, now);
+                let mut badges = h_flex().flex_wrap().gap_1();
+                for state in status.split(" · ").filter(|state| !state.is_empty()) {
+                    let color = if state.starts_with("Error") || state == "Exhausted" {
+                        Color::Error
+                    } else if state == "Stale" {
+                        Color::Warning
+                    } else {
+                        Color::Muted
+                    };
+                    let label = if state.starts_with("Error") && !account.windows.is_empty() {
+                        "Error · cached data"
+                    } else {
+                        state
+                    };
+                    badges = badges.child(badge(label.to_string(), color, cx));
+                }
+                if !status.is_empty() {
+                    provider = provider.child(badges);
+                }
+                #[cfg(debug_assertions)]
+                if let Some(notes) = self
+                    .preview
+                    .as_ref()
+                    .and_then(|preview| preview.notes.get(&account.scope.id))
+                {
+                    for note in notes {
+                        provider = provider.child(
+                            Label::new(*note)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        );
+                    }
+                }
+                if let Some(balance) = &account.metadata.credit_balance {
+                    provider = provider.child(
+                        Label::new(credit_text(
+                            balance,
+                            account.metadata.available_reset_credits,
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    );
+                }
                 let mut windows = account.windows.values().collect::<Vec<_>>();
                 windows.sort_by(|left, right| {
                     used_fraction(right)
@@ -511,58 +732,35 @@ impl Render for QuotaPanel {
                     if preferences.compact && index > 0 {
                         continue;
                     }
-                    let used = used_fraction(window);
-                    let value = used
-                        .map(|used| {
-                            format!(
-                                "{:.0}% {}",
-                                display_fraction(used, preferences.used) * 100.,
-                                if preferences.used {
-                                    "used"
-                                } else {
-                                    "remaining"
-                                }
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            window
-                                .remaining
-                                .as_ref()
-                                .and_then(|sample| sample.value.as_ref())
-                                .map(|amount| {
-                                    format!("{} {:?} remaining", amount.value, amount.unit)
-                                })
-                                .unwrap_or_else(|| "Unknown percentage".into())
-                        });
-                    let reset = window.reset_at.as_ref().and_then(|reset| reset.value);
+                    let disabled = window.disabled.as_ref().is_some_and(|sample| sample.value);
+                    let used = used_fraction(window).filter(|_| !disabled);
+                    let percentage = used.map(|used| {
+                        format!(
+                            "{:.0}% {}",
+                            display_fraction(used, preferences.used) * 100.,
+                            if preferences.used { "used" } else { "left" }
+                        )
+                    });
+                    let reset = window.reset_at.as_ref().and_then(|sample| sample.value);
                     let title = format!("{} · {}", window.key.bucket.bucket, window.key.role);
-                    let mut section = v_flex()
-                        .gap_1()
-                        .pl_6()
-                        .child(Label::new(title).size(LabelSize::Small))
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .gap_2()
-                                .child(
-                                    Label::new(value)
+                    let mut section = v_flex().gap_1().pl_6().child(
+                        h_flex()
+                            .justify_between()
+                            .gap_2()
+                            .child(Label::new(title).size(LabelSize::Small))
+                            .when_some(percentage, |element, percentage| {
+                                element.child(
+                                    Label::new(percentage)
                                         .size(LabelSize::Small)
                                         .color(used.map(severity).unwrap_or(Color::Muted)),
                                 )
-                                .child(
-                                    Label::new(countdown(reset, now))
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                        );
-                    if window.disabled.as_ref().is_some_and(|sample| sample.value) {
-                        section = section.child(Label::new("Disabled").size(LabelSize::Small));
-                    }
-                    if !preferences.compact {
-                        if let Some(used) = used.filter(|_| {
-                            !window.disabled.as_ref().is_some_and(|sample| sample.value)
-                        }) {
-                            section = section.child(
+                            }),
+                    );
+                    if let Some(used) = used
+                        && !preferences.compact
+                    {
+                        section =
+                            section.child(
                                 div()
                                     .w_full()
                                     .h(px(6.))
@@ -578,8 +776,39 @@ impl Render for QuotaPanel {
                                             .bg(severity(used).color(cx)),
                                     ),
                             );
-                        }
                     }
+                    if let Some(amount) = amount_text(window) {
+                        section = section.child(
+                            Label::new(amount)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        );
+                    }
+                    let state = if disabled {
+                        Some(("Disabled", Color::Muted))
+                    } else {
+                        match used {
+                            Some(used) if used >= 1. => Some(("Exhausted", Color::Error)),
+                            Some(used) if used >= 0.8 => Some(("Critical", Color::Error)),
+                            Some(used) if used >= 0.6 => Some(("Warning", Color::Warning)),
+                            None => Some(("Unknown", Color::Muted)),
+                            _ => None,
+                        }
+                    };
+                    section = section.child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .gap_2()
+                            .child(h_flex().when_some(state, |element, (label, color)| {
+                                element.child(badge(label, color, cx))
+                            }))
+                            .child(
+                                Label::new(countdown(reset, now))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    );
                     provider = provider.child(
                         section
                             .id(format!("quota-window-{}-{index}", account.scope.id))
@@ -603,7 +832,7 @@ impl Render for QuotaPanel {
                 if preferences.compact && account.windows.len() > 1 {
                     provider = provider.child(
                         Label::new(format!(
-                            "{} windows · Detailed shows all coverage",
+                            "{} windows · Detailed shows all",
                             account.windows.len()
                         ))
                         .size(LabelSize::XSmall)
@@ -613,21 +842,80 @@ impl Render for QuotaPanel {
             }
             content = content.child(provider);
         }
-        v_flex()
-            .id("crew-quota-panel")
-            .track_focus(&self.focus)
-            .size_full()
-            .p_3()
+        let mut tab_index = 0;
+        let controls = v_flex()
             .gap_2()
-            .overflow_y_scroll()
-            .on_action(cx.listener(|this, _: &RefreshQuota, _, cx| this.refresh(cx)))
+            .child(
+                ToggleButtonGroup::single_row(
+                    "quota-density",
+                    [
+                        ToggleButtonSimple::new(
+                            "Detailed",
+                            cx.listener(|this, _, _, cx| {
+                                if this.display_preferences(cx).compact {
+                                    this.change_preference(true, cx);
+                                }
+                            }),
+                        )
+                        .tooltip(Tooltip::text("Show all quota windows")),
+                        ToggleButtonSimple::new(
+                            "Compact",
+                            cx.listener(|this, _, _, cx| {
+                                if !this.display_preferences(cx).compact {
+                                    this.change_preference(true, cx);
+                                }
+                            }),
+                        )
+                        .tooltip(Tooltip::text("Show the most constrained window")),
+                    ],
+                )
+                .selected_index(usize::from(preferences.compact))
+                .style(ToggleButtonGroupStyle::Filled)
+                .tab_index(&mut tab_index),
+            )
+            .child(
+                ToggleButtonGroup::single_row(
+                    "quota-values",
+                    [
+                        ToggleButtonSimple::new(
+                            "Remaining",
+                            cx.listener(|this, _, _, cx| {
+                                if this.display_preferences(cx).used {
+                                    this.change_preference(false, cx);
+                                }
+                            }),
+                        )
+                        .tooltip(Tooltip::text(
+                            "Show remaining quota; colors still follow usage",
+                        )),
+                        ToggleButtonSimple::new(
+                            "Used",
+                            cx.listener(|this, _, _, cx| {
+                                if !this.display_preferences(cx).used {
+                                    this.change_preference(false, cx);
+                                }
+                            }),
+                        )
+                        .tooltip(Tooltip::text("Show consumed quota")),
+                    ],
+                )
+                .selected_index(usize::from(preferences.used))
+                .style(ToggleButtonGroupStyle::Filled)
+                .tab_index(&mut tab_index),
+            );
+        let header = v_flex()
+            .gap_2()
             .child(
                 h_flex().justify_between().child(Label::new("Quota")).child(
                     IconButton::new("refresh-quota", IconName::RotateCw)
                         .disabled(self.refresh_task.is_some())
-                        .tab_index(0_isize)
+                        .tab_index(4_isize)
                         .aria_label("Refresh quota")
-                        .tooltip(Tooltip::text("Refresh quota"))
+                        .tooltip(Tooltip::text(if self.is_preview() {
+                            "Reload sample data"
+                        } else {
+                            "Refresh quota"
+                        }))
                         .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 ),
             )
@@ -639,44 +927,66 @@ impl Render for QuotaPanel {
                 })
                 .size(LabelSize::XSmall)
                 .color(Color::Muted),
-            )
-            .child(
+            );
+        #[cfg(debug_assertions)]
+        let header = if let Some(preview) = &self.preview {
+            header.child(
                 h_flex()
-                    .gap_2()
+                    .justify_between()
+                    .child(badge("Sample data · debug preview", Color::Warning, cx))
                     .child(
                         Button::new(
-                            "quota-density",
-                            if preferences.compact {
-                                "Compact"
+                            "quota-preview-scene",
+                            if preview.states {
+                                "Overview"
                             } else {
-                                "Detailed"
+                                "All states"
                             },
                         )
-                        .tab_index(0_isize)
-                        .tooltip(Tooltip::text("Switch Detailed / Compact"))
-                        .on_click(cx.listener(|this, _, _, cx| this.change_preference(true, cx))),
-                    )
-                    .child(
-                        Button::new(
-                            "quota-values",
-                            if preferences.used {
-                                "Used"
-                            } else {
-                                "Remaining"
-                            },
-                        )
-                        .tab_index(0_isize)
-                        .tooltip(Tooltip::text("Switch Used / Remaining"))
-                        .on_click(cx.listener(|this, _, _, cx| this.change_preference(false, cx))),
+                        .tab_index(5_isize)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(preview) = &mut this.preview {
+                                let preferences = preview.preferences.clone();
+                                let left = preview.left;
+                                *preview = preview::FixturePreview::new(
+                                    chrono::Utc::now().timestamp(),
+                                    !preview.states,
+                                );
+                                preview.preferences = preferences;
+                                preview.left = left;
+                            }
+                            cx.notify();
+                        })),
                     ),
             )
+        } else {
+            header
+        };
+        v_flex()
+            .id("crew-quota-panel")
+            .track_focus(&self.focus)
+            .size_full()
+            .p_3()
+            .gap_3()
+            .font_features(gpui::FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+            .on_action(cx.listener(|this, _: &RefreshQuota, _, cx| this.refresh(cx)))
+            .child(header)
+            .child(controls)
             .when_some(self.refresh_error.clone(), |element, error| {
                 element.child(Label::new(error).color(Color::Error))
             })
             .when(self.preferences.read(cx).error, |element| {
                 element.child(Label::new("Could not save panel preferences").color(Color::Error))
             })
-            .child(content)
+            .child(
+                v_flex()
+                    .id("quota-provider-list")
+                    .flex_1()
+                    .min_h_0()
+                    .gap_3()
+                    .overflow_y_scroll()
+                    .child(content),
+            )
     }
 }
 
@@ -711,6 +1021,81 @@ mod tests {
         fn monotonic(&self) -> u64 {
             0
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[gpui::test]
+    fn fixture_preview_is_isolated_and_draws_all_modes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            init(cx);
+            let service = cx.new(|cx| {
+                QuotaService::new(
+                    Ports {
+                        source: Rc::new(InertPorts),
+                        store: Rc::new(InertPorts),
+                        clock: Rc::new(InertPorts),
+                    },
+                    cx,
+                )
+            });
+            cx.set_global(GlobalQuota(service));
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| QuotaPanel::new(cx));
+        let before = panel.read_with(cx, |_, cx| {
+            KeyValueStore::global(cx)
+                .scoped("crew_quota")
+                .read("panel_preferences")
+                .expect("read preferences")
+        });
+        for states in [false, true] {
+            for compact in [false, true] {
+                for used in [false, true] {
+                    panel.update_in(cx, |panel, window, cx| {
+                        panel.set_active(false, window, cx);
+                        let mut preview =
+                            preview::FixturePreview::new(chrono::Utc::now().timestamp(), states);
+                        preview.preferences.compact = compact;
+                        preview.preferences.used = used;
+                        panel.preview = Some(preview);
+                        panel.set_active(true, window, cx);
+                        panel.refresh(cx);
+                        panel.change_preference(true, cx);
+                        panel.change_preference(true, cx);
+                        panel.change_preference(false, cx);
+                        panel.change_preference(false, cx);
+                        assert!(panel.demand.is_none());
+                        assert!(panel.refresh_task.is_none());
+                        assert_eq!(panel.display_preferences(cx).compact, compact);
+                        assert_eq!(panel.display_preferences(cx).used, used);
+                    });
+                    cx.draw(
+                        gpui::Point::default(),
+                        gpui::size(
+                            gpui::AvailableSpace::Definite(px(360.)),
+                            gpui::AvailableSpace::Definite(px(1000.)),
+                        ),
+                        |_, _| panel.clone().into_any_element(),
+                    );
+                }
+            }
+        }
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert!(panel.demand.is_none());
+            assert_eq!(
+                KeyValueStore::global(cx)
+                    .scoped("crew_quota")
+                    .read("panel_preferences")
+                    .expect("read preferences"),
+                before
+            );
+        });
+        panel.update_in(cx, |panel, window, cx| panel.set_active(false, window, cx));
     }
 
     #[gpui::test]
@@ -935,6 +1320,22 @@ mod tests {
         assert_eq!(
             provider_rows(&snapshot).first().map(|row| row.provider),
             Some(ProviderId::Codex)
+        );
+    }
+
+    #[test]
+    fn unknown_credit_count_is_not_zero() {
+        let balance = Amount {
+            value: 120.,
+            unit: Unit::Credits { denomination: None },
+        };
+        assert_eq!(
+            credit_text(&balance, None),
+            "120 credits · Reset credits unknown"
+        );
+        assert_eq!(
+            credit_text(&balance, Some(3)),
+            "120 credits · 3 reset credits"
         );
     }
 
