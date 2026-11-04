@@ -503,6 +503,7 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
         Availability::NotInstalled => "Not installed",
         Availability::NotLoggedIn => "Not logged in",
         Availability::Unavailable(_) => "Unavailable",
+        Availability::Error(ErrorCode::CleanupFailed) => "Error — session pending cleanup",
         Availability::Error(_) if account.windows.is_empty() => "Error — quota unavailable",
         Availability::Error(_) => "Error — showing last known data",
         Availability::Ready => "",
@@ -519,7 +520,14 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
     }
     if account.windows.values().any(|window| {
         matches!(
-            window.freshness(now, Duration::from_secs(120)),
+            window.freshness(
+                now,
+                Duration::from_secs(if account.scope.provider == ProviderId::Antigravity {
+                    900
+                } else {
+                    120
+                })
+            ),
             Freshness::Stale { .. }
         )
     }) {
@@ -735,7 +743,10 @@ impl Render for QuotaPanel {
                 }
                 if row.accounts.is_empty() {
                     statuses.insert(
-                        if matches!(provider_id, ProviderId::Codex | ProviderId::Claude) {
+                        if matches!(
+                            provider_id,
+                            ProviderId::Codex | ProviderId::Claude | ProviderId::Antigravity
+                        ) {
                             "Unknown".into()
                         } else {
                             "Unsupported · source pending".into()
@@ -770,7 +781,10 @@ impl Render for QuotaPanel {
             }
             if row.accounts.is_empty() {
                 provider = provider.child(badge(
-                    if matches!(row.provider, ProviderId::Codex | ProviderId::Claude) {
+                    if matches!(
+                        row.provider,
+                        ProviderId::Codex | ProviderId::Claude | ProviderId::Antigravity
+                    ) {
                         "Unknown"
                     } else {
                         "Unsupported · source pending"
@@ -822,7 +836,10 @@ impl Render for QuotaPanel {
                     } else {
                         Color::Muted
                     };
-                    let label = if state.starts_with("Error") && !account.windows.is_empty() {
+                    let label = if state.starts_with("Error")
+                        && !state.contains("pending cleanup")
+                        && !account.windows.is_empty()
+                    {
                         "Error · cached data"
                     } else {
                         state
@@ -876,7 +893,13 @@ impl Render for QuotaPanel {
                         )
                     });
                     let reset = window.reset_at.as_ref().and_then(|sample| sample.value);
-                    let title = format!("{} · {}", window.key.bucket.bucket, window.key.role);
+                    let bucket = window
+                        .key
+                        .bucket
+                        .bucket
+                        .strip_prefix("agy-v1/")
+                        .unwrap_or(&window.key.bucket.bucket);
+                    let title = format!("{} · {}", bucket, window.key.role);
                     let mut section = v_flex().gap_1().pl_6().child(
                         h_flex()
                             .justify_between()

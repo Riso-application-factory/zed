@@ -201,7 +201,7 @@ impl Scheduler {
             .filter(|state| {
                 !state.in_flight
                     && !state.suspended
-                    && (state.provider == ProviderId::Codex
+                    && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                         || (state.provider == ProviderId::Claude && state.demand_until > now))
             })
             .map(|state| {
@@ -226,7 +226,7 @@ impl Scheduler {
         for state in self.scopes.values_mut() {
             if !state.in_flight
                 && !state.suspended
-                && (state.provider == ProviderId::Codex
+                && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                     || (state.provider == ProviderId::Claude && state.demand_until > now))
                 && Self::next_for(state, now, monotonic) <= now
             {
@@ -241,7 +241,7 @@ impl Scheduler {
             .filter(|(_, state)| {
                 !state.in_flight
                     && !state.suspended
-                    && (state.provider == ProviderId::Codex
+                    && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                         || (state.provider == ProviderId::Claude && state.demand_until > now))
                     && Self::next_for(state, now, monotonic) <= now
                     && state.last_monotonic.is_none_or(|attempt| {

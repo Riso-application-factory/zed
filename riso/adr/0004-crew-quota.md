@@ -1,6 +1,6 @@
 +++
 id = "ADR-0004"
-title = "Crew quota service, Codex and Claude sources and dock panel"
+title = "Crew quota service, Codex, Claude and Antigravity sources and dock panel"
 status = "proposed"
 review = "human"
 intent = "Provide an app-wide attributed, freshness-aware quota API with installed Codex reads and Claude passive updates plus demand-driven inference probes."
@@ -8,8 +8,8 @@ owns = ["crates/crew_quota/**"]
 patches = ["Cargo.toml", "Cargo.lock", "crates/zed/Cargo.toml"]
 hooks = ["crew-quota-init"]
 watch = ["crates/acp_thread/src/acp_thread.rs", "crates/acp_thread/src/connection.rs", "crates/agent_servers/src/acp/v1.rs", "crates/agent_servers/src/acp/v2.rs", "crates/agent_servers/src/acp/debug_log.rs", "crates/http_client/src/http_client.rs", "crates/zed/src/main.rs", "crates/project/src/agent_server_store.rs", "crates/project/src/agent_registry_store.rs", "crates/project/src/environment.rs", "crates/project/src/project_settings.rs", "crates/node_runtime/src/node_runtime.rs", "crates/db/src/kvp.rs", "crates/fs/src/fs.rs", "crates/gpui/src/app.rs", "crates/gpui/src/app/context.rs", "crates/workspace/src/workspace.rs", "crates/workspace/src/dock.rs", "crates/ui/src/components/button/button_like.rs", "crates/ui/src/components/button/icon_button.rs", "crates/gpui/src/elements/div.rs"]
-relies_on = ["AcpThread exposes local project, agent connection and session ID; defer avoids entity reentry", "Both concrete ACP connections expose subscribe_debug_messages with timestamp-free backlog and a live receiver", "Default registry claude-acp without env, args or config overrides shares the ProjectEnvironment shell-OAuth login with the probe; overridden or custom connections remain isolated", "Scope keys hash only env key names and nonsecret configuration flags, never secret values; residual risk: project-local environment or login changes may differ from the hidden project without an explicit upstream auth identity", "Claude ACP rateLimit utilization is a consumed fraction and resetsAt is Unix seconds; unifiedWindows takes precedence over representative fields", "Claude tiny Haiku messages probe uses fixed OAuth headers and max_tokens 1; stored credentials are presence-detected only and unsupported", "ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available", "Workspace observe_new receives its creation window before asynchronous dock restoration completes", "Workspace add_panel restores width through the stable panel_key", "Dock panel activation priorities must be unique; Crew quota reserves 100", "Dock relocation observes SettingsStore changes; Crew defers a SettingsStore pulse after changing its own KVP preference"]
-contracts = ["cargo test -p crew_quota upstream::claude", "cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
+relies_on = ["Antigravity binary resolution requires Installed current registry version and exactly one v_<sanitized-version>_ directory containing the target command; it never calls get_command", "Antigravity environment parity follows LocalRegistryArchiveAgent get_command: ProjectEnvironment default, registry platform target env, then settings env, with target args and darwin/linux platform keys", "Antigravity ACP 1.4.5 usage is a local Markdown command; session/close is verified despite missing capability advertisement; only advertised session/delete is sent", "Antigravity cleanup uses an exact-ID durable journal, directory identity and no-follow directory-relative unlinks only after owned Unix group exit; unknown writers or ownership suspend polling", "AcpThread exposes local project, agent connection and session ID; defer avoids entity reentry", "Both concrete ACP connections expose subscribe_debug_messages with timestamp-free backlog and a live receiver", "Default registry claude-acp without env, args or config overrides shares the ProjectEnvironment shell-OAuth login with the probe; overridden or custom connections remain isolated", "Scope keys hash only env key names and nonsecret configuration flags, never secret values; residual risk: project-local environment or login changes may differ from the hidden project without an explicit upstream auth identity", "Claude ACP rateLimit utilization is a consumed fraction and resetsAt is Unix seconds; unifiedWindows takes precedence over representative fields", "Claude tiny Haiku messages probe uses fixed OAuth headers and max_tokens 1; stored credentials are presence-detected only and unsupported", "ExternalAgentServer::install_status discovers installations without installing; get_command is intentionally never called", "Public registry and AllAgentServersSettings expose the configured npx package and environment overlays", "Registry npx installations live under external_agents_dir/registry/npx/<sanitized registry ID>/node_modules", "node_runtime::read_package_executable reads package.json bin without installation and selects its single entry or unscoped package name", "ProjectEnvironment::default_environment supplies the same base environment as the agent launcher", "NodeRuntime::binary_path is called only after Installed status; shared Node runtime bootstrap is accepted if missing, while agent installation and updates remain forbidden", "codex-acp >=2.5.0 and <3.0.0 stable versions support cli app-server passthrough", "Codex NDJSON initialize, initialized and account/rateLimits/read require no thread or turn", "Unix process groups own the Codex launcher tree; Windows and other unsupported platforms reject before spawn until atomic process-tree ownership exists", "KeyValueStore::global provides release-channel scoped storage", "Fs::watch supplies auth.json and config.toml change notifications without reading credential contents", "The quota init hook runs immediately after the model catalog init hook with AppState available", "Workspace observe_new receives its creation window before asynchronous dock restoration completes", "Workspace add_panel restores width through the stable panel_key", "Dock panel activation priorities must be unique; Crew quota reserves 100", "Dock relocation observes SettingsStore changes; Crew defers a SettingsStore pulse after changing its own KVP preference"]
+contracts = ["cargo test -p crew_quota upstream::antigravity", "cargo test -p crew_quota upstream::claude", "cargo test -p crew_quota", "ITERATIONS=20 cargo test -p crew_quota", "./script/clippy -p crew_quota", "cargo fmt --all -- --check", "cargo check -p zed"]
 obsolete_if = "Upstream supplies an app-wide attributed quota service with equivalent freshness, persistence, scheduling and Codex account read contracts."
 superseded_by = ""
 +++
@@ -55,7 +55,7 @@ Unknown JSON-RPC errors are safe codes, not automatically authentication failure
 
 Schedule at two minutes with demand and fifteen minutes idle, with provider
 floors, account single flight, two external operations, backoff and reset alarms.
-Grok remains passive only, with no probes or probe budget. Antigravity source implementation remains deferred. A consumer asking for broader coverage than
+Grok remains passive only, with no probes or probe budget. Antigravity uses a dedicated bounded ACP connection, one session and one advertised `/usage` prompt per attempt, with a fifteen-minute attempt floor and protocol/cleanup latches. A consumer asking for broader coverage than
 the producer proves receives Partial, never a fabricated Fresh account.
 
 Persist bounded schema-v1 sanitized records and attempt guards in `crew_quota`
@@ -76,6 +76,27 @@ attempt guards but withhold numeric cache until a live read; decoder hydration
 always marks persisted observations stale. Auth/config-file notifications invalidate the runtime generation, cancel shared
 reads and remove numbers from the previous login. No credential identity or raw payload
 is serialized, logged or returned to consumers.
+
+Antigravity supports the inspected ACP 1.4.5 Markdown grammar, including group
+descriptions, rounded percentages, integer units, Disabled rows and session tier.
+Unknown structural rows and activity requests fail closed. Reads require both
+headings, end_turn and a recognized numeric bucket; no quota freshness is inferred
+from session context usage. The adapter retains only recognized group/window
+labels and numeric values. Reset instants use UTC minute precision; malformed
+reset text leaves the instant unknown. Raw transcripts are never persisted.
+
+The adapter owns its minimal NDJSON transport rather than using CustomAgentServer:
+the shared connection shutdown API cannot prove descendant exit before SQLite
+unlinking. It reuses quota's Unix process ownership primitive without changing
+shared ACP lifecycle APIs. Normal configured MCP startup is accepted, and neither
+GEMINI_HOME nor settings are rewritten. Startup can refresh the producer's own
+credentials internally; no verified-zero-inference claim is made.
+
+A private durable journal holds only the exact owned session, process group,
+directory identity and prelaunch filenames. Recovery checks group absence before
+unlinking; a live/reused group or an unknown session remains pending for Human
+intervention. Cancellation leaves bounded cleanup running, serialized across
+Antigravity reads. Protocol and cleanup failures suspend automatic polling.
 
 ## Consequences
 
@@ -103,7 +124,7 @@ sources remain explicit and cached data retains stale/error labels. A workspace
 created without a window attaches on its first window render through a deferred
 action renderer; the usual creation-window path remains synchronous.
 
-Later commits add Claude, Antigravity, the native xAI passive HTTP decorator and
+Later commits add the native xAI passive HTTP decorator and
 the separate provider-summary status bar. Display defaults are Detailed/Remaining for the panel and
 Compact/Remaining for the status bar, with used-fraction colors at 60/80.
 

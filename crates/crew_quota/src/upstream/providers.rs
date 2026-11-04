@@ -284,14 +284,14 @@ pub fn decode(
     Ok(observation)
 }
 
-struct OwnedChild {
-    child: Child,
+pub(super) struct OwnedChild {
+    pub(super) child: Child,
     #[cfg(unix)]
-    group: Option<i32>,
+    pub(super) group: Option<i32>,
 }
 
 impl OwnedChild {
-    fn terminate(&mut self) -> Result<(), RefreshError> {
+    pub(super) fn terminate(&mut self) -> Result<(), RefreshError> {
         #[cfg(unix)]
         if let Some(group) = self.group {
             // This group belongs exclusively to this read, including descendants whose launcher already exited.
@@ -329,7 +329,7 @@ impl Drop for OwnedChild {
     }
 }
 
-fn spawn_owned(mut command: std::process::Command) -> Result<OwnedChild, RefreshError> {
+pub(super) fn spawn_owned(mut command: std::process::Command) -> Result<OwnedChild, RefreshError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -408,7 +408,7 @@ async fn bounded_response<R: futures::AsyncRead + Unpin>(
     }
 }
 
-async fn deadline<T>(
+pub(super) async fn deadline<T>(
     executor: &BackgroundExecutor,
     duration: Duration,
     future: impl std::future::Future<Output = Result<T, RefreshError>>,

@@ -1,3 +1,4 @@
+mod antigravity;
 mod claude;
 mod panel;
 mod providers;
@@ -135,6 +136,8 @@ pub struct QuotaService {
     pending_persistence: BTreeMap<String, Task<()>>,
     _inventory: Option<Task<()>>,
     claude: claude::ClaudeState,
+    antigravity_inventory: Option<Task<()>>,
+    antigravity_identity: Option<(Vec<String>, Availability)>,
     _auth_watcher: Option<Task<()>>,
     auth_path: Option<std::path::PathBuf>,
     _project: Option<Entity<Project>>,
@@ -215,6 +218,8 @@ impl QuotaService {
             pending_persistence: BTreeMap::new(),
             _inventory: None,
             claude: Default::default(),
+            antigravity_inventory: None,
+            antigravity_identity: None,
             _auth_watcher: None,
             auth_path: None,
             _project: None,
@@ -302,7 +307,7 @@ impl QuotaService {
             let Some(state) = self.scheduler.scopes.get(&scope) else {
                 return Task::ready(Err(RefreshError::Unknown));
             };
-            if state.provider != ProviderId::Codex
+            if !matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                 && (state.provider != ProviderId::Claude || !request.allow_inference)
             {
                 return Task::ready(Err(RefreshError::NotRefreshable));
@@ -759,12 +764,17 @@ impl QuotaService {
                     }
                     RefreshState::Suspended(ErrorCode::Unknown)
                 }
-                Err(RefreshError::Failed(ErrorCode::CleanupFailed)) => {
-                    account.availability = Availability::Error(ErrorCode::CleanupFailed);
+                Err(RefreshError::Failed(
+                    code
+                    @ (ErrorCode::CleanupFailed | ErrorCode::Protocol | ErrorCode::InvalidData),
+                )) if account.scope.provider == ProviderId::Antigravity
+                    || *code == ErrorCode::CleanupFailed =>
+                {
+                    account.availability = Availability::Error(*code);
                     if let Some(schedule) = self.scheduler.scopes.get_mut(scope) {
                         schedule.suspended = true;
                     }
-                    RefreshState::Suspended(ErrorCode::CleanupFailed)
+                    RefreshState::Suspended(*code)
                 }
                 Err(RefreshError::Failed(
                     code @ (ErrorCode::InferenceAccess | ErrorCode::StoredAuthUnsupported),
@@ -841,6 +851,15 @@ impl QuotaSource for CodexSource {
         start_sequence: u64,
         cx: &mut App,
     ) -> Task<Result<Observation, RefreshError>> {
+        if scope == "antigravity-registry" {
+            return antigravity::refresh(
+                self.project.clone(),
+                scope,
+                generation,
+                start_sequence,
+                cx,
+            );
+        }
         if scope.starts_with("claude-") {
             return claude::refresh(self.project.clone(), scope, generation, start_sequence, cx);
         }
@@ -994,6 +1013,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     cx.set_global(GlobalQuota(service.clone()));
     panel::init(cx);
     claude::init(&service, &project, cx);
+    antigravity::init(&service, &project, cx);
     service.update(cx, |service, _| service._project = Some(project.clone()));
     let subscription = cx.subscribe(&store, {
         let service = service.downgrade();
