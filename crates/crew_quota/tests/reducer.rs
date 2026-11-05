@@ -3,6 +3,8 @@ use std::time::Duration;
 
 fn scope() -> AccountScope {
     AccountScope {
+        category: crate::AccountCategory::ExternalAgent,
+        native_provider_id: None,
         id: "scope".into(),
         provider: ProviderId::Codex,
         runtime: "local".into(),
@@ -197,6 +199,8 @@ fn cache_round_trip_is_stale_and_future_schema_is_rejected() -> Result<(), Error
         decode_record(
             &encoded,
             &AccountScope {
+                category: crate::AccountCategory::ExternalAgent,
+                native_provider_id: None,
                 id: "other".into(),
                 ..scope()
             },
@@ -508,5 +512,86 @@ fn persisted_scheduling_bounds_allow_supported_guards_only() -> Result<(), Error
         .map_err(|_| ErrorCode::InvalidData)?;
         assert_eq!(decode_attempt(&record, &scope(), 100).is_ok(), accepted);
     }
+    Ok(())
+}
+
+#[test]
+fn account_category_is_part_of_selection() {
+    let mut native = scope();
+    native.category = AccountCategory::LlmProvider;
+    native.native_provider_id = Some("x_ai".into());
+    let external = Selector {
+        category: Some(AccountCategory::ExternalAgent),
+        ..Default::default()
+    };
+    assert!(external.matches(&scope()));
+    assert!(!external.matches(&native));
+    assert!(Selector::default().matches(&native));
+}
+
+#[test]
+fn legacy_native_grok_cache_withholds_numbers_and_preserves_attempt_guard() -> anyhow::Result<()> {
+    let mut core = QuotaCore::default();
+    let mut native = scope();
+    native.provider = ProviderId::Grok;
+    native.runtime = "native-xai".into();
+    core.inventory(native.clone(), 0, Availability::Unknown)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let mut account = core.snapshot.accounts[&native.id].clone();
+    account.last_success_at = Some(100);
+    account.source_version = Some("xai-headers-v1".into());
+    account.metadata.grok_response = Some(GrokResponse {
+        blocked: Some(GrokBlockReason::SpendingLimit),
+        status: 403,
+        observed_at: 100,
+        retry_at: None,
+    });
+    let record = StoredRecord {
+        schema_version: 1,
+        revision: 1,
+        account,
+        failures: 2,
+        retry_at: 120,
+    };
+    let encoded = encode_record(&record).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let decoded =
+        decode_record(&encoded, &native, 110).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    assert!(decoded.account.metadata.grok_response.is_none());
+    assert!(decoded.account.source_version.is_none());
+    assert!(decoded.account.last_success_at.is_none());
+    assert_eq!(decoded.failures, 2);
+    assert_eq!(decoded.retry_at, 120);
+    Ok(())
+}
+
+#[test]
+fn native_inventory_requires_bounded_nonsecret_registry_id() {
+    for identifier in [None, Some("https://example.com"), Some("sk-secret")] {
+        let mut native = scope();
+        native.category = AccountCategory::LlmProvider;
+        native.native_provider_id = identifier.map(str::to_owned);
+        assert_eq!(
+            QuotaCore::default().inventory(native, 1, Availability::Unknown),
+            Err(ErrorCode::InvalidData)
+        );
+    }
+    let mut native = scope();
+    native.category = AccountCategory::LlmProvider;
+    native.native_provider_id = Some("a".repeat(129));
+    assert_eq!(
+        QuotaCore::default().inventory(native, 1, Availability::Unknown),
+        Err(ErrorCode::InvalidData)
+    );
+}
+
+#[test]
+fn legacy_external_scope_defaults_to_external_agent() -> anyhow::Result<()> {
+    let mut value = serde_json::to_value(scope())?;
+    let object = value.as_object_mut().expect("scope object");
+    object.remove("category");
+    object.remove("native_provider_id");
+    let decoded: AccountScope = serde_json::from_value(value)?;
+    assert_eq!(decoded.category, AccountCategory::ExternalAgent);
+    assert!(decoded.native_provider_id.is_none());
     Ok(())
 }

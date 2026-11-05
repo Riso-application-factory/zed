@@ -1230,6 +1230,35 @@ impl Render for QuotaPanel {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    fn blocked_native_panel_status_overrides_waiting() {
+        let preview = preview::FixturePreview::new(1000, false);
+        let mut account = preview.snapshot.accounts["codex"].clone();
+        account.scope.provider = ProviderId::Grok;
+        account.availability = Availability::Unknown;
+        account.windows.clear();
+        for (reason, panel) in [
+            (
+                GrokBlockReason::SpendingLimit,
+                "Out of credits / spending limit",
+            ),
+            (GrokBlockReason::RateLimited, "Rate limited · Retry in 20s"),
+            (GrokBlockReason::Forbidden, "Blocked · HTTP 4xx"),
+        ] {
+            account.metadata.grok_response = Some(GrokResponse {
+                blocked: Some(reason),
+                status: 403,
+                observed_at: 1000,
+                retry_at: Some(1030),
+            });
+            let status = account_status(&account, 1010);
+            assert!(status.contains(panel), "{status}");
+            assert!(status.contains("observed 10s ago"));
+            assert!(!status.contains("Waiting"));
+        }
+    }
+
     use super::*;
 
     pub(super) struct InertPorts;
@@ -1542,6 +1571,8 @@ mod tests {
     fn fake_account() -> AccountState {
         AccountState {
             scope: AccountScope {
+                category: crate::AccountCategory::ExternalAgent,
+                native_provider_id: None,
                 id: "fake".into(),
                 provider: ProviderId::Codex,
                 runtime: "local".into(),
@@ -1686,6 +1717,8 @@ mod tests {
         ] {
             core.inventory(
                 AccountScope {
+                    category: crate::AccountCategory::ExternalAgent,
+                    native_provider_id: None,
                     id: id.into(),
                     provider,
                     runtime: "local".into(),

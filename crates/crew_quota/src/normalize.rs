@@ -125,6 +125,11 @@ pub fn decode_record(
         return Err(ErrorCode::UnsupportedVersion);
     }
     if record.retry_at > now.saturating_add(MAX_BACKOFF_SECONDS as i64)
+        || scope
+            .native_provider_id
+            .as_ref()
+            .is_some_and(|id| !valid_text(id, 128))
+        || (scope.category == AccountCategory::LlmProvider && scope.native_provider_id.is_none())
         || record.account.scope != *scope
         || record.account.windows.len() > MAX_WINDOWS
         || !valid_text(&scope.id, 512)
@@ -201,6 +206,16 @@ pub fn decode_record(
         plan.source = SourceKind::Persisted;
     }
     record.account.refresh = RefreshState::Idle;
+    if record.account.scope.provider == ProviderId::Grok
+        && record.account.scope.runtime == "native-xai"
+        && record.account.scope.category == AccountCategory::ExternalAgent
+    {
+        record.account.windows.clear();
+        record.account.metadata = AccountMetadata::default();
+        record.account.source_version = None;
+        record.account.last_success_at = None;
+        record.account.complete = false;
+    }
     Ok(record)
 }
 

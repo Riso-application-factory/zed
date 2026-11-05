@@ -22,8 +22,19 @@ pub struct InstallationKey {
     pub config_generation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AccountCategory {
+    #[default]
+    ExternalAgent,
+    LlmProvider,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AccountScope {
+    #[serde(default)]
+    pub category: AccountCategory,
+    #[serde(default)]
+    pub native_provider_id: Option<String>,
     pub id: String,
     pub provider: ProviderId,
     pub runtime: String,
@@ -367,6 +378,7 @@ pub struct QuotaSnapshot {
 
 #[derive(Clone, Debug, Default)]
 pub struct Selector {
+    pub category: Option<AccountCategory>,
     pub scopes: Vec<String>,
     pub provider: Option<ProviderId>,
     pub windows: Vec<WindowKey>,
@@ -375,7 +387,9 @@ pub struct Selector {
 
 impl Selector {
     pub fn matches(&self, scope: &AccountScope) -> bool {
-        (self.scopes.is_empty() || self.scopes.contains(&scope.id))
+        self.category
+            .is_none_or(|category| category == scope.category)
+            && (self.scopes.is_empty() || self.scopes.contains(&scope.id))
             && self
                 .provider
                 .is_none_or(|provider| provider == scope.provider)

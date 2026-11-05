@@ -951,6 +951,8 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
             if this
                 .update(cx, |service, cx| {
                     let scope = AccountScope {
+                        category: crate::AccountCategory::ExternalAgent,
+                        native_provider_id: None,
                         id: SCOPE.into(),
                         provider: ProviderId::Antigravity,
                         runtime: "local".into(),

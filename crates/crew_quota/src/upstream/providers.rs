@@ -639,6 +639,8 @@ mod tests {
         let mut core = crate::QuotaCore::default();
         core.inventory(
             crate::AccountScope {
+                category: crate::AccountCategory::ExternalAgent,
+                native_provider_id: None,
                 id: "scope".into(),
                 provider: crate::ProviderId::Codex,
                 runtime: "local".into(),

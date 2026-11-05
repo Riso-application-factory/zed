@@ -255,6 +255,8 @@ pub(super) fn init(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                             .core
                             .inventory(
                                 AccountScope {
+                                    category: crate::AccountCategory::ExternalAgent,
+                                    native_provider_id: None,
                                     id: scope.clone(),
                                     provider: ProviderId::Claude,
                                     runtime: "local".into(),
@@ -439,6 +441,8 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                         .get(SHARED_SCOPE)
                         .map_or(1, |account| account.generation.saturating_add(1));
                     let scope = AccountScope {
+                        category: crate::AccountCategory::ExternalAgent,
+                        native_provider_id: None,
                         id: SHARED_SCOPE.into(),
                         provider: ProviderId::Claude,
                         runtime: "local".into(),
@@ -733,6 +737,8 @@ mod tests {
         let mut core = QuotaCore::default();
         core.inventory(
             AccountScope {
+                category: crate::AccountCategory::ExternalAgent,
+                native_provider_id: None,
                 id: "scope".into(),
                 provider: ProviderId::Claude,
                 runtime: "local".into(),

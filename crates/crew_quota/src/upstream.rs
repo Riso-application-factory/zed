@@ -1306,6 +1306,8 @@ fn sync_inventory(
             }
         };
         let scope = AccountScope {
+            category: crate::AccountCategory::ExternalAgent,
+            native_provider_id: None,
             id: scope_id.clone(),
             provider: ProviderId::Codex,
             runtime: "local".into(),
@@ -1522,6 +1524,8 @@ mod tests {
                 .core
                 .inventory(
                     AccountScope {
+                        category: crate::AccountCategory::ExternalAgent,
+                        native_provider_id: None,
                         id: scope.into(),
                         provider: ProviderId::Claude,
                         runtime: "local".into(),
@@ -1702,6 +1706,8 @@ mod tests {
                     .core
                     .inventory(
                         AccountScope {
+                            category: crate::AccountCategory::ExternalAgent,
+                            native_provider_id: None,
                             id: scope.clone(),
                             provider: ProviderId::Claude,
                             runtime: "local".into(),
@@ -1916,6 +1922,8 @@ mod tests {
                     .core
                     .inventory(
                         AccountScope {
+                            category: crate::AccountCategory::ExternalAgent,
+                            native_provider_id: None,
                             id: "scope".into(),
                             provider: ProviderId::Codex,
                             runtime: "local".into(),
@@ -2067,6 +2075,8 @@ mod tests {
                     .core
                     .inventory(
                         AccountScope {
+                            category: crate::AccountCategory::ExternalAgent,
+                            native_provider_id: None,
                             id: id.into(),
                             provider: ProviderId::Claude,
                             runtime: "local".into(),
@@ -2358,6 +2368,8 @@ mod tests {
                 .core
                 .inventory(
                     AccountScope {
+                        category: crate::AccountCategory::ExternalAgent,
+                        native_provider_id: None,
                         id: "claude-test".into(),
                         provider: ProviderId::Claude,
                         runtime: "local".into(),

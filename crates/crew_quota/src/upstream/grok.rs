@@ -363,6 +363,8 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
             .core
             .inventory(
                 AccountScope {
+                    category: crate::AccountCategory::LlmProvider,
+                    native_provider_id: Some("x_ai".into()),
                     id: scope.clone(),
                     provider: ProviderId::Grok,
                     runtime: "native-xai".into(),
@@ -587,6 +589,8 @@ mod tests {
             let mut core = QuotaCore::default();
             core.inventory(
                 AccountScope {
+                    category: crate::AccountCategory::ExternalAgent,
+                    native_provider_id: None,
                     id: "test".into(),
                     provider: ProviderId::Grok,
                     runtime: "native-xai".into(),
@@ -665,10 +669,7 @@ mod tests {
                 assert!(!stored.contains("never retain this"));
                 let restored =
                     decode_record(&stored, &account.scope, now + 60).expect("restore signal");
-                assert_eq!(
-                    restored.account.metadata.grok_response,
-                    account.metadata.grok_response
-                );
+                assert!(restored.account.metadata.grok_response.is_none());
                 let panel = super::super::panel::account_status(account, now);
                 if expected == Some(GrokBlockReason::SpendingLimit) {
                     assert!(panel.contains("Out of credits"));
@@ -783,8 +784,8 @@ mod tests {
     }
 
     #[test]
-    fn fake_streaming_startup_coalesces_and_restart_restores_unverified_age() -> anyhow::Result<()>
-    {
+    fn fake_streaming_startup_coalesces_and_restart_invalidates_legacy_native_cache()
+    -> anyhow::Result<()> {
         smol::block_on(async {
             let inner = http_client::FakeHttpClient::create(|_| async {
                 Ok(Response::builder()
@@ -827,6 +828,8 @@ mod tests {
             let observation = pending.remove("test").expect("latest").quota;
             let now = observation.observed_at;
             let scope = AccountScope {
+                category: crate::AccountCategory::ExternalAgent,
+                native_provider_id: None,
                 id: "test".into(),
                 provider: ProviderId::Grok,
                 runtime: "native-xai".into(),
@@ -845,14 +848,8 @@ mod tests {
             })
             .expect("store");
             let restored = decode_record(&encoded, &scope, now + 60).expect("restart");
-            let window = restored.account.windows.values().next().expect("window");
-            let sample = window.remaining.as_ref().expect("sample");
-            assert_eq!(sample.source, SourceKind::Persisted);
-            assert_eq!(sample.observed_at, now);
-            assert!(matches!(
-                window.freshness(now + 60, Duration::from_secs(120)),
-                Freshness::Stale { .. }
-            ));
+            assert!(restored.account.windows.is_empty());
+            assert!(restored.account.last_success_at.is_none());
             Ok(())
         })
     }
@@ -985,6 +982,8 @@ mod tests {
         let mut core = QuotaCore::default();
         core.inventory(
             AccountScope {
+                category: crate::AccountCategory::ExternalAgent,
+                native_provider_id: None,
                 id: "test".into(),
                 provider: ProviderId::Grok,
                 runtime: "native-xai".into(),

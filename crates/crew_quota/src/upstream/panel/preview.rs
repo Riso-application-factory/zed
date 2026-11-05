@@ -191,6 +191,8 @@ fn sample<T>(value: T, source: SourceKind, observed_at: Timestamp) -> Measuremen
 fn account(id: &str, provider: ProviderId, plan: &str, now: Timestamp) -> AccountState {
     AccountState {
         scope: AccountScope {
+            category: crate::AccountCategory::ExternalAgent,
+            native_provider_id: None,
             id: id.into(),
             provider,
             runtime: "sanitized-fixture".into(),

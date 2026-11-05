@@ -13,7 +13,13 @@ impl QuotaCore {
         generation: u64,
         availability: Availability,
     ) -> Result<(), ErrorCode> {
-        if !valid_text(&scope.id, 512)
+        if scope
+            .native_provider_id
+            .as_ref()
+            .is_some_and(|id| !valid_text(id, 128))
+            || (scope.category == AccountCategory::LlmProvider
+                && scope.native_provider_id.is_none())
+            || !valid_text(&scope.id, 512)
             || !valid_text(&scope.runtime, 512)
             || (self.snapshot.accounts.len() >= MAX_SCOPES
                 && !self.snapshot.accounts.contains_key(&scope.id))
