@@ -67,9 +67,22 @@ fn shares_host(endpoint: &str, host: &str) -> bool {
     })
 }
 
+#[derive(Default)]
+struct CredentialLoads(BTreeMap<String, CredentialLoad>);
+impl Global for CredentialLoads {}
+
+#[derive(Default)]
+struct CredentialLoad {
+    pending: bool,
+    last_state: Option<&'static str>,
+}
+
 // These implementations only call ApiKeyState::load_if_needed. Anthropic,
 // OpenRouter and Vercel also fetch models, so must remain observation-only.
 pub(super) fn load_credentials(cx: &mut App) {
+    if !cx.has_global::<CredentialLoads>() {
+        cx.set_global(CredentialLoads::default());
+    }
     let providers = LanguageModelRegistry::read_global(cx).providers();
     for provider in providers {
         let id = provider.id().0.to_string();
@@ -78,14 +91,34 @@ pub(super) fn load_credentials(cx: &mut App) {
         {
             continue;
         }
+        let load = cx
+            .global_mut::<CredentialLoads>()
+            .0
+            .entry(id.clone())
+            .or_default();
+        if load.pending {
+            continue;
+        }
+        load.pending = true;
         let task = provider.authenticate(cx);
-        cx.spawn(async move |_| {
+        cx.spawn(async move |cx| {
             let state = if task.await.is_ok() {
                 "Completed"
             } else {
                 "Unavailable"
             };
-            log::info!("crew_quota: native_credentials provider={id} state={state}");
+            cx.update(|cx| {
+                let load = cx
+                    .global_mut::<CredentialLoads>()
+                    .0
+                    .entry(id.clone())
+                    .or_default();
+                load.pending = false;
+                if load.last_state != Some(state) {
+                    log::info!("crew_quota: native_credentials provider={id} state={state}");
+                    load.last_state = Some(state);
+                }
+            });
         })
         .detach();
     }

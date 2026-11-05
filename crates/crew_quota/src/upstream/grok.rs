@@ -19,6 +19,9 @@ struct Bridge {
 }
 impl Global for Bridge {}
 
+#[derive(Clone)]
+pub(super) struct AgentProbe;
+
 struct Observer {
     inner: Arc<dyn HttpClient>,
     target: Arc<Mutex<BTreeMap<String, Target>>>,
@@ -33,8 +36,17 @@ impl HttpClient for Observer {
     }
     fn send(
         &self,
-        request: Request<AsyncBody>,
+        mut request: Request<AsyncBody>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        if request.extensions_mut().remove::<AgentProbe>().is_some() {
+            return self.inner.send(request);
+        }
+        let provider = match request.uri().host() {
+            Some("api.x.ai") => "x_ai",
+            Some("api.anthropic.com") => "anthropic",
+            Some("api.openai.com") => "openai",
+            _ => "other",
+        };
         let host_category = match request.uri().host() {
             Some("api.x.ai") => "xai",
             Some("api.anthropic.com") => "anthropic",
@@ -48,13 +60,15 @@ impl HttpClient for Observer {
         }
         let endpoint = inference_endpoint(&request).map(str::to_owned);
         if endpoint.is_none() {
-            log::info!("crew_quota: agent=Grok source=Headers outcome=Unmatched path_kind=Other");
+            log::info!(
+                "crew_quota: native_capture provider={provider} outcome=Unmatched path_kind=Other"
+            );
             return self.inner.send(request);
         }
         let target = endpoint
             .as_ref()
             .and_then(|_| self.target.lock().ok()?.get(request.uri().host()?).cloned());
-        log::info!("crew_quota: agent=Grok source=Headers outcome=Eligible");
+        log::info!("crew_quota: native_capture provider={provider} outcome=Eligible");
         let target = match target {
             Some(target) if target.gate_reason.is_none() => Some(target),
             target => {
@@ -62,7 +76,9 @@ impl HttpClient for Observer {
                     .as_ref()
                     .and_then(|target| target.gate_reason.as_deref())
                     .unwrap_or("NoCaptureTarget");
-                log::info!("crew_quota: agent=Grok source=Headers outcome=Gated reason={reason}");
+                log::info!(
+                    "crew_quota: native_capture provider={provider} outcome=Gated reason={reason}"
+                );
                 None
             }
         };
@@ -72,14 +88,16 @@ impl HttpClient for Observer {
         Box::pin(async move {
             let mut response = future.await.inspect_err(|_| {
                 if endpoint.is_some() {
-                    log::info!("crew_quota: agent=Grok source=Headers outcome=TransportError");
+                    log::info!(
+                        "crew_quota: native_capture provider={provider} outcome=TransportError"
+                    );
                 }
             })?;
             if let (Some(endpoint), Some(target)) = (endpoint, target) {
                 let now = chrono::Utc::now().timestamp();
                 if response.status().is_redirection() {
                     log::info!(
-                        "crew_quota: agent=Grok source=Headers outcome=Skipped reason=Redirect"
+                        "crew_quota: native_capture provider={provider} outcome=Skipped reason=Redirect"
                     );
                     return Ok(response);
                 }
@@ -89,7 +107,7 @@ impl HttpClient for Observer {
                 let blocked = classify_response(&mut response, &host).await;
                 if let Some(reason) = blocked {
                     log::info!(
-                        "crew_quota: agent=Grok source=Headers outcome=Blocked reason={reason:?}"
+                        "crew_quota: native_capture provider={provider} outcome=Blocked reason={reason:?}"
                     );
                 }
                 let observation = Observation {
@@ -119,10 +137,10 @@ impl HttpClient for Observer {
                     retry_at: retry_after(response.headers(), now),
                 }) {
                     Ok(()) => {
-                        log::info!("crew_quota: agent=Grok source=Headers outcome=Queued")
+                        log::info!("crew_quota: native_capture provider={provider} outcome=Queued")
                     }
                     Err(_) => {
-                        log::info!("crew_quota: agent=Grok source=Headers outcome=Dropped")
+                        log::info!("crew_quota: native_capture provider={provider} outcome=Dropped")
                     }
                 }
             }
@@ -225,6 +243,16 @@ async fn classify_response(
     };
     *response.body_mut() = AsyncBody::from_reader(futures::io::Cursor::new(prefix).chain(body));
     reason
+}
+
+fn capture_provider(observation: &Observation) -> &'static str {
+    if observation.source_version.starts_with("api.anthropic.com") {
+        "anthropic"
+    } else if observation.source_version.starts_with("api.openai.com") {
+        "openai"
+    } else {
+        "x_ai"
+    }
 }
 
 fn trusted_host(request: &Request<AsyncBody>) -> Option<&str> {
@@ -488,10 +516,11 @@ async fn buffer_until_ready(
                 let Ok(headers) = result else {
                     return Err(ErrorCode::Persistence);
                 };
+                let provider = capture_provider(&headers.quota);
                 if pending.len() < MAX_SCOPES || pending.contains_key(&headers.quota.scope) {
                     pending.insert(headers.quota.scope.clone(), headers);
                 }
-                log::info!("crew_quota: agent=Grok source=Headers outcome=Buffered");
+                log::info!("crew_quota: native_capture provider={provider} outcome=Buffered");
             }
         }
     }
@@ -570,9 +599,12 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
                         {
                             observation.sequence = account.sequence.saturating_add(1);
                         }
+                        let provider = capture_provider(&observation);
                         let scope = observation.scope.clone();
                         let generation = observation.generation;
-                        log::info!("crew_quota: agent=Grok source=Headers outcome=Received");
+                        log::info!(
+                            "crew_quota: native_capture provider={provider} outcome=Received"
+                        );
                         if validate_observation(&observation, service.ports.clock.now()).is_err() {
                             log::warn!("crew_quota: native_observation_invalid");
                             return;
@@ -606,6 +638,47 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_probe_bypasses_capture_but_native_anthropic_is_observed() -> anyhow::Result<()> {
+        smol::block_on(async {
+            let (sender, receiver) = async_channel::bounded(2);
+            let observer = Observer {
+                inner: http_client::FakeHttpClient::create(|request| async move {
+                    assert!(request.extensions().get::<AgentProbe>().is_none());
+                    Ok(Response::builder().status(200).body(AsyncBody::empty())?)
+                }),
+                target: Arc::new(Mutex::new(BTreeMap::from([(
+                    "api.anthropic.com".into(),
+                    Target {
+                        scope: "native/anthropic".into(),
+                        generation: 1,
+                        gate_reason: None,
+                    },
+                )]))),
+                sender,
+            };
+            // Hold the target lock: a probe must bypass even capture eligibility and its logs.
+            let response = {
+                let _target = observer.target.lock().expect("target lock");
+                observer.send(
+                    Request::post("https://api.anthropic.com/v1/messages")
+                        .extension(AgentProbe)
+                        .body(AsyncBody::empty())?,
+                )
+            };
+            response.await?;
+            assert!(receiver.try_recv().is_err());
+            observer
+                .send(
+                    Request::post("https://api.anthropic.com/v1/messages")
+                        .body(AsyncBody::empty())?,
+                )
+                .await?;
+            assert_eq!(receiver.try_recv()?.quota.scope, "native/anthropic");
+            Ok(())
+        })
+    }
+
     use super::*;
     use futures::{AsyncReadExt as _, StreamExt as _};
     use settings::Settings;

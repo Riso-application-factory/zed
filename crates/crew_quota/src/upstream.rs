@@ -1244,7 +1244,11 @@ fn sync_inventory(
             .map(|agent| agent.install_status(cx))
     });
     let Some(status) = status else {
-        log::info!("crew_quota: inventory agent=codex-acp installation=not_configured");
+        log::debug!("crew_quota: inventory agent=codex-acp installation=not_configured");
+        if service.codex_installation != Some("not_configured") {
+            log::info!("crew_quota: inventory agent=codex-acp installation=not_configured");
+            service.codex_installation = Some("not_configured");
+        }
         let scopes: Vec<_> = service
             .core
             .snapshot
@@ -1342,7 +1346,7 @@ fn sync_inventory(
                     }
                     Err(_) => Availability::Error(ErrorCode::Transport),
                 };
-                log::info!(
+                log::debug!(
                     "crew_quota: inventory agent=codex-acp installation={}",
                     installation_code(&availability)
                 );
@@ -1351,6 +1355,10 @@ fn sync_inventory(
                     this.finish_init(Ok(()));
                     return;
                 }
+                log::info!(
+                    "crew_quota: inventory agent=codex-acp installation={}",
+                    installation_code(&availability)
+                );
                 this.codex_installation = Some(installation);
                 if let Some(handle) = this.cancellations.remove(&scope_id) {
                     handle.abort();

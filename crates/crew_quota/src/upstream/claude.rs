@@ -421,7 +421,7 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
             };
             if this
                 .update(cx, |service, cx| {
-                    log::info!(
+                    log::debug!(
                         "crew_quota: inventory agent=claude-acp installation={}",
                         installation_code(&availability)
                     );
@@ -429,6 +429,10 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                     if service.claude.installation == Some(installation) {
                         return;
                     }
+                    log::info!(
+                        "crew_quota: inventory agent=claude-acp installation={}",
+                        installation_code(&availability)
+                    );
                     service.claude.installation = Some(installation);
                     if let Some(handle) = service.cancellations.remove(SHARED_SCOPE) {
                         handle.abort();
@@ -540,6 +544,7 @@ pub(super) async fn probe(
         .map_err(|_| RefreshError::Failed(ErrorCode::InvalidData))?;
     authorization.set_sensitive(true);
     let request = http_client::Request::builder().method("POST").uri("https://api.anthropic.com/v1/messages")
+        .extension(super::grok::AgentProbe)
         .follow_redirects(RedirectPolicy::NoFollow).timeout(Duration::from_secs(30))
         .header("authorization", authorization)
         .header("anthropic-version", "2023-06-01").header("anthropic-beta", "oauth-2025-04-20").header("content-type", "application/json")
@@ -767,6 +772,12 @@ mod tests {
     #[gpui::test]
     async fn probe_has_exact_request_and_normalizes_headers(_cx: &mut gpui::TestAppContext) {
         let client = http_client::FakeHttpClient::create(|request| async move {
+            assert!(
+                request
+                    .extensions()
+                    .get::<super::super::grok::AgentProbe>()
+                    .is_some()
+            );
             assert_eq!(request.uri(), "https://api.anthropic.com/v1/messages");
             assert_eq!(request.method(), "POST");
             assert!(request.headers()["authorization"].is_sensitive());

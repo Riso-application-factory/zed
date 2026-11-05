@@ -958,7 +958,7 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                         runtime: "local".into(),
                         identity_known: false,
                     };
-                    log::info!(
+                    log::debug!(
                         "crew_quota: inventory agent=antigravity installation={}",
                         installation_code(&availability)
                     );
@@ -966,6 +966,17 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                         == Some(&(identity.clone(), availability.clone()))
                     {
                         return;
+                    }
+                    if service
+                        .antigravity_identity
+                        .as_ref()
+                        .map(|(_, availability)| installation_code(availability))
+                        != Some(installation_code(&availability))
+                    {
+                        log::info!(
+                            "crew_quota: inventory agent=antigravity installation={}",
+                            installation_code(&availability)
+                        );
                     }
                     service.antigravity_identity = Some((identity, availability.clone()));
                     let generation = service
