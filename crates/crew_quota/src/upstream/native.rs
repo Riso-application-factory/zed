@@ -16,6 +16,9 @@ fn endpoint(id: &str, settings: &language_models::AllLanguageModelSettings) -> O
         "anthropic" => (&settings.anthropic.api_url, "https://api.anthropic.com"),
         "openai" => (&settings.openai.api_url, "https://api.openai.com/v1"),
         "x_ai_subscribed" => return Some("https://api.x.ai/v1".into()),
+        "lmstudio" => (&settings.lmstudio.api_url, ""),
+        "llama.cpp" => (&settings.llama_cpp.api_url, ""),
+        "ollama" => (&settings.ollama.api_url, ""),
         "deepseek" => (&settings.deepseek.api_url, ""),
         "google" => (&settings.google.api_url, ""),
         "mistral" => (&settings.mistral.api_url, ""),
@@ -383,8 +386,10 @@ mod tests {
             assert!(!collect(cx).iter().any(|provider| provider.id == "x_ai"));
             providers.first().expect("xai").authenticated.store(true, Ordering::SeqCst);
             cx.update_global::<SettingsStore, _>(|settings, cx| settings.set_user_settings(
-                r#"{"language_models":{"x_ai":{"api_url":"https://custom.example/v1"},"openai_compatible":{"custom":{"api_url":"https://api.openai.com/v1","available_models":[]}}}}"#, cx).expect("custom settings"));
+                r#"{"language_models":{"lmstudio":{"api_url":"https://api.anthropic.com"},"x_ai":{"api_url":"https://custom.example/v1"},"openai_compatible":{"custom":{"api_url":"https://api.openai.com/v1","available_models":[]}}}}"#, cx).expect("custom settings"));
             let inventory = collect(cx);
+            assert_eq!(inventory.iter().find(|provider| provider.id == "anthropic").expect("anthropic").info.kind, NativeProviderKind::Ambiguous);
+            assert_eq!(inventory.iter().find(|provider| provider.id == "lmstudio").expect("local").info.kind, NativeProviderKind::Local);
             assert_eq!(inventory.iter().find(|provider| provider.id == "x_ai").expect("xai").info.kind, NativeProviderKind::CustomEndpoint);
             assert_eq!(inventory.iter().find(|provider| provider.id == "openai").expect("openai").info.kind, NativeProviderKind::Ambiguous);
             assert_eq!(inventory.iter().find(|provider| provider.id == "custom").expect("custom").info.kind, NativeProviderKind::CustomEndpoint);

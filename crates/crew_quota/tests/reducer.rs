@@ -595,3 +595,13 @@ fn legacy_external_scope_defaults_to_external_agent() -> anyhow::Result<()> {
     assert!(decoded.native_provider_id.is_none());
     Ok(())
 }
+
+#[test]
+fn native_provider_freshness_is_never_longer_than_two_minutes() {
+    for active in [false, true] {
+        assert_eq!(
+            default_max_age(ProviderId::LlmProvider, active),
+            std::time::Duration::from_secs(120)
+        );
+    }
+}

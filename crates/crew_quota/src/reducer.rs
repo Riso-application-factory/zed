@@ -282,6 +282,7 @@ struct ObservationStamp {
 pub fn default_max_age(provider: ProviderId, active: bool) -> Duration {
     Duration::from_secs(match provider {
         ProviderId::Grok => 60,
+        ProviderId::LlmProvider => 120,
         ProviderId::Antigravity => 900,
         _ if active => 120,
         _ => 900,
