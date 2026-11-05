@@ -260,9 +260,10 @@ impl QuotaPanel {
             let result = task.await;
             this.update(cx, |this, cx| {
                 this.refresh_task = None;
-                this.refresh_error = result
-                    .err()
-                    .map(|error| format!("Refresh unavailable: {error:?}"));
+                if result.is_err() {
+                    log::debug!("crew_quota: refresh_service_closed");
+                }
+                this.refresh_error = None;
                 cx.notify();
             })
             .log_err();
@@ -407,6 +408,12 @@ impl Panel for QuotaPanel {
                     .await;
                 if this
                     .update(cx, |this, cx| {
+                        if let Some(service) = &this.service {
+                            let task = service.update(cx, |service, cx| {
+                                service.recheck_inventory("visible_tick", cx)
+                            });
+                            cx.spawn(async move |_, _| task.await).detach();
+                        }
                         if let Some(demand) = &this.demand {
                             demand.renew(chrono::Utc::now().timestamp(), Duration::from_secs(180));
                         }
@@ -845,7 +852,20 @@ impl Render for QuotaPanel {
             })
             .min();
         let mut content = v_flex().gap_3();
-        for (provider_index, row) in provider_rows(&snapshot).into_iter().enumerate() {
+        let rows = provider_rows(&snapshot);
+        if rows.is_empty() {
+            let inventoried = self
+                .service
+                .as_ref()
+                .is_some_and(|service| service.read(cx).hydrated)
+                && !snapshot.accounts.is_empty();
+            content = content.child(Label::new(if inventoried {
+                "No installed agents"
+            } else {
+                "Checking installed agents"
+            }));
+        }
+        for (provider_index, row) in rows.into_iter().enumerate() {
             let (name, icon) = match row.provider {
                 ProviderId::Claude => ("Claude", IconName::AiClaude),
                 ProviderId::Codex => ("Codex", IconName::AiOpenAi),
@@ -860,7 +880,27 @@ impl Render for QuotaPanel {
                 .border_b_1()
                 .border_color(cx.theme().colors().border_variant);
             for account in &row.accounts {
-                let status = account_status(account, now);
+                let mut status = account_status(account, now);
+                if let Some(service) = &self.service {
+                    let service = service.read(cx);
+                    if let Some(schedule) = service.scheduler.scopes.get(&account.scope.id) {
+                        let retry_at = Scheduler::next_for(
+                            schedule,
+                            service.ports.clock.now(),
+                            service.ports.clock.monotonic(),
+                        );
+                        if retry_at > service.ports.clock.now() && !schedule.suspended {
+                            let seconds = retry_at.saturating_sub(service.ports.clock.now());
+                            if !status.is_empty() {
+                                status.push_str(" · ");
+                            }
+                            status.push_str(&format!(
+                                "Refresh available in {}m",
+                                (seconds + 59) / 60
+                            ));
+                        }
+                    }
+                }
                 let logged_out = account.availability == Availability::NotLoggedIn;
                 let mut header = h_flex().w_full().justify_between().gap_2().child(
                     h_flex()
@@ -1592,6 +1632,48 @@ mod tests {
         assert_eq!(severity(0.80), Color::Error);
         assert_eq!(countdown(Some(60), 61), "Resets now");
         assert_eq!(countdown(None, 0), "");
+    }
+
+    #[test]
+    fn inventory_transition_adds_rows_and_errors_keep_other_providers_visible() {
+        let mut core = QuotaCore::default();
+        for (id, provider, availability) in [
+            (
+                "claude",
+                ProviderId::Claude,
+                Availability::Error(ErrorCode::Transport),
+            ),
+            ("codex", ProviderId::Codex, Availability::NotInstalled),
+        ] {
+            core.inventory(
+                AccountScope {
+                    id: id.into(),
+                    provider,
+                    runtime: "local".into(),
+                    identity_known: false,
+                },
+                1,
+                availability,
+            )
+            .expect("inventory");
+        }
+        assert_eq!(provider_rows(&core.snapshot).len(), 1);
+        let scope = core
+            .snapshot
+            .accounts
+            .get("codex")
+            .expect("codex")
+            .scope
+            .clone();
+        core.inventory(scope, 2, Availability::NotLoggedIn)
+            .expect("installed after startup");
+        assert_eq!(provider_rows(&core.snapshot).len(), 2);
+        for account in core.snapshot.accounts.values() {
+            let text = account_status(account, 100);
+            for raw in ["NotInstalled", "NotLoggedIn", "Transport", "Error("] {
+                assert!(!text.contains(raw), "{text}");
+            }
+        }
     }
 
     #[test]

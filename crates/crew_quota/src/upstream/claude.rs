@@ -13,7 +13,8 @@ const SHARED_SCOPE: &str = "claude-registry-shell-oauth";
 #[derive(Default)]
 pub(super) struct ClaudeState {
     pub(super) readers: BTreeMap<usize, (Rc<RefCell<BTreeSet<String>>>, Task<()>)>,
-    inventory: Option<Task<()>>,
+    pub(super) inventory: Option<Task<()>>,
+    installation: Option<&'static str>,
 }
 
 trait DebugFeed {
@@ -359,7 +360,7 @@ pub(super) fn attach_reader(
     service.claude.readers.insert(identity, (sessions, task));
 }
 
-fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App) {
+pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App) {
     let eligible = shared_scope(cx);
     let status = project
         .read(cx)
@@ -396,6 +397,15 @@ fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App)
             };
             if this
                 .update(cx, |service, cx| {
+                    log::info!(
+                        "crew_quota: inventory agent=claude-acp installation={}",
+                        installation_code(&availability)
+                    );
+                    let installation = installation_code(&availability);
+                    if service.claude.installation == Some(installation) {
+                        return;
+                    }
+                    service.claude.installation = Some(installation);
                     if let Some(handle) = service.cancellations.remove(SHARED_SCOPE) {
                         handle.abort();
                     }

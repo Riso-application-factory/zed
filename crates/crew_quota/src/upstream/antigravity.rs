@@ -913,7 +913,7 @@ fn configuration_identity(cx: &App) -> Vec<String> {
     }
     identity
 }
-fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App) {
+pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App) {
     // This comparison is memory-only: environment values never enter a scope key or persistence.
     let identity = configuration_identity(cx);
     let status = project
@@ -952,6 +952,10 @@ fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App)
                         runtime: "local".into(),
                         identity_known: false,
                     };
+                    log::info!(
+                        "crew_quota: inventory agent=antigravity installation={}",
+                        installation_code(&availability)
+                    );
                     if service.antigravity_identity.as_ref()
                         == Some(&(identity.clone(), availability.clone()))
                     {

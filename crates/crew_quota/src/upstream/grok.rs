@@ -224,7 +224,10 @@ fn capture_allowed(present: bool, supported: bool, supergrok: bool) -> bool {
     present && supported && !supergrok
 }
 
-fn sync(service: &Entity<QuotaService>, cx: &mut App) {
+pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
+    if cx.try_global::<Bridge>().is_none() {
+        return;
+    }
     let configured = &language_models::AllLanguageModelSettings::get_global(cx)
         .x_ai
         .api_url;

@@ -137,6 +137,8 @@ pub struct QuotaService {
     _writer: Task<()>,
     pending_persistence: BTreeMap<String, Task<()>>,
     _inventory: Option<Task<()>>,
+    inventory_refresh: Option<Shared<Task<()>>>,
+    codex_installation: Option<&'static str>,
     grok_task: Option<Task<()>>,
     grok_identity: Option<(String, bool)>,
     claude: claude::ClaudeState,
@@ -200,7 +202,9 @@ impl QuotaService {
                 };
                 futures::select_biased! {
                     value = receiver.next().fuse() => if value.is_none() { break; },
-                    _ = cx.background_executor().timer(delay).fuse() => {},
+                    _ = cx.background_executor().timer(delay).fuse() => {
+                        if let Ok(task) = this.update(cx, |this, cx| this.recheck_inventory("tick", cx)) { task.await; }
+                    },
                 }
             }
         });
@@ -221,6 +225,8 @@ impl QuotaService {
             _writer: writer,
             pending_persistence: BTreeMap::new(),
             _inventory: None,
+            inventory_refresh: None,
+            codex_installation: None,
             grok_task: None,
             grok_identity: None,
             claude: Default::default(),
@@ -351,69 +357,91 @@ impl QuotaService {
         selector: Selector,
         cx: &mut Context<Self>,
     ) -> Task<Result<(), RefreshError>> {
-        for account in self
-            .core
-            .snapshot
-            .accounts
-            .values()
-            .filter(|account| selector.matches(&account.scope))
-        {
-            self.scheduler.force(&account.scope.id);
-        }
-        self.evaluate(cx);
-        if selector.provider == Some(ProviderId::Grok) {
-            return Task::ready(Err(RefreshError::NotRefreshable));
-        }
-        let mut pending = Vec::new();
-        for account in self
-            .core
-            .snapshot
-            .accounts
-            .values()
-            .filter(|account| selector.matches(&account.scope))
-        {
-            if account.scope.provider == ProviderId::Grok {
-                continue;
-            }
-            if let Some(task) = self.tasks.get(&account.scope.id) {
-                pending.push(task.clone());
-            } else {
-                return Task::ready(Err(match account.availability {
-                    Availability::NotInstalled => RefreshError::NotInstalled,
-                    Availability::NotLoggedIn => RefreshError::NotLoggedIn,
-                    Availability::Unsupported(_) => RefreshError::Unsupported,
-                    _ => RefreshError::Deferred {
-                        retry_at: self.scheduler.scopes.get(&account.scope.id).map_or(
-                            self.ports.clock.now(),
-                            |state| {
-                                Scheduler::next_for(
-                                    state,
-                                    self.ports.clock.now(),
-                                    self.ports.clock.monotonic(),
-                                )
-                            },
-                        ),
-                    },
-                }));
-            }
-        }
-        if pending.is_empty() {
-            return Task::ready(Err(
-                if self.core.snapshot.accounts.values().any(|account| {
-                    selector.matches(&account.scope) && account.scope.provider == ProviderId::Grok
-                }) {
-                    RefreshError::NotRefreshable
-                } else {
-                    RefreshError::Unknown
-                },
-            ));
-        }
-        cx.spawn(async move |_, _| {
+        let inventory = self.recheck_inventory("manual", cx);
+        cx.spawn(async move |this, cx| {
+            inventory.await;
+            let pending = this
+                .update(cx, |service, cx| {
+                    for account in service
+                        .core
+                        .snapshot
+                        .accounts
+                        .values()
+                        .filter(|account| selector.matches(&account.scope))
+                    {
+                        service.scheduler.force(&account.scope.id);
+                    }
+                    service.evaluate(cx);
+                    service
+                        .tasks
+                        .iter()
+                        .filter(|(scope, _)| {
+                            service
+                                .core
+                                .snapshot
+                                .accounts
+                                .get(*scope)
+                                .is_some_and(|account| selector.matches(&account.scope))
+                        })
+                        .map(|(_, task)| task.clone())
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|_| RefreshError::Unknown)?;
             for task in pending {
-                task.await?;
+                if task.await.is_err() {
+                    // The completion path records failures on the affected account.
+                    log::debug!("crew_quota: refresh_provider_failed");
+                }
             }
             Ok(())
         })
+    }
+
+    fn recheck_inventory(
+        &mut self,
+        trigger: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Shared<Task<()>> {
+        if let Some(task) = &self.inventory_refresh {
+            return task.clone();
+        }
+        log::info!("crew_quota: refresh_trigger={trigger}");
+        let Some(project) = self._project.clone() else {
+            return Task::ready(()).shared();
+        };
+        let task = cx
+            .spawn(async move |this, cx| {
+                let Some(service) = this.upgrade() else {
+                    return;
+                };
+                cx.update(|cx| {
+                    grok::sync(&service, cx);
+                    claude::sync(&service, &project, cx);
+                    antigravity::sync(&service, &project, cx);
+                    service.update(cx, |service, cx| {
+                        sync_inventory(
+                            service,
+                            &project.read(cx).agent_server_store().clone(),
+                            false,
+                            cx,
+                        )
+                    });
+                });
+                let tasks = service.update(cx, |service, _| {
+                    [
+                        service._inventory.take(),
+                        service.claude.inventory.take(),
+                        service.antigravity_inventory.take(),
+                    ]
+                });
+                for task in tasks.into_iter().flatten() {
+                    task.await;
+                }
+                service.update(cx, |service, _| service.inventory_refresh = None);
+            })
+            .shared();
+        self.inventory_refresh = Some(task.clone());
+        task
     }
 
     pub fn observe(
@@ -1059,6 +1087,23 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
         )
     });
     cx.set_global(GlobalQuota(service.clone()));
+    cx.observe_new::<acp_thread::AcpThread>({
+        let service = service.downgrade();
+        move |thread, _, cx| {
+            if !thread.project().read(cx).is_local() {
+                return;
+            }
+            let service = service.clone();
+            cx.defer(move |cx| {
+                if let Ok(task) =
+                    service.update(cx, |service, cx| service.recheck_inventory("thread", cx))
+                {
+                    cx.spawn(async move |_| task.await).detach();
+                }
+            });
+        }
+    })
+    .detach();
     grok::init(&service, cx);
     panel::init(cx);
     claude::init(&service, &project, cx);
@@ -1067,6 +1112,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
     let subscription = cx.subscribe(&store, {
         let service = service.downgrade();
         move |store, _: &AgentServersUpdated, cx| {
+            log::info!("crew_quota: refresh_trigger=agent_servers_updated");
             if service
                 .update(cx, |service, cx| sync_inventory(service, &store, true, cx))
                 .is_err()
@@ -1098,6 +1144,7 @@ fn sync_inventory(
             .map(|agent| agent.install_status(cx))
     });
     let Some(status) = status else {
+        log::info!("crew_quota: inventory agent=codex-acp installation=not_configured");
         let scopes: Vec<_> = service
             .core
             .snapshot
@@ -1185,13 +1232,7 @@ fn sync_inventory(
                     .snapshot
                     .accounts
                     .get(&scope_id)
-                    .map_or(1, |account| {
-                        account.generation.saturating_add(u64::from(changed))
-                    });
-                if let Some(handle) = this.cancellations.remove(&scope_id) {
-                    handle.abort();
-                }
-                this.tasks.remove(&scope_id);
+                    .map_or(1, |account| account.generation.saturating_add(1));
                 let availability = match status {
                     Ok(AgentInstallStatus::Installed { .. }) => Availability::Ready,
                     Ok(AgentInstallStatus::NotInstalled) => Availability::NotInstalled,
@@ -1200,6 +1241,20 @@ fn sync_inventory(
                     }
                     Err(_) => Availability::Error(ErrorCode::Transport),
                 };
+                log::info!(
+                    "crew_quota: inventory agent=codex-acp installation={}",
+                    installation_code(&availability)
+                );
+                let installation = installation_code(&availability);
+                if !changed && this.codex_installation == Some(installation) {
+                    this.finish_init(Ok(()));
+                    return;
+                }
+                this.codex_installation = Some(installation);
+                if let Some(handle) = this.cancellations.remove(&scope_id) {
+                    handle.abort();
+                }
+                this.tasks.remove(&scope_id);
                 if this
                     .core
                     .inventory(scope.clone(), generation, availability)
@@ -1274,7 +1329,7 @@ fn sync_inventory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{BorrowAppContext as _, TestAppContext};
     use std::cell::RefCell;
 
     struct FakeClock {
@@ -1502,6 +1557,117 @@ mod tests {
             deadline: 1300,
             allow_inference: false,
         }
+    }
+
+    #[gpui::test]
+    async fn tick_rechecks_installation_without_agent_servers_updated(cx: &mut TestAppContext) {
+        use project::agent_registry_store::{RegistryAgentMetadata, RegistryNpxAgent};
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            AgentRegistryStore::init_test_global(
+                cx,
+                vec![RegistryAgent::Npx(RegistryNpxAgent {
+                    metadata: RegistryAgentMetadata {
+                        id: AgentId::new("codex-acp"),
+                        name: "Codex".into(),
+                        description: "".into(),
+                        version: "1.0.0".into(),
+                        repository: None,
+                        website: None,
+                        license_url: None,
+                        icon_path: None,
+                    },
+                    package: "codex-acp".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                })],
+            );
+        });
+        let filesystem = fs::FakeFs::new(cx.executor());
+        let project = Project::test(filesystem.clone(), [], cx).await;
+        cx.update(|cx| {
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings
+                    .set_user_settings(r#"{"agent_servers":{"codex-acp":{"type":"registry"}}}"#, cx)
+                    .expect("registry settings");
+            });
+        });
+        cx.run_until_parked();
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, _| service._project = Some(project));
+        let task = service.update(cx, |service, cx| service.recheck_inventory("tick", cx));
+        task.await;
+        service.read_with(cx, |service, _| {
+            assert!(
+                service
+                    .core
+                    .snapshot
+                    .accounts
+                    .values()
+                    .any(|account| account.scope.provider == ProviderId::Codex
+                        && account.availability == Availability::NotInstalled)
+            )
+        });
+        filesystem.insert_tree(paths::external_agents_dir().join("registry/npx/codex-acp/node_modules"), serde_json::json!({ "codex-acp": { "package.json": r#"{"version":"1.0.0","bin":"cli.js"}"#, "cli.js": "" } })).await;
+        let task = service.update(cx, |service, cx| service.recheck_inventory("tick", cx));
+        task.await;
+        service.read_with(cx, |service, _| {
+            assert!(
+                service
+                    .core
+                    .snapshot
+                    .accounts
+                    .values()
+                    .any(|account| account.scope.provider == ProviderId::Codex
+                        && account.availability == Availability::Ready)
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn manual_refresh_skips_missing_agents_and_isolates_provider_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let (service, _, source, _) = harness(cx);
+        source.fail.set(true);
+        service.update(cx, |service, _| {
+            for (id, availability) in [
+                ("missing", Availability::NotInstalled),
+                ("logged-out", Availability::NotLoggedIn),
+            ] {
+                service
+                    .core
+                    .inventory(
+                        AccountScope {
+                            id: id.into(),
+                            provider: ProviderId::Claude,
+                            runtime: "local".into(),
+                            identity_known: false,
+                        },
+                        1,
+                        availability,
+                    )
+                    .expect("inventory");
+                service.scheduler.track(id.into(), ProviderId::Claude, 1);
+            }
+        });
+        let result = service.update(cx, |service, cx| service.refresh(Selector::default(), cx));
+        assert_eq!(result.await, Ok(()));
+        assert_eq!(source.calls.get(), 1);
+        service.read_with(cx, |service, _| {
+            assert_eq!(service.core.snapshot.accounts.len(), 3);
+            assert_eq!(
+                service
+                    .core
+                    .snapshot
+                    .accounts
+                    .get("missing")
+                    .expect("missing")
+                    .availability,
+                Availability::NotInstalled
+            );
+        });
     }
 
     #[gpui::test]
@@ -1791,5 +1957,14 @@ mod tests {
             );
             assert!(service.scheduler.scopes["claude-test"].suspended);
         });
+    }
+}
+
+fn installation_code(availability: &Availability) -> &'static str {
+    match availability {
+        Availability::NotInstalled => "not_installed",
+        Availability::Unsupported(_) => "unsupported",
+        Availability::Error(_) => "error",
+        _ => "installed",
     }
 }
