@@ -12,7 +12,7 @@ const SHARED_SCOPE: &str = "claude-registry-shell-oauth";
 
 #[derive(Default)]
 pub(super) struct ClaudeState {
-    readers: BTreeMap<usize, (Rc<RefCell<BTreeSet<String>>>, Task<()>)>,
+    pub(super) readers: BTreeMap<usize, (Rc<RefCell<BTreeSet<String>>>, Task<()>)>,
     inventory: Option<Task<()>>,
 }
 
@@ -78,12 +78,8 @@ fn configured_scope(cx: &App) -> String {
     let settings = cx
         .global::<SettingsStore>()
         .get::<AllAgentServersSettings>(None);
-    let Some(CustomAgentServerSettings::Registry {
-        env,
-        default_mode,
-        default_config_options,
-        ..
-    }) = settings.get("claude-acp")
+    let Some(configuration @ CustomAgentServerSettings::Registry { env, .. }) =
+        settings.get("claude-acp")
     else {
         return auth_scope(false, Vec::new(), true, 0, "unknown");
     };
@@ -98,11 +94,27 @@ fn configured_scope(cx: &App) -> String {
     let Some(RegistryAgent::Npx(registry)) = registry else {
         return auth_scope(false, env.keys().cloned().collect(), true, 0, "unknown");
     };
+    registry_scope(
+        configuration,
+        registry.env.keys().cloned().collect(),
+        registry.args.len(),
+    )
+}
+
+fn registry_scope(
+    settings: &CustomAgentServerSettings,
+    mut environment_names: Vec<String>,
+    argument_count: usize,
+) -> String {
+    let CustomAgentServerSettings::Registry { env, .. } = settings else {
+        return auth_scope(false, environment_names, true, argument_count, "unknown");
+    };
+    environment_names.extend(env.keys().cloned());
     auth_scope(
         true,
-        env.keys().chain(registry.env.keys()).cloned().collect(),
-        default_mode.is_some() || !default_config_options.is_empty(),
-        registry.args.len(),
+        environment_names,
+        false,
+        argument_count,
         "shell-oauth",
     )
 }
@@ -241,89 +253,110 @@ pub(super) fn init(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                                 .track(scope.clone(), ProviderId::Claude, 1);
                         }
                     }
-                    let sessions = Rc::new(RefCell::new(BTreeSet::from([session])));
-                    let generation = service
-                        .core
-                        .snapshot
-                        .accounts
-                        .get(&scope)
-                        .map_or(1, |account| account.generation);
-                    let latest = backlog
-                        .into_iter()
-                        .filter_map(|message| decode(message, &sessions.borrow()))
-                        .next_back();
-                    if let Some(data) = latest {
-                        // Debug backlog has no timestamp; persisted provenance prevents replay from becoming fresh.
-                        if let Ok(observation) = normalize_claude(
-                            data,
-                            &scope,
-                            generation,
-                            SourceKind::Persisted,
-                            service.ports.clock.now(),
-                            0,
-                        ) {
-                            if service.observe(observation, cx).is_err() {
-                                log::debug!("crew_quota: invalid_claude_backlog");
-                            }
-                        }
-                    }
-                    let task = cx.spawn({
-                        let sessions = sessions.clone();
-                        async move |this, cx| {
-                            while let Ok(message) = receiver.recv().await {
-                                let data = decode(message, &sessions.borrow());
-                                let Some(data) = data else {
-                                    continue;
-                                };
-                                if this
-                                    .update(cx, |service, cx| {
-                                        let sequence = service
-                                            .core
-                                            .snapshot
-                                            .accounts
-                                            .get(&scope)
-                                            .map_or(1, |account| {
-                                                account.sequence.saturating_add(1)
-                                            });
-                                        match normalize_claude(
-                                            data,
-                                            &scope,
-                                            generation,
-                                            SourceKind::ClaudeAcpEvent,
-                                            service.ports.clock.now(),
-                                            sequence,
-                                        ) {
-                                            Ok(observation) => {
-                                                if service.observe(observation, cx).is_err() {
-                                                    log::debug!("crew_quota: invalid_claude_event");
-                                                }
-                                            }
-                                            Err(_) => {
-                                                log::debug!("crew_quota: invalid_claude_event")
-                                            }
-                                        }
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            if this
-                                .update(cx, |service, _| {
-                                    service.claude.readers.remove(&identity);
-                                })
-                                .is_err()
-                            {
-                                log::debug!("crew_quota: claude_service_closed");
-                            }
-                        }
-                    });
-                    service.claude.readers.insert(identity, (sessions, task));
+                    attach_reader(service, identity, scope, session, backlog, receiver, cx);
                 });
             });
         }
     })
     .detach();
+}
+
+pub(super) fn attach_reader(
+    service: &mut QuotaService,
+    identity: usize,
+    scope: String,
+    session: String,
+    backlog: Vec<AcpDebugMessage>,
+    receiver: async_channel::Receiver<AcpDebugMessage>,
+    cx: &mut Context<QuotaService>,
+) {
+    if let Some((sessions, _)) = service.claude.readers.get(&identity) {
+        sessions.borrow_mut().insert(session);
+        return;
+    }
+    log::info!("crew_quota: agent=Claude source=Passive outcome=Attached");
+    let sessions = Rc::new(RefCell::new(BTreeSet::from([session])));
+    let generation = service
+        .core
+        .snapshot
+        .accounts
+        .get(&scope)
+        .map_or(1, |account| account.generation);
+    let latest = backlog
+        .into_iter()
+        .filter_map(|message| decode(message, &sessions.borrow()))
+        .next_back();
+    if let Some(data) = latest {
+        // Debug backlog has no timestamp; persisted provenance prevents replay from becoming fresh.
+        if let Ok(observation) = normalize_claude(
+            data,
+            &scope,
+            generation,
+            SourceKind::Persisted,
+            service.ports.clock.now(),
+            0,
+        ) {
+            if service.observe(observation, cx).is_err() {
+                log::debug!("crew_quota: invalid_claude_backlog");
+            }
+        }
+    }
+    let task = cx.spawn({
+        let sessions = sessions.clone();
+        async move |this, cx| {
+            while let Ok(message) = receiver.recv().await {
+                let data = decode(message, &sessions.borrow());
+                let Some(data) = data else {
+                    continue;
+                };
+                if this
+                    .update(cx, |service, cx| {
+                        let generation = service
+                            .core
+                            .snapshot
+                            .accounts
+                            .get(&scope)
+                            .map_or(generation, |account| account.generation);
+                        let sequence = service
+                            .core
+                            .snapshot
+                            .accounts
+                            .get(&scope)
+                            .map_or(1, |account| account.sequence.saturating_add(1));
+                        match normalize_claude(
+                            data,
+                            &scope,
+                            generation,
+                            SourceKind::ClaudeAcpEvent,
+                            service.ports.clock.now(),
+                            sequence,
+                        ) {
+                            Ok(observation) => {
+                                if service.observe(observation, cx).is_err() {
+                                    log::debug!("crew_quota: invalid_claude_event");
+                                }
+                            }
+                            Err(_) => {
+                                log::debug!("crew_quota: invalid_claude_event")
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            if this
+                .update(cx, |service, _| {
+                    service.claude.readers.remove(&identity);
+                })
+                .is_err()
+            {
+                log::debug!("crew_quota: claude_service_closed");
+            }
+        }
+    });
+    service.claude.readers.insert(identity, (sessions, task));
 }
 
 fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx: &mut App) {
@@ -439,7 +472,7 @@ pub(super) fn refresh(
             let environment = environment.await.ok_or(RefreshError::Unsupported)?;
             if environment.contains_key("ANTHROPIC_API_KEY") || environment.contains_key("CLAUDE_CODE_USE_BEDROCK") || environment.contains_key("CLAUDE_CODE_USE_VERTEX") { return Err(RefreshError::Unsupported); }
             let token = match environment.get("CLAUDE_CODE_OAUTH_TOKEN").filter(|token| !token.is_empty()) {
-                Some(token) => token.clone(),
+                Some(token) => { log::info!("crew_quota: agent=Claude source=ProjectEnvironment outcome=TokenPresent"); token.clone() },
                 None => {
                     let directory = environment.get("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| paths::home_dir().join(".claude"));
                     // Stored credentials are detected by presence only, never opened.
@@ -784,6 +817,26 @@ mod tests {
 #[cfg(test)]
 mod scope_tests {
     use super::*;
+    #[test]
+    fn registry_ui_defaults_share_probe_scope_but_environment_isolates() {
+        let mut configuration = CustomAgentServerSettings::Registry {
+            env: Default::default(),
+            default_mode: Some("default".into()),
+            default_config_options: [(
+                "fast".into(),
+                serde_json::from_value(serde_json::json!(true)).expect("config value"),
+            )]
+            .into_iter()
+            .collect(),
+            favorite_config_option_values: Default::default(),
+        };
+        assert_eq!(registry_scope(&configuration, Vec::new(), 0), SHARED_SCOPE);
+        if let CustomAgentServerSettings::Registry { env, .. } = &mut configuration {
+            env.insert("CLAUDE_CODE_OAUTH_TOKEN".into(), "fixture".into());
+        }
+        assert_ne!(registry_scope(&configuration, Vec::new(), 0), SHARED_SCOPE);
+    }
+
     #[test]
     fn default_registry_scope_is_shared_and_overrides_are_isolated() {
         assert_eq!(

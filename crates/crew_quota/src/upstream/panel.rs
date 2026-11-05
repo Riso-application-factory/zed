@@ -669,11 +669,23 @@ fn age(updated: Option<Timestamp>, now: Timestamp) -> String {
 }
 fn account_status(account: &AccountState, now: Timestamp) -> String {
     let availability = match account.availability {
-        Availability::Unknown => "Unknown",
+        Availability::Unknown if account.scope.provider == ProviderId::Grok => {
+            "Waiting for a Grok response"
+        }
+        Availability::Unknown => "Waiting for quota data",
         Availability::Unsupported(ErrorCode::StoredAuthUnsupported) => {
             "Stored OAuth unsupported — use producer shell login"
         }
-        Availability::Unsupported(_) => "Unsupported",
+        Availability::Unsupported(_) if account.scope.provider == ProviderId::Grok => {
+            "Unsupported — use the standard xAI API endpoint"
+        }
+        Availability::Unsupported(ErrorCode::UnsupportedPlatform) => {
+            "Unsupported — platform not supported"
+        }
+        Availability::Unsupported(ErrorCode::UnsupportedVersion) => {
+            "Unsupported — agent version or launch configuration"
+        }
+        Availability::Unsupported(_) => "Unsupported — source cannot read this configuration",
         Availability::Unavailable(ErrorCode::StoredAuthUnsupported) => {
             "Stored OAuth unsupported — use producer shell login"
         }
@@ -692,6 +704,16 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
         Availability::Ready => "",
     };
     let mut states = Vec::new();
+    if account.scope.provider == ProviderId::Grok
+        && account.windows.values().any(|window| {
+            window
+                .remaining
+                .as_ref()
+                .is_some_and(|sample| sample.source == SourceKind::Persisted)
+        })
+    {
+        states.push("Cached · account unverified");
+    }
     if !availability.is_empty() {
         states.push(availability);
     }
@@ -731,7 +753,7 @@ fn account_status(account: &AccountState, now: Timestamp) -> String {
         states.push("Exhausted");
     }
     if states.is_empty() && account.windows.is_empty() {
-        states.push("Unknown — no quota data");
+        states.push("Waiting for quota data");
     }
     states.join(" · ")
 }
@@ -1463,7 +1485,7 @@ mod tests {
     fn fake_snapshot_render_states() {
         let mut account = fake_account();
         for (availability, expected) in [
-            (Availability::Unknown, "Unknown"),
+            (Availability::Unknown, "Waiting for quota data"),
             (Availability::NotLoggedIn, "Not logged in"),
             (
                 Availability::Unsupported(ErrorCode::UnsupportedVersion),

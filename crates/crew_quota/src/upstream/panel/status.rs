@@ -116,6 +116,31 @@ fn provider_for_thread(visible: bool, agent: Option<&str>) -> Option<ProviderId>
     }
 }
 
+fn numeric_summary(account: &AccountState, used: bool) -> Option<String> {
+    if account.availability == Availability::NotLoggedIn {
+        return None;
+    }
+    let summary = visible_windows(account)
+        .iter()
+        .filter(|window| {
+            used_fraction(window).is_some()
+                || window
+                    .remaining
+                    .as_ref()
+                    .is_some_and(|sample| sample.value.is_some())
+        })
+        .map(|window| {
+            format!(
+                "{} {}",
+                window_title(account, window),
+                window_value(window, used)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    (!summary.is_empty()).then_some(summary)
+}
+
 impl Render for QuotaStatusItem {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let provider = self.visible_provider(cx);
@@ -143,27 +168,9 @@ impl Render for QuotaStatusItem {
             {
                 for account in row.accounts {
                     let status = account_status(account, now);
-                    let summary = if account.availability == Availability::NotLoggedIn {
-                        "Not logged in".to_string()
-                    } else {
-                        visible_windows(account)
-                            .iter()
-                            .map(|window| {
-                                format!(
-                                    "{} {}",
-                                    window_title(account, window),
-                                    window_value(window, preferences.used)
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" · ")
+                    let Some(summary) = numeric_summary(account, preferences.used) else {
+                        continue;
                     };
-                    let summary =
-                        if status.is_empty() || account.availability == Availability::NotLoggedIn {
-                            summary
-                        } else {
-                            format!("{status} · {summary}")
-                        };
                     content = content.child(
                         div()
                             .id("quota-active-thread")
@@ -180,6 +187,32 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn footer_only_renders_numbers_and_hides_empty_states() {
+        let preview = super::super::preview::FixturePreview::new(1000, false);
+        let mut account = preview.snapshot.accounts["codex"].clone();
+        assert!(numeric_summary(&account, false).is_some());
+        account.availability = Availability::NotLoggedIn;
+        assert!(numeric_summary(&account, false).is_none());
+        account.windows.clear();
+        for availability in [
+            Availability::Unknown,
+            Availability::Ready,
+            Availability::NotLoggedIn,
+        ] {
+            account.availability = availability;
+            for refresh in [
+                RefreshState::Idle,
+                RefreshState::Queued,
+                RefreshState::InFlight,
+            ] {
+                account.refresh = refresh;
+                assert!(numeric_summary(&account, false).is_none());
+            }
+        }
+    }
 
     #[test]
     fn follows_visible_thread_and_hides_for_other_surfaces() {

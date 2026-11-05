@@ -2,6 +2,7 @@ use super::*;
 use http_client::{AsyncBody, HttpClient, Request, Response, Url, http::HeaderValue};
 use settings::Settings;
 use std::sync::Mutex;
+use util::ResultExt as _;
 
 #[derive(Clone)]
 struct Target {
@@ -39,10 +40,24 @@ impl HttpClient for Observer {
         let target = endpoint
             .as_ref()
             .and_then(|_| self.target.try_lock().ok()?.clone());
+        if endpoint.is_some() {
+            log::info!(
+                "crew_quota: agent=Grok source=Headers outcome={}",
+                if target.is_some() {
+                    "Eligible"
+                } else {
+                    "Gated"
+                }
+            );
+        }
         let future = self.inner.send(request);
         let sender = self.sender.clone();
         Box::pin(async move {
-            let response = future.await?;
+            let response = future.await.inspect_err(|_| {
+                if endpoint.is_some() {
+                    log::info!("crew_quota: agent=Grok source=Headers outcome=TransportError");
+                }
+            })?;
             if let (Some(endpoint), Some(target)) = (endpoint, target) {
                 let now = chrono::Utc::now().timestamp();
                 let windows = parse(response.headers(), &target.scope, &endpoint);
@@ -65,10 +80,15 @@ impl HttpClient for Observer {
                         quota: observation,
                         retry_at: retry_after(response.headers(), now),
                     }) {
-                        Ok(())
-                        | Err(async_channel::TrySendError::Full(_))
-                        | Err(async_channel::TrySendError::Closed(_)) => {}
+                        Ok(()) => {
+                            log::info!("crew_quota: agent=Grok source=Headers outcome=Queued")
+                        }
+                        Err(_) => {
+                            log::info!("crew_quota: agent=Grok source=Headers outcome=Dropped")
+                        }
                     }
+                } else {
+                    log::info!("crew_quota: agent=Grok source=Headers outcome=NoQuotaHeaders");
                 }
             }
             Ok(response)
@@ -84,7 +104,11 @@ fn inference_endpoint(request: &Request<AsyncBody>) -> Option<&str> {
         && uri.port_u16().is_none_or(|port| port == 443)
         && matches!(
             uri.path(),
-            "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/embeddings"
+            "/v1/chat/completions"
+                | "/v1//chat/completions"
+                | "/v1/completions"
+                | "/v1/responses"
+                | "/v1/embeddings"
         ))
     .then_some(uri.path())
 }
@@ -134,7 +158,7 @@ fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) ->
                         scope: scope.into(),
                         bucket: format!("xai{endpoint}/{dimension}"),
                         applicability: Applicability::Family(format!(
-                            "Latest xAI response · Unknown model ({endpoint})"
+                            "Latest xAI response · Model unverified ({endpoint})"
                         )),
                     },
                     role: dimension.into(),
@@ -162,6 +186,10 @@ fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) ->
                 disabled: Patch::Missing,
                 precision: Precision::Exact,
             }
+        })
+        .filter(|window| {
+            !matches!(window.remaining, Patch::Set(None))
+                || !matches!(window.limit, Patch::Set(None))
         })
         .collect()
 }
@@ -265,6 +293,38 @@ fn sync(service: &Entity<QuotaService>, cx: &mut App) {
                 generation,
             });
         }
+        if capture_allowed(present, supported, supergrok) {
+            let load = service.ports.store.load(format!("snapshot/{scope}"), cx);
+            cx.spawn({
+                let scope = scope.clone();
+                async move |this, cx| {
+                    let result = load.await;
+                    this.update(cx, |service, cx| {
+                        match result {
+                            Ok(Some(record)) => {
+                                if let Some(account) = service.core.snapshot.accounts.get_mut(&scope)
+                                    && account.generation == generation && account.windows.is_empty()
+                                {
+                                    match decode_record(&record, &account.scope, service.ports.clock.now()) {
+                                        Ok(record) => {
+                                            account.windows = record.account.windows;
+                                            account.last_success_at = record.account.last_success_at;
+                                            account.availability = Availability::Ready;
+                                            service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
+                                            log::info!("crew_quota: agent=Grok source=Cache outcome=RestoredUnverified");
+                                            cx.notify();
+                                        }
+                                        Err(code) => log::info!("crew_quota: agent=Grok source=Cache outcome={code:?}"),
+                                    }
+                                }
+                            }
+                            Err(code) => log::info!("crew_quota: agent=Grok source=Cache outcome={code:?}"),
+                            Ok(None) => log::info!("crew_quota: agent=Grok source=Cache outcome=Empty"),
+                        }
+                    }).log_err();
+                }
+            }).detach();
+        }
         cx.emit(QuotaEvent::AvailabilityChanged(scope.clone()));
         cx.emit(QuotaEvent::Changed {
             scopes: vec![scope],
@@ -273,6 +333,35 @@ fn sync(service: &Entity<QuotaService>, cx: &mut App) {
         });
         cx.notify();
     });
+}
+
+async fn buffer_until_ready(
+    ready: impl std::future::Future<Output = Result<(), ErrorCode>>,
+    receiver: &async_channel::Receiver<HeaderObservation>,
+) -> Result<BTreeMap<String, HeaderObservation>, ErrorCode> {
+    let mut pending = BTreeMap::new();
+    let mut ready = Box::pin(ready);
+    loop {
+        match futures::future::select(ready, Box::pin(receiver.recv())).await {
+            futures::future::Either::Left((result, _)) => {
+                if result.is_err() {
+                    return Err(ErrorCode::Persistence);
+                }
+                break;
+            }
+            futures::future::Either::Right((result, remaining)) => {
+                ready = remaining;
+                let Ok(headers) = result else {
+                    return Err(ErrorCode::Persistence);
+                };
+                if pending.len() < MAX_SCOPES || pending.contains_key(&headers.quota.scope) {
+                    pending.insert(headers.quota.scope.clone(), headers);
+                }
+                log::info!("crew_quota: agent=Grok source=Headers outcome=Buffered");
+            }
+        }
+    }
+    Ok(pending)
 }
 
 pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
@@ -304,7 +393,22 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
         service._subscriptions.extend([subscription, settings]);
         service.grok_task = Some(cx.spawn(async move |this, cx| {
             let _sender = sender;
-            while let Ok(headers) = receiver.recv().await {
+            let ready = this.read_with(cx, |service, _| service.ready());
+            let Ok(ready) = ready else {
+                return;
+            };
+            let Ok(pending) = buffer_until_ready(ready, &receiver).await else {
+                return;
+            };
+            let mut pending = pending.into_values();
+            loop {
+                let headers = match pending.next() {
+                    Some(headers) => headers,
+                    None => match receiver.recv().await {
+                        Ok(headers) => headers,
+                        Err(_) => break,
+                    },
+                };
                 let mut observation = headers.quota;
                 if this
                     .update(cx, |service, cx| {
@@ -318,6 +422,7 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
                         }
                         let scope = observation.scope.clone();
                         let generation = observation.generation;
+                        log::info!("crew_quota: agent=Grok source=Headers outcome=Received");
                         if service.observe(observation, cx).is_err() {
                             log::warn!("crew_quota: xai_observation_invalid");
                         }
@@ -344,6 +449,81 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
 mod tests {
     use super::*;
     use futures::AsyncReadExt as _;
+
+    #[test]
+    fn fake_streaming_startup_coalesces_and_restart_restores_unverified_age() -> anyhow::Result<()>
+    {
+        smol::block_on(async {
+            let inner = http_client::FakeHttpClient::create(|_| async {
+                Ok(Response::builder()
+                    .header("x-ratelimit-limit-requests", "100")
+                    .header("x-ratelimit-remaining-requests", "80")
+                    .body(AsyncBody::from("data: fixture\n\n"))?)
+            });
+            let (sender, receiver) = async_channel::bounded(128);
+            let observer = Observer {
+                inner,
+                sender,
+                target: Arc::new(Mutex::new(Some(Target {
+                    scope: "test".into(),
+                    generation: 1,
+                }))),
+            };
+            let (ready_sender, ready_receiver) = oneshot::channel();
+            let buffer = buffer_until_ready(
+                async { ready_receiver.await.map_err(|_| ErrorCode::Persistence) },
+                &receiver,
+            );
+            futures::pin_mut!(buffer);
+            for _ in 0..3 {
+                let mut response = observer
+                    .send(
+                        Request::builder()
+                            .method("POST")
+                            .uri("https://api.x.ai/v1/chat/completions")
+                            .body(AsyncBody::empty())?,
+                    )
+                    .await?;
+                let mut bytes = Vec::new();
+                response.body_mut().read_to_end(&mut bytes).await?;
+                assert_eq!(bytes, b"data: fixture\n\n");
+                assert!(futures::poll!(buffer.as_mut()).is_pending());
+            }
+            ready_sender.send(()).expect("ready");
+            let mut pending = buffer.await.map_err(|code| anyhow::anyhow!("{code:?}"))?;
+            assert_eq!(pending.len(), 1);
+            let observation = pending.remove("test").expect("latest").quota;
+            let now = observation.observed_at;
+            let scope = AccountScope {
+                id: "test".into(),
+                provider: ProviderId::Grok,
+                runtime: "native-xai".into(),
+                identity_known: false,
+            };
+            let mut core = QuotaCore::default();
+            core.inventory(scope.clone(), 1, Availability::Unknown)
+                .expect("inventory");
+            core.apply(observation, now).expect("headers");
+            let encoded = encode_record(&StoredRecord {
+                schema_version: 1,
+                revision: core.snapshot.revision,
+                account: core.snapshot.accounts["test"].clone(),
+                failures: 0,
+                retry_at: 0,
+            })
+            .expect("store");
+            let restored = decode_record(&encoded, &scope, now + 60).expect("restart");
+            let window = restored.account.windows.values().next().expect("window");
+            let sample = window.remaining.as_ref().expect("sample");
+            assert_eq!(sample.source, SourceKind::Persisted);
+            assert_eq!(sample.observed_at, now);
+            assert!(matches!(
+                window.freshness(now + 60, Duration::from_secs(120)),
+                Freshness::Stale { .. }
+            ));
+            Ok(())
+        })
+    }
 
     #[test]
     fn coexistence_fails_closed() {
@@ -463,7 +643,7 @@ mod tests {
             }
             .matches_window(&window.key)
         }));
-        assert_eq!(windows.len(), 2);
+        assert_eq!(windows.len(), 1);
         assert_ne!(
             windows.first().map(|window| &window.key),
             parse(&headers, "test", "/v1/responses")

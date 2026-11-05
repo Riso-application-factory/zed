@@ -421,6 +421,15 @@ impl QuotaService {
         observation: Observation,
         cx: &mut Context<Self>,
     ) -> Result<(), ErrorCode> {
+        log::info!(
+            "crew_quota: agent={:?} source={:?} outcome=Observed",
+            self.core
+                .snapshot
+                .accounts
+                .get(&observation.scope)
+                .map(|account| &account.scope.provider),
+            observation.source
+        );
         let live = observation.source != SourceKind::Persisted;
         let scope = observation.scope.clone();
         let previous_availability = self
@@ -580,15 +589,13 @@ impl QuotaService {
         let Some(account) = self.core.snapshot.accounts.get(scope) else {
             return;
         };
-        let Some(schedule) = self.scheduler.scopes.get(scope) else {
-            return;
-        };
+        let schedule = self.scheduler.scopes.get(scope);
         let record = StoredRecord {
             schema_version: 1,
             revision: self.core.snapshot.revision,
             account: account.clone(),
-            failures: schedule.failures,
-            retry_at: schedule.retry_at,
+            failures: schedule.map_or(0, |schedule| schedule.failures),
+            retry_at: schedule.map_or(0, |schedule| schedule.retry_at),
         };
         match encode_record(&record) {
             Ok(record) => {
@@ -686,6 +693,10 @@ impl QuotaService {
                 }
                 continue;
             }
+            log::info!(
+                "crew_quota: agent={:?} source=Active outcome=Attempt",
+                account.scope.provider
+            );
             account.last_attempt_at = Some(now);
             account.refresh = RefreshState::InFlight;
             let sequence = account.sequence;
@@ -768,6 +779,18 @@ impl QuotaService {
                 .apply(observation, now)
                 .map_err(RefreshError::Failed)
         });
+        log::info!(
+            "crew_quota: agent={:?} source=Active outcome={:?}",
+            self.core
+                .snapshot
+                .accounts
+                .get(scope)
+                .map(|account| account.scope.provider),
+            result.as_ref().map(|_| ()).map_err(|error| match error {
+                RefreshError::Deferred { .. } => RefreshError::Deferred { retry_at: 0 },
+                other => other.clone(),
+            })
+        );
         let retry_at = match &result {
             Err(RefreshError::Deferred { retry_at }) => Some(*retry_at),
             _ => None,
@@ -1337,6 +1360,89 @@ mod tests {
             })
         }
     }
+    #[gpui::test]
+    fn passive_grok_snapshot_persists_without_active_schedule(cx: &mut TestAppContext) {
+        let (service, _, _, store) = harness(cx);
+        service.update(cx, |service, cx| {
+            service.scheduler.scopes.remove("scope");
+            service
+                .core
+                .snapshot
+                .accounts
+                .get_mut("scope")
+                .expect("scope")
+                .scope
+                .provider = ProviderId::Grok;
+            service.write_snapshot("scope", cx);
+        });
+        cx.run_until_parked();
+        assert!(store.records.borrow().contains_key("snapshot/scope"));
+    }
+
+    #[gpui::test]
+    fn claude_fake_v1_v2_readers_survive_inventory_without_duplicate_subscriptions(
+        cx: &mut TestAppContext,
+    ) {
+        for identity in [1, 2] {
+            let (service, _, _, _) = harness(cx);
+            let (sender, receiver) = async_channel::unbounded();
+            service.update(cx, |service, cx| {
+                let account = service
+                    .core
+                    .snapshot
+                    .accounts
+                    .get_mut("scope")
+                    .expect("account");
+                account.scope.provider = ProviderId::Claude;
+                claude::attach_reader(
+                    service,
+                    identity,
+                    "scope".into(),
+                    "fixture".into(),
+                    Vec::new(),
+                    receiver.clone(),
+                    cx,
+                );
+                claude::attach_reader(
+                    service,
+                    identity,
+                    "scope".into(),
+                    "second-session".into(),
+                    Vec::new(),
+                    receiver,
+                    cx,
+                );
+                assert_eq!(service.claude.readers.len(), 1);
+                let scope = service.core.snapshot.accounts["scope"].scope.clone();
+                service
+                    .core
+                    .inventory(scope, 2, Availability::Unknown)
+                    .expect("generation");
+            });
+            sender
+                .try_send(agent_servers::AcpDebugMessage {
+                    direction: agent_servers::AcpDebugMessageDirection::Incoming,
+                    message: agent_servers::AcpDebugMessageContent::Notification {
+                        method: "session/update".into(),
+                        params: Some(
+                            serde_json::from_str(include_str!(
+                                "../tests/fixtures/claude-passive.sanitized.json"
+                            ))
+                            .expect("fixture"),
+                        ),
+                    },
+                })
+                .expect("send");
+            cx.run_until_parked();
+            service.read_with(cx, |service, _| {
+                let account = &service.core.snapshot.accounts["scope"];
+                assert_eq!(account.generation, 2);
+                assert!(!account.windows.is_empty());
+                assert_eq!(service.claude.readers.len(), 1);
+            });
+        }
+    }
+
     fn harness(
         cx: &mut TestAppContext,
     ) -> (

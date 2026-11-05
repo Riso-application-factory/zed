@@ -1264,11 +1264,21 @@ mod tests {
                 directory: temporary.path().into(),
                 conversations: conversations.canonicalize()?,
                 version: "fixture".into(),
-                timeout: Duration::from_millis(800),
+                timeout: if mode == "agy-timeout" {
+                    Duration::from_millis(800)
+                } else {
+                    Duration::from_secs(5)
+                },
             };
             let result = smol::block_on(read(launch, executor.clone()));
             if mode == "agy-success" {
-                assert!(result.is_ok(), "{result:?}");
+                assert!(
+                    result.is_ok(),
+                    "{result:?}, closed={}, journal={}, owned={}",
+                    temporary.path().join("closed").exists(),
+                    temporary.path().join("pending-session.json").exists(),
+                    conversations.join("fixture-owned-session.db").exists()
+                );
             } else {
                 assert!(result.is_err());
             }

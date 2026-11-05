@@ -23,7 +23,7 @@ fn main() -> io::Result<()> {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    let descendant = Command::new(std::env::current_exe()?)
+    let mut descendant = Command::new(std::env::current_exe()?)
         .arg("--descendant")
         .spawn()?;
     std::fs::write(
@@ -37,7 +37,7 @@ fn main() -> io::Result<()> {
     let mode = std::env::var("CREW_QUOTA_FIXTURE_MODE")
         .map_err(|_| io::Error::other("fixture mode missing"))?;
     if mode.starts_with("agy-") {
-        return antigravity(&directory, &mode);
+        return antigravity(&directory, &mode, &mut descendant);
     }
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -67,7 +67,11 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn antigravity(directory: &std::path::Path, mode: &str) -> io::Result<()> {
+fn antigravity(
+    directory: &std::path::Path,
+    mode: &str,
+    descendant: &mut async_process::Child,
+) -> io::Result<()> {
     use serde_json::{Value, json};
     let session = "fixture-owned-session";
     for line in io::stdin().lock().lines() {
@@ -113,6 +117,9 @@ fn antigravity(directory: &std::path::Path, mode: &str) -> io::Result<()> {
                 json!({"stopReason":"end_turn"})
             }
             "session/close" => {
+                // Reap the fixture child before its parent is killed, so group-exit checks do not depend on launchd reaping an orphan.
+                descendant.kill()?;
+                smol::block_on(descendant.status())?;
                 std::fs::write(directory.join("closed"), session)?;
                 json!({})
             }
