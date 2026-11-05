@@ -12,7 +12,7 @@ struct HeaderObservation {
     retry_at: Option<Timestamp>,
 }
 struct Bridge {
-    target: Arc<Mutex<Option<Target>>>,
+    target: Arc<Mutex<BTreeMap<String, Target>>>,
     sender: async_channel::Sender<HeaderObservation>,
     receiver: async_channel::Receiver<HeaderObservation>,
 }
@@ -20,7 +20,7 @@ impl Global for Bridge {}
 
 struct Observer {
     inner: Arc<dyn HttpClient>,
-    target: Arc<Mutex<Option<Target>>>,
+    target: Arc<Mutex<BTreeMap<String, Target>>>,
     sender: async_channel::Sender<HeaderObservation>,
 }
 impl HttpClient for Observer {
@@ -36,11 +36,13 @@ impl HttpClient for Observer {
     ) -> futures::future::BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         let host_category = match request.uri().host() {
             Some("api.x.ai") => "xai",
+            Some("api.anthropic.com") => "anthropic",
+            Some("api.openai.com") => "openai",
             Some("localhost" | "127.0.0.1" | "::1" | "[::1]") => "localhost",
             _ => "other",
         };
         log::debug!("crew_quota: http_send host_category={host_category}");
-        if !is_xai_host(&request) {
+        if trusted_host(&request).is_none() {
             return self.inner.send(request);
         }
         let endpoint = inference_endpoint(&request).map(str::to_owned);
@@ -48,13 +50,22 @@ impl HttpClient for Observer {
             log::info!("crew_quota: agent=Grok source=Headers outcome=Unmatched path_kind=Other");
             return self.inner.send(request);
         }
-        let target = endpoint
-            .as_ref()
-            .and_then(|_| self.target.try_lock().ok()?.clone());
-        log::info!("crew_quota: agent=Grok source=Headers outcome=Eligible");
-        if target.is_none() {
-            log::info!("crew_quota: agent=Grok source=Headers outcome=Gated");
-        }
+        let target = endpoint.as_ref().and_then(|_| {
+            self.target
+                .try_lock()
+                .ok()?
+                .get(request.uri().host()?)
+                .cloned()
+        });
+        log::info!(
+            "crew_quota: agent=Grok source=Headers outcome={}",
+            if target.is_some() {
+                "Eligible"
+            } else {
+                "Gated"
+            }
+        );
+        let host = request.uri().host().unwrap_or_default().to_owned();
         let future = self.inner.send(request);
         let sender = self.sender.clone();
         Box::pin(async move {
@@ -65,50 +76,53 @@ impl HttpClient for Observer {
             })?;
             if let (Some(endpoint), Some(target)) = (endpoint, target) {
                 let now = chrono::Utc::now().timestamp();
-                let windows = parse(response.headers(), &target.scope, &endpoint);
+                if response.status().is_redirection() {
+                    log::info!(
+                        "crew_quota: agent=Grok source=Headers outcome=Skipped reason=Redirect"
+                    );
+                    return Ok(response);
+                }
+                let windows =
+                    parse_dialect(response.headers(), &target.scope, &endpoint, &host, now);
                 let status = response.status().as_u16();
-                let blocked = classify_response(&mut response).await;
+                let blocked = classify_response(&mut response, &host).await;
                 if let Some(reason) = blocked {
                     log::info!(
                         "crew_quota: agent=Grok source=Headers outcome=Blocked reason={reason:?}"
                     );
                 }
-                if blocked.is_some() || (response.status().is_success() && !windows.is_empty()) {
-                    let observation = Observation {
-                        scope: target.scope,
-                        generation: target.generation,
-                        source: SourceKind::GrokResponseHeaders,
-                        source_version: "xai-headers-v1".into(),
-                        observed_at: now,
-                        provider_sample_at: None,
-                        sequence: 0,
-                        start_sequence: None,
-                        windows,
-                        complete: false,
-                        metadata: AccountMetadata {
-                            grok_response: Some(GrokResponse {
-                                blocked,
-                                status,
-                                observed_at: now,
-                                retry_at: retry_after(response.headers(), now),
-                            }),
-                            ..Default::default()
-                        },
-                    };
-                    // Losing telemetry must never apply backpressure to inference.
-                    match sender.try_send(HeaderObservation {
-                        quota: observation,
-                        retry_at: retry_after(response.headers(), now),
-                    }) {
-                        Ok(()) => {
-                            log::info!("crew_quota: agent=Grok source=Headers outcome=Queued")
-                        }
-                        Err(_) => {
-                            log::info!("crew_quota: agent=Grok source=Headers outcome=Dropped")
-                        }
+                let observation = Observation {
+                    scope: target.scope,
+                    generation: target.generation,
+                    source: SourceKind::GrokResponseHeaders,
+                    source_version: format!("{host}-headers-v2"),
+                    observed_at: now,
+                    provider_sample_at: None,
+                    sequence: 0,
+                    start_sequence: None,
+                    windows,
+                    complete: false,
+                    metadata: AccountMetadata {
+                        grok_response: Some(GrokResponse {
+                            blocked,
+                            status,
+                            observed_at: now,
+                            retry_at: retry_after(response.headers(), now),
+                        }),
+                        ..Default::default()
+                    },
+                };
+                // Losing telemetry must never apply backpressure to inference.
+                match sender.try_send(HeaderObservation {
+                    quota: observation,
+                    retry_at: retry_after(response.headers(), now),
+                }) {
+                    Ok(()) => {
+                        log::info!("crew_quota: agent=Grok source=Headers outcome=Queued")
                     }
-                } else {
-                    log::info!("crew_quota: agent=Grok source=Headers outcome=NoQuotaHeaders");
+                    Err(_) => {
+                        log::info!("crew_quota: agent=Grok source=Headers outcome=Dropped")
+                    }
                 }
             }
             Ok(response)
@@ -117,11 +131,22 @@ impl HttpClient for Observer {
 }
 
 #[derive(serde::Deserialize)]
-struct ErrorCodeBody {
+struct CodeBody {
     code: Option<String>,
 }
+#[derive(serde::Deserialize)]
+struct NestedCodeBody {
+    error: Option<CodeBody>,
+}
 
-async fn classify_response(response: &mut Response<AsyncBody>) -> Option<GrokBlockReason> {
+#[allow(
+    clippy::disallowed_methods,
+    reason = "The HTTP decorator runs independently of a GPUI dispatcher and must enforce a wall-clock deadline."
+)]
+async fn classify_response(
+    response: &mut Response<AsyncBody>,
+    host: &str,
+) -> Option<GrokBlockReason> {
     use futures::AsyncReadExt as _;
     let status = response.status();
     if status.is_success() {
@@ -129,7 +154,7 @@ async fn classify_response(response: &mut Response<AsyncBody>) -> Option<GrokBlo
     }
     let fallback = if status.as_u16() == 429 {
         Some(GrokBlockReason::RateLimited)
-    } else if status.is_client_error() {
+    } else if matches!(status.as_u16(), 401 | 403) {
         Some(GrokBlockReason::Forbidden)
     } else {
         None
@@ -145,10 +170,19 @@ async fn classify_response(response: &mut Response<AsyncBody>) -> Option<GrokBlo
     let mut prefix = Vec::new();
     // Retain the unread tail and replay even read errors to preserve the caller's response.
     let mut exhausted = false;
+    let mut deadline = Box::pin(smol::Timer::after(Duration::from_millis(100)));
     while prefix.len() < 8192 {
         let mut buffer = [0; 1024];
         let length = (8192 - prefix.len()).min(buffer.len());
-        match body.read(&mut buffer[..length]).await {
+        let read = Box::pin(body.read(&mut buffer[..length]));
+        let result = match futures::future::select(read, deadline).await {
+            futures::future::Either::Left((result, remaining)) => {
+                deadline = remaining;
+                result
+            }
+            futures::future::Either::Right(_) => break,
+        };
+        match result {
             Ok(0) => {
                 exhausted = true;
                 break;
@@ -167,12 +201,24 @@ async fn classify_response(response: &mut Response<AsyncBody>) -> Option<GrokBlo
         }
     }
     let reason = if exhausted {
-        serde_json::from_slice::<ErrorCodeBody>(&prefix)
-            .ok()
-            .and_then(|value| value.code)
-            .filter(|code| code.contains("spending-limit"))
-            .map(|_| GrokBlockReason::SpendingLimit)
-            .or(fallback)
+        let code = if host == "api.x.ai" {
+            serde_json::from_slice::<CodeBody>(&prefix)
+                .ok()
+                .and_then(|value| value.code)
+        } else {
+            serde_json::from_slice::<NestedCodeBody>(&prefix)
+                .ok()
+                .and_then(|value| value.error)
+                .and_then(|error| error.code)
+        };
+        code.filter(|code| match host {
+            "api.x.ai" => code.contains("spending-limit"),
+            "api.openai.com" => code == "insufficient_quota",
+            "api.anthropic.com" => code == "credit_balance_too_low",
+            _ => false,
+        })
+        .map(|_| GrokBlockReason::SpendingLimit)
+        .or(fallback)
     } else {
         fallback
     };
@@ -180,26 +226,42 @@ async fn classify_response(response: &mut Response<AsyncBody>) -> Option<GrokBlo
     reason
 }
 
-fn is_xai_host(request: &Request<AsyncBody>) -> bool {
+fn trusted_host(request: &Request<AsyncBody>) -> Option<&str> {
     let uri = request.uri();
-    uri.scheme_str() == Some("https")
-        && uri.host() == Some("api.x.ai")
-        && uri.port_u16().is_none_or(|port| port == 443)
+    if uri.scheme_str() != Some("https") || !uri.port_u16().is_none_or(|port| port == 443) {
+        return None;
+    }
+    uri.host()
+        .filter(|host| matches!(*host, "api.x.ai" | "api.anthropic.com" | "api.openai.com"))
 }
 
+fn provider_label(host: &str) -> &str {
+    match host {
+        "api.x.ai" => "xAI",
+        "api.anthropic.com" => "Anthropic",
+        "api.openai.com" => "OpenAI",
+        _ => host,
+    }
+}
+#[cfg(test)]
+fn is_xai_host(request: &Request<AsyncBody>) -> bool {
+    trusted_host(request) == Some("api.x.ai")
+}
 fn inference_endpoint(request: &Request<AsyncBody>) -> Option<&str> {
-    let uri = request.uri();
+    let host = trusted_host(request)?;
     (request.method() == http_client::Method::POST
-        && is_xai_host(request)
-        && matches!(
-            uri.path(),
-            "/v1/chat/completions"
-                | "/v1//chat/completions"
-                | "/v1/completions"
-                | "/v1/responses"
-                | "/v1/embeddings"
-        ))
-    .then_some(uri.path())
+        && match host {
+            "api.anthropic.com" => request.uri().path() == "/v1/messages",
+            _ => matches!(
+                request.uri().path(),
+                "/v1/chat/completions"
+                    | "/v1//chat/completions"
+                    | "/v1/completions"
+                    | "/v1/responses"
+                    | "/v1/embeddings"
+            ),
+        })
+    .then_some(request.uri().path())
 }
 
 fn absolute_date(text: &str) -> Option<Timestamp> {
@@ -222,7 +284,51 @@ fn retry_after(headers: &http_client::http::HeaderMap, now: Timestamp) -> Option
         .or_else(|| absolute_date(text))
 }
 
+#[cfg(test)]
 fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) -> Vec<WindowPatch> {
+    parse_dialect(
+        headers,
+        scope,
+        endpoint,
+        "api.x.ai",
+        chrono::Utc::now().timestamp(),
+    )
+}
+fn duration_reset(text: &str, now: Timestamp) -> Option<Timestamp> {
+    if text.len() > 64 || text.is_empty() {
+        return None;
+    }
+    let mut rest = text;
+    let mut seconds = 0.0;
+    while !rest.is_empty() {
+        let end = rest.find(|character: char| !character.is_ascii_digit() && character != '.')?;
+        let value = rest.get(..end)?.parse::<f64>().ok()?;
+        rest = rest.get(end..)?;
+        let (unit, scale) = if rest.starts_with("ms") {
+            (2, 0.001)
+        } else if rest.starts_with('s') {
+            (1, 1.0)
+        } else if rest.starts_with('m') {
+            (1, 60.0)
+        } else if rest.starts_with('h') {
+            (1, 3600.0)
+        } else {
+            return None;
+        };
+        seconds += value * scale;
+        rest = rest.get(unit..)?;
+    }
+    (seconds.is_finite() && seconds >= 0.0 && seconds < i64::MAX as f64)
+        .then(|| now.checked_add(seconds.ceil() as i64))
+        .flatten()
+}
+fn parse_dialect(
+    headers: &http_client::http::HeaderMap,
+    scope: &str,
+    endpoint: &str,
+    host: &str,
+    now: Timestamp,
+) -> Vec<WindowPatch> {
     let number = |name: &str| {
         let text = headers.get(name)?.to_str().ok()?;
         if text.len() > 32 {
@@ -231,12 +337,20 @@ fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) ->
         let value = text.parse::<f64>().ok()?;
         (value.is_finite() && value >= 0.0).then_some(value)
     };
-    ["requests", "tokens"]
+    ["requests", "tokens", "input-tokens", "output-tokens"]
         .into_iter()
+        .filter(|dimension| host == "api.anthropic.com" || !dimension.contains('-'))
         .map(|dimension| {
-            let limit = number(&format!("x-ratelimit-limit-{dimension}"));
-            let remaining = number(&format!("x-ratelimit-remaining-{dimension}"));
-            let unit = if dimension == "tokens" {
+            let header = |field: &str| {
+                if host == "api.anthropic.com" {
+                    format!("anthropic-ratelimit-{dimension}-{field}")
+                } else {
+                    format!("x-ratelimit-{field}-{dimension}")
+                }
+            };
+            let limit = number(&header("limit"));
+            let remaining = number(&header("remaining"));
+            let unit = if dimension.ends_with("tokens") {
                 Unit::Tokens
             } else {
                 Unit::Requests
@@ -245,9 +359,10 @@ fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) ->
                 key: WindowKey {
                     bucket: BucketKey {
                         scope: scope.into(),
-                        bucket: format!("xai{endpoint}/{dimension}"),
+                        bucket: format!("{host}{endpoint}/{dimension}"),
                         applicability: Applicability::Family(format!(
-                            "Latest xAI response · Model unverified ({endpoint})"
+                            "Latest {} API response · Model unverified ({endpoint})",
+                            provider_label(host)
                         )),
                     },
                     role: dimension.into(),
@@ -267,9 +382,15 @@ fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) ->
                 // Only absolute dates are unambiguous; unknown bucket-relative formats stay unknown.
                 reset_at: Patch::Set(
                     headers
-                        .get(format!("x-ratelimit-reset-{dimension}"))
+                        .get(header("reset"))
                         .and_then(|value| value.to_str().ok())
-                        .and_then(absolute_date),
+                        .and_then(|text| {
+                            if host == "api.openai.com" {
+                                duration_reset(text, now)
+                            } else {
+                                absolute_date(text)
+                            }
+                        }),
                 ),
                 admission: Patch::Set(Admission::Unknown),
                 disabled: Patch::Missing,
@@ -289,7 +410,7 @@ pub fn install_http_observer(cx: &mut App) {
     }
     log::info!("crew_quota: http_observer=Installed");
     let (sender, receiver) = async_channel::bounded(128);
-    let target = Arc::new(Mutex::new(None));
+    let target = Arc::new(Mutex::new(BTreeMap::new()));
     let inner = cx.http_client();
     cx.set_http_client(Arc::new(Observer {
         inner,
@@ -303,35 +424,32 @@ pub fn install_http_observer(cx: &mut App) {
     });
 }
 
-#[cfg(test)]
-fn capture_allowed(present: bool, supported: bool, supergrok: bool) -> bool {
-    present && supported && !supergrok
-}
-
 pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
     if cx.try_global::<Bridge>().is_none() {
         return;
     }
     super::native::sync(service, cx);
     if let Some(bridge) = cx.try_global::<Bridge>() {
+        let service = service.read(cx);
         let target = service
-            .read(cx)
-            .core
-            .snapshot
-            .accounts
+            .native_inventory
             .values()
-            .find(|account| {
-                account.scope.native_provider_id.as_deref() == Some("x_ai")
-                    && account
-                        .metadata
-                        .native_provider
-                        .as_ref()
-                        .is_some_and(|info| info.kind == NativeProviderKind::Passive)
+            .filter_map(|candidate| {
+                let host = candidate.capture_host?;
+                let account = service
+                    .core
+                    .snapshot
+                    .accounts
+                    .get(&format!("llm-provider:{}", candidate.id))?;
+                Some((
+                    host.to_owned(),
+                    Target {
+                        scope: account.scope.id.clone(),
+                        generation: account.generation,
+                    },
+                ))
             })
-            .map(|account| Target {
-                scope: account.scope.id.clone(),
-                generation: account.generation,
-            });
+            .collect();
         match bridge.target.lock() {
             Ok(mut current) => *current = target,
             Err(_) => log::warn!("crew_quota: native_targets outcome=LockFailed"),
@@ -435,6 +553,15 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
                         let scope = observation.scope.clone();
                         let generation = observation.generation;
                         log::info!("crew_quota: agent=Grok source=Headers outcome=Received");
+                        if validate_observation(&observation, service.ports.clock.now()).is_err() {
+                            log::warn!("crew_quota: native_observation_invalid");
+                            return;
+                        }
+                        if let Some(account) = service.core.snapshot.accounts.get_mut(&scope)
+                            && account.generation == generation
+                        {
+                            account.windows.clear();
+                        }
                         if service.observe(observation, cx).is_err() {
                             log::warn!("crew_quota: xai_observation_invalid");
                         }
@@ -460,8 +587,202 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::AsyncReadExt as _;
+    use futures::{AsyncReadExt as _, StreamExt as _};
     use settings::Settings;
+
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "Exercises the transport wall-clock deadline without GPUI scheduling."
+    )]
+    fn provider_errors_replay_bytes_and_slow_tails() -> anyhow::Result<()> {
+        smol::block_on(async {
+            for (status, host, bytes, expected) in [
+                (
+                    400u16,
+                    "api.openai.com",
+                    r#"{"error":{"code":"insufficient_quota","message":"private"}}"#,
+                    Some(GrokBlockReason::SpendingLimit),
+                ),
+                (
+                    429,
+                    "api.openai.com",
+                    r#"{"error":{"code":"insufficient_quota","message":"private"}}"#,
+                    Some(GrokBlockReason::SpendingLimit),
+                ),
+                (
+                    400,
+                    "api.anthropic.com",
+                    r#"{"error":{"code":"credit_balance_too_low"}}"#,
+                    Some(GrokBlockReason::SpendingLimit),
+                ),
+                (
+                    403,
+                    "api.x.ai",
+                    r#"{"code":"new-org-blocked:spending-limit"}"#,
+                    Some(GrokBlockReason::SpendingLimit),
+                ),
+                (
+                    400,
+                    "api.openai.com",
+                    r#"{"error":{"code":"unknown","message":"insufficient_quota"}}"#,
+                    None,
+                ),
+                (
+                    400,
+                    "api.x.ai",
+                    r#"{"error":{"code":"insufficient_quota"}}"#,
+                    None,
+                ),
+            ] {
+                let mut response = Response::builder()
+                    .status(status)
+                    .body(AsyncBody::from(bytes))?;
+                assert_eq!(classify_response(&mut response, host).await, expected);
+                let mut forwarded = String::new();
+                response.body_mut().read_to_string(&mut forwarded).await?;
+                assert_eq!(forwarded, bytes);
+            }
+            use futures::TryStreamExt as _;
+            let chunks =
+                futures::stream::once(async { Ok::<_, std::io::Error>(b"prefix".to_vec()) }).chain(
+                    futures::stream::once(async {
+                        smol::Timer::after(Duration::from_millis(150)).await;
+                        Ok::<_, std::io::Error>(b"tail".to_vec())
+                    }),
+                );
+            let mut response = Response::builder()
+                .status(429)
+                .body(AsyncBody::from_reader(chunks.into_async_read()))?;
+            assert_eq!(
+                classify_response(&mut response, "api.openai.com").await,
+                Some(GrokBlockReason::RateLimited)
+            );
+            let mut bytes = String::new();
+            response.body_mut().read_to_string(&mut bytes).await?;
+            assert_eq!(bytes, "prefixtail");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn native_dialects_and_exact_endpoints() -> anyhow::Result<()> {
+        assert_eq!(duration_reset("1h2m3.5s", 100), Some(3824));
+        for value in ["NaN", "-1s", "1", "1d", "infms"] {
+            assert_eq!(duration_reset(value, 100), None);
+        }
+        let reset_at = |window: &WindowPatch| match window.reset_at {
+            Patch::Set(value) => value,
+            Patch::Missing => None,
+        };
+        let mut headers = http_client::http::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-requests-limit",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-remaining",
+            HeaderValue::from_static("80"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-reset",
+            HeaderValue::from_static("2026-11-05T12:00:00Z"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-input-tokens-limit",
+            HeaderValue::from_static("1000"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-input-tokens-remaining",
+            HeaderValue::from_static("900"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-output-tokens-limit",
+            HeaderValue::from_static("500"),
+        );
+        let windows = parse_dialect(&headers, "test", "/v1/messages", "api.anthropic.com", 100);
+        assert_eq!(windows.len(), 3);
+        let requests = windows
+            .iter()
+            .find(|window| window.key.role == "requests")
+            .expect("requests dimension");
+        assert_eq!(
+            reset_at(requests),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-05T12:00:00Z")
+                    .expect("reset")
+                    .timestamp()
+            )
+        );
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.key.role == "input-tokens")
+        );
+        assert!(!windows.iter().any(|window| window.key.role == "tokens"));
+
+        let mut headers = http_client::http::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-limit-requests",
+            HeaderValue::from_static("100"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("80"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("6m0s"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-tokens",
+            HeaderValue::from_static("nonsense"),
+        );
+        let windows = parse_dialect(&headers, "test", "/v1/responses", "api.openai.com", 100);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(reset_at(&windows[0]), Some(460));
+        assert!(windows.iter().all(|window| {
+            window.key.bucket.applicability.eq(&Applicability::Family(
+                "Latest OpenAI API response · Model unverified (/v1/responses)".into(),
+            ))
+        }));
+
+        for (host, path, prefix) in [
+            (
+                "api.anthropic.com",
+                "/v1/messages",
+                "anthropic-ratelimit-requests-limit",
+            ),
+            (
+                "api.openai.com",
+                "/v1/responses",
+                "x-ratelimit-limit-requests",
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("https://{host}{path}"))
+                .body(AsyncBody::empty())?;
+            assert!(inference_endpoint(&request).is_some());
+            let mut headers = http_client::http::HeaderMap::new();
+            headers.insert(prefix, HeaderValue::from_static("100"));
+            assert_eq!(parse_dialect(&headers, "test", path, host, 100).len(), 1);
+        }
+        for uri in [
+            "https://api.openai.com.evil/v1/responses",
+            "https://api.openai.com:444/v1/responses",
+            "https://api.anthropic.com/v1/messages/extra",
+            "https://api.anthropic.com/v1/chat/completions",
+            "http://api.openai.com/v1/responses",
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(AsyncBody::empty())?;
+            assert!(inference_endpoint(&request).is_none());
+        }
+        Ok(())
+    }
 
     #[test]
     fn non_xai_errors_are_untouched() -> anyhow::Result<()> {
@@ -475,10 +796,13 @@ mod tests {
             let observer = Observer {
                 inner,
                 sender,
-                target: Arc::new(Mutex::new(Some(Target {
-                    scope: "test".into(),
-                    generation: 0,
-                }))),
+                target: Arc::new(Mutex::new(BTreeMap::from([(
+                    "api.x.ai".into(),
+                    Target {
+                        scope: "test".into(),
+                        generation: 0,
+                    },
+                )]))),
             };
             let mut response = observer
                 .send(
@@ -537,10 +861,13 @@ mod tests {
                 let observer = Observer {
                     inner,
                     sender,
-                    target: Arc::new(Mutex::new(Some(Target {
-                        scope: "test".into(),
-                        generation: 0,
-                    }))),
+                    target: Arc::new(Mutex::new(BTreeMap::from([(
+                        "api.x.ai".into(),
+                        Target {
+                            scope: "test".into(),
+                            generation: 0,
+                        },
+                    )]))),
                 };
                 let mut response = observer
                     .send(
@@ -587,7 +914,6 @@ mod tests {
                 let panel = super::super::panel::account_status(account, now);
                 if expected == Some(GrokBlockReason::SpendingLimit) {
                     assert!(panel.contains("Out of credits"));
-                    assert!(panel.contains("grok.com"));
                 }
             }
             Ok(())
@@ -626,10 +952,13 @@ mod tests {
                 cx.set_http_client(transport);
                 install_http_observer(cx);
                 let bridge = cx.global::<Bridge>();
-                *bridge.target.lock().expect("target lock") = Some(Target {
-                    scope: "test".into(),
-                    generation: 1,
-                });
+                *bridge.target.lock().expect("target lock") = BTreeMap::from([(
+                    "api.x.ai".into(),
+                    Target {
+                        scope: "test".into(),
+                        generation: 1,
+                    },
+                )]);
                 let receiver = bridge.receiver.clone();
                 let client = client::Client::production(cx);
                 cx.set_http_client(client.http_client());
@@ -679,7 +1008,7 @@ mod tests {
             let observer = Observer {
                 inner: Arc::new(http_client::BlockedHttpClient::new()),
                 sender,
-                target: Arc::new(Mutex::new(None)),
+                target: Arc::new(Mutex::new(BTreeMap::new())),
             };
             for uri in [
                 "http://localhost:8080/v1/chat/completions",
@@ -711,10 +1040,13 @@ mod tests {
             let observer = Observer {
                 inner,
                 sender,
-                target: Arc::new(Mutex::new(Some(Target {
-                    scope: "test".into(),
-                    generation: 1,
-                }))),
+                target: Arc::new(Mutex::new(BTreeMap::from([(
+                    "api.x.ai".into(),
+                    Target {
+                        scope: "test".into(),
+                        generation: 1,
+                    },
+                )]))),
             };
             let (ready_sender, ready_receiver) = oneshot::channel();
             let buffer = buffer_until_ready(
@@ -769,11 +1101,47 @@ mod tests {
     }
 
     #[test]
-    fn coexistence_fails_closed() {
-        assert!(capture_allowed(true, true, false));
-        assert!(!capture_allowed(true, true, true));
-        assert!(!capture_allowed(false, true, false));
-        assert!(!capture_allowed(true, false, false));
+    fn untargeted_hosts_forward_without_capture() -> anyhow::Result<()> {
+        smol::block_on(async {
+            for targets in [
+                BTreeMap::new(),
+                BTreeMap::from([(
+                    "api.anthropic.com".into(),
+                    Target {
+                        scope: "other".into(),
+                        generation: 0,
+                    },
+                )]),
+            ] {
+                let inner = http_client::FakeHttpClient::create(|_| async {
+                    Ok(Response::builder()
+                        .status(200)
+                        .header("x-ratelimit-limit-requests", "100")
+                        .body(AsyncBody::from("bytes"))?)
+                });
+                let (sender, receiver) = async_channel::bounded(1);
+                let observer = Observer {
+                    inner,
+                    sender,
+                    target: Arc::new(Mutex::new(targets)),
+                };
+                let mut response = observer
+                    .send(
+                        Request::builder()
+                            .method("POST")
+                            .uri("https://api.x.ai/v1/chat/completions")
+                            .body(AsyncBody::empty())?,
+                    )
+                    .await?;
+                assert_eq!(response.status(), 200);
+                assert_eq!(response.headers()["x-ratelimit-limit-requests"], "100");
+                let mut bytes = String::new();
+                response.body_mut().read_to_string(&mut bytes).await?;
+                assert_eq!(bytes, "bytes");
+                assert!(receiver.try_recv().is_err());
+            }
+            Ok(())
+        })
     }
 
     #[test]
@@ -801,10 +1169,13 @@ mod tests {
                     let observer = Observer {
                         inner,
                         sender,
-                        target: Arc::new(Mutex::new(Some(Target {
-                            scope: "xai-test".into(),
-                            generation: 0,
-                        }))),
+                        target: Arc::new(Mutex::new(BTreeMap::from([(
+                            "api.x.ai".into(),
+                            Target {
+                                scope: "xai-test".into(),
+                                generation: 0,
+                            },
+                        )]))),
                     };
                     let mut response = observer
                         .send(
@@ -834,7 +1205,7 @@ mod tests {
             let observer = Observer {
                 inner: Arc::new(http_client::BlockedHttpClient::new()),
                 sender,
-                target: Arc::new(Mutex::new(None)),
+                target: Arc::new(Mutex::new(BTreeMap::new())),
             };
             assert!(
                 observer
@@ -947,5 +1318,186 @@ mod tests {
             None
         );
         Ok(())
+    }
+
+    struct InertPorts;
+    impl Clock for InertPorts {
+        fn now(&self) -> Timestamp {
+            1000
+        }
+        fn monotonic(&self) -> u64 {
+            0
+        }
+    }
+    impl QuotaSource for InertPorts {
+        fn refresh(
+            &self,
+            _: String,
+            _: u64,
+            _: u64,
+            _: &mut App,
+        ) -> Task<Result<Observation, RefreshError>> {
+            panic!("passive capture must not refresh")
+        }
+    }
+    impl QuotaStore for InertPorts {
+        fn load(&self, _: String, _: &App) -> Task<Result<Option<String>, ErrorCode>> {
+            Task::ready(Ok(None))
+        }
+        fn save(&self, _: String, _: String, _: &App) -> Task<Result<(), ErrorCode>> {
+            Task::ready(Ok(()))
+        }
+        fn delete(&self, _: String, _: &App) -> Task<Result<(), ErrorCode>> {
+            Task::ready(Ok(()))
+        }
+    }
+
+    fn window(scope: &str, role: &str, remaining: f64) -> WindowPatch {
+        WindowPatch {
+            key: WindowKey {
+                bucket: BucketKey {
+                    scope: scope.into(),
+                    bucket: format!("api.x.ai/v1/chat/completions/{role}"),
+                    applicability: Applicability::Family("fixture".into()),
+                },
+                role: role.into(),
+                duration_seconds: None,
+            },
+            used_fraction: Patch::Missing,
+            remaining: Patch::Set(Some(Amount {
+                value: remaining,
+                unit: Unit::Tokens,
+            })),
+            limit: Patch::Set(Some(Amount {
+                value: 100.0,
+                unit: Unit::Tokens,
+            })),
+            reset_at: Patch::Missing,
+            admission: Patch::Missing,
+            disabled: Patch::Missing,
+            precision: Precision::Exact,
+        }
+    }
+
+    fn headers(scope: &str, generation: u64, windows: Vec<WindowPatch>) -> HeaderObservation {
+        HeaderObservation {
+            quota: Observation {
+                scope: scope.into(),
+                generation,
+                source: SourceKind::GrokResponseHeaders,
+                source_version: "fixture".into(),
+                observed_at: 1000,
+                provider_sample_at: None,
+                sequence: 0,
+                start_sequence: None,
+                windows,
+                complete: false,
+                metadata: AccountMetadata {
+                    grok_response: Some(GrokResponse {
+                        blocked: None,
+                        status: 200,
+                        observed_at: 1000,
+                        retry_at: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+            retry_at: None,
+        }
+    }
+
+    #[gpui::test]
+    fn latest_response_replaces_windows_atomically(cx: &mut gpui::TestAppContext) {
+        let scope = "llm-provider:x_ai";
+        let (sender, service) = cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            language_models::AllLanguageModelSettings::register(cx);
+            language_model::init(cx);
+            cx.set_http_client(Arc::new(http_client::BlockedHttpClient::new()));
+            install_http_observer(cx);
+            let service = cx.new(|cx| {
+                QuotaService::new(
+                    Ports {
+                        clock: Rc::new(InertPorts),
+                        source: Rc::new(InertPorts),
+                        store: Rc::new(InertPorts),
+                    },
+                    cx,
+                )
+            });
+            init(&service, cx);
+            service.update(cx, |service, _| {
+                service
+                    .core
+                    .inventory(
+                        AccountScope {
+                            category: crate::AccountCategory::LlmProvider,
+                            native_provider_id: Some("x_ai".into()),
+                            id: scope.into(),
+                            provider: ProviderId::LlmProvider,
+                            runtime: "native-api".into(),
+                            identity_known: false,
+                        },
+                        7,
+                        Availability::Unknown,
+                    )
+                    .expect("inventory");
+                service.finish_init(Ok(()));
+            });
+            let sender = cx.global::<Bridge>().sender.clone();
+            (sender, service)
+        });
+        cx.run_until_parked();
+        sender
+            .try_send(headers(
+                scope,
+                7,
+                vec![
+                    window(scope, "requests", 80.0),
+                    window(scope, "tokens", 40.0),
+                ],
+            ))
+            .expect("send");
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert_eq!(service.core.snapshot.accounts[scope].windows.len(), 2);
+        });
+        sender
+            .try_send(headers(scope, 7, vec![window(scope, "requests", 60.0)]))
+            .expect("send");
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            let account = &service.core.snapshot.accounts[scope];
+            assert_eq!(account.windows.len(), 1);
+            assert_eq!(
+                account
+                    .windows
+                    .values()
+                    .next()
+                    .and_then(|window| window.remaining.as_ref())
+                    .and_then(|sample| sample.value.as_ref())
+                    .map(|amount| amount.value),
+                Some(60.0)
+            );
+        });
+        sender
+            .try_send(headers(scope, 99, vec![window(scope, "tokens", 1.0)]))
+            .expect("send");
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            let account = &service.core.snapshot.accounts[scope];
+            assert_eq!(account.windows.len(), 1);
+            assert_eq!(
+                account
+                    .windows
+                    .values()
+                    .next()
+                    .and_then(|window| window.remaining.as_ref())
+                    .and_then(|sample| sample.value.as_ref())
+                    .map(|amount| amount.value),
+                Some(60.0)
+            );
+        });
     }
 }
