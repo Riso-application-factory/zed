@@ -1,8 +1,6 @@
 use super::*;
 use http_client::{AsyncBody, HttpClient, Request, Response, Url, http::HeaderValue};
-use settings::Settings;
 use std::sync::Mutex;
-use util::ResultExt as _;
 
 #[derive(Clone)]
 struct Target {
@@ -305,6 +303,7 @@ pub fn install_http_observer(cx: &mut App) {
     });
 }
 
+#[cfg(test)]
 fn capture_allowed(present: bool, supported: bool, supergrok: bool) -> bool {
     present && supported && !supergrok
 }
@@ -313,125 +312,31 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
     if cx.try_global::<Bridge>().is_none() {
         return;
     }
-    let configured = &language_models::AllLanguageModelSettings::get_global(cx)
-        .x_ai
-        .api_url;
-    let api_url = if configured.is_empty() {
-        "https://api.x.ai/v1"
-    } else {
-        configured.as_str()
-    };
-    let present = language_model::LanguageModelRegistry::read_global(cx)
-        .providers()
-        .iter()
-        .any(|provider| provider.id().0.as_ref() == "x_ai" && provider.is_authenticated(cx));
-    let supergrok = language_model::LanguageModelRegistry::read_global(cx)
-        .providers()
-        .iter()
-        .any(|provider| {
-            provider.id().0.as_ref() == "x_ai_subscribed" && provider.is_authenticated(cx)
-        });
-    use sha2::{Digest, Sha256};
-    let scope = format!(
-        "xai-{:x}",
-        Sha256::digest(format!("{api_url}/credential-present={present}"))
-    );
-    let supported = api_url.trim_end_matches('/') == "https://api.x.ai/v1";
-    let bridge = cx.global::<Bridge>().target.clone();
-    service.update(cx, |service, cx| {
-        let identity = (scope.clone(), supergrok);
-        if service.grok_identity.as_ref() == Some(&identity) {
-            return;
-        }
-        service.grok_identity = Some(identity);
-        let old = service
+    super::native::sync(service, cx);
+    if let Some(bridge) = cx.try_global::<Bridge>() {
+        let target = service
+            .read(cx)
             .core
             .snapshot
             .accounts
             .values()
-            .find(|account| account.scope.provider == ProviderId::Grok)
-            .map(|account| (account.scope.id.clone(), account.generation));
-        let generation = old
-            .as_ref()
-            .map_or(0, |(_, generation)| generation.saturating_add(1));
-        if old.as_ref().is_some_and(|(previous, _)| previous != &scope) {
-            if let Some((previous, _)) = &old {
-                service.remove_scope(previous, cx);
-            }
-        }
-        if service
-            .core
-            .inventory(
-                AccountScope {
-                    category: crate::AccountCategory::LlmProvider,
-                    native_provider_id: Some("x_ai".into()),
-                    id: scope.clone(),
-                    provider: ProviderId::Grok,
-                    runtime: "native-xai".into(),
-                    identity_known: false,
-                },
-                generation,
-                if !present {
-                    Availability::NotLoggedIn
-                } else if supergrok {
-                    Availability::Unavailable(ErrorCode::AttributionAmbiguous)
-                } else if supported {
-                    Availability::Unknown
-                } else {
-                    Availability::Unsupported(ErrorCode::Unknown)
-                },
-            )
-            .is_err()
-        {
-            log::warn!("crew_quota: xai_inventory_invalid");
-        }
-        if let Ok(mut target) = bridge.lock() {
-            *target = capture_allowed(present, supported, supergrok).then_some(Target {
-                scope: scope.clone(),
-                generation,
+            .find(|account| {
+                account.scope.native_provider_id.as_deref() == Some("x_ai")
+                    && account
+                        .metadata
+                        .native_provider
+                        .as_ref()
+                        .is_some_and(|info| info.kind == NativeProviderKind::Passive)
+            })
+            .map(|account| Target {
+                scope: account.scope.id.clone(),
+                generation: account.generation,
             });
+        match bridge.target.lock() {
+            Ok(mut current) => *current = target,
+            Err(_) => log::warn!("crew_quota: native_targets outcome=LockFailed"),
         }
-        if capture_allowed(present, supported, supergrok) {
-            let load = service.ports.store.load(format!("snapshot/{scope}"), cx);
-            cx.spawn({
-                let scope = scope.clone();
-                async move |this, cx| {
-                    let result = load.await;
-                    this.update(cx, |service, cx| {
-                        match result {
-                            Ok(Some(record)) => {
-                                if let Some(account) = service.core.snapshot.accounts.get_mut(&scope)
-                                    && account.generation == generation && account.windows.is_empty() && account.metadata.grok_response.is_none()
-                                {
-                                    match decode_record(&record, &account.scope, service.ports.clock.now()) {
-                                        Ok(record) => {
-                                            account.windows = record.account.windows;
-                                            account.metadata.grok_response = record.account.metadata.grok_response;
-                                            account.last_success_at = record.account.last_success_at;
-                                            account.availability = Availability::Ready;
-                                            service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
-                                            log::info!("crew_quota: agent=Grok source=Cache outcome=RestoredUnverified");
-                                            cx.notify();
-                                        }
-                                        Err(code) => log::info!("crew_quota: agent=Grok source=Cache outcome={code:?}"),
-                                    }
-                                }
-                            }
-                            Err(code) => log::info!("crew_quota: agent=Grok source=Cache outcome={code:?}"),
-                            Ok(None) => log::info!("crew_quota: agent=Grok source=Cache outcome=Empty"),
-                        }
-                    }).log_err();
-                }
-            }).detach();
-        }
-        cx.emit(QuotaEvent::AvailabilityChanged(scope.clone()));
-        cx.emit(QuotaEvent::Changed {
-            scopes: vec![scope],
-            windows: Vec::new(),
-            revision: service.core.snapshot.revision,
-        });
-        cx.notify();
-    });
+    }
 }
 
 async fn buffer_until_ready(
@@ -469,10 +374,18 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
     }
     sync(service, cx);
     let registry = language_model::LanguageModelRegistry::global(cx);
-    let subscription = cx.observe(&registry, {
+    let subscription = cx.subscribe(&registry, {
         let service = service.downgrade();
-        move |_, cx| {
-            if let Some(service) = service.upgrade() {
+        move |_, event, cx| {
+            if matches!(
+                event,
+                language_model::Event::ProviderStateChanged(_)
+                    | language_model::Event::AddedProvider(_)
+                    | language_model::Event::RemovedProvider(_)
+                    | language_model::Event::ProvidersChanged
+            ) && let Some(service) = service.upgrade()
+            {
+                service.update(cx, |service, _| service.native_inventory.clear());
                 sync(&service, cx);
             }
         }
@@ -548,6 +461,7 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
 mod tests {
     use super::*;
     use futures::AsyncReadExt as _;
+    use settings::Settings;
 
     #[test]
     fn non_xai_errors_are_untouched() -> anyhow::Result<()> {

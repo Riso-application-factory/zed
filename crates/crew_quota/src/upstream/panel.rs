@@ -895,6 +895,7 @@ impl Render for QuotaPanel {
                 ProviderId::Codex => ("Codex", IconName::AiOpenAi),
                 ProviderId::Antigravity => ("Antigravity", IconName::AiGemini),
                 ProviderId::Grok => ("Grok", IconName::AiXAi),
+                ProviderId::LlmProvider => ("LLM Provider", IconName::ZedAssistant),
             };
             let provider_id = row.provider;
             let expanded = !preferences.collapsed.contains(&provider_id);

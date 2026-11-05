@@ -147,6 +147,7 @@ fn tooltip_text(account: &AccountState, now: Timestamp) -> String {
         ProviderId::Codex => "Codex",
         ProviderId::Antigravity => "Antigravity",
         ProviderId::Grok => "Grok",
+        ProviderId::LlmProvider => "LLM Provider",
     };
     let mut lines = vec![name.to_string()];
     for window in visible_windows(account) {

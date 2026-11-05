@@ -157,6 +157,7 @@ impl QuotaCore {
         if observation.sequence >= account.sequence {
             macro_rules! metadata { ($($field:ident),*) => { $(if observation.metadata.$field.is_some() { account.metadata.$field = observation.metadata.$field; })* }; }
             metadata!(
+                native_provider,
                 grok_response,
                 plan,
                 ordinary_usage_allowed,

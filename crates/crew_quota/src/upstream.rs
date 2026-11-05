@@ -1,6 +1,7 @@
 mod antigravity;
 mod claude;
 mod grok;
+mod native;
 pub use grok::install_http_observer;
 mod panel;
 mod providers;
@@ -151,7 +152,8 @@ pub struct QuotaService {
     inventory_refresh: Option<Shared<Task<()>>>,
     codex_installation: Option<&'static str>,
     grok_task: Option<Task<()>>,
-    grok_identity: Option<(String, bool)>,
+    native_inventory: BTreeMap<String, native::Candidate>,
+    native_generation: u64,
     claude: claude::ClaudeState,
     antigravity_inventory: Option<Task<()>>,
     antigravity_identity: Option<(Vec<String>, Availability)>,
@@ -250,7 +252,8 @@ impl QuotaService {
             inventory_refresh: None,
             codex_installation: None,
             grok_task: None,
-            grok_identity: None,
+            native_inventory: BTreeMap::new(),
+            native_generation: 0,
             claude: Default::default(),
             antigravity_inventory: None,
             antigravity_identity: None,
@@ -317,7 +320,9 @@ impl QuotaService {
             Err(_) => {}
         }
         if self.core.snapshot.accounts.values().any(|account| {
-            request.selector.matches(&account.scope) && account.scope.provider == ProviderId::Grok
+            request.selector.matches(&account.scope)
+                && (account.scope.category == AccountCategory::LlmProvider
+                    || account.scope.provider == ProviderId::Grok)
         }) {
             return Task::ready(Err(RefreshError::NotRefreshable));
         }

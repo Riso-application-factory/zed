@@ -12,6 +12,7 @@ pub enum ProviderId {
     Codex,
     Antigravity,
     Grok,
+    LlmProvider,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -326,8 +327,26 @@ pub struct GrokResponse {
     pub retry_at: Option<Timestamp>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeProviderKind {
+    Passive,
+    Local,
+    Unavailable,
+    CustomEndpoint,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeProviderInfo {
+    pub name: String,
+    pub kind: NativeProviderKind,
+    pub order: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountMetadata {
+    #[serde(default)]
+    pub native_provider: Option<NativeProviderInfo>,
     #[serde(default)]
     pub grok_response: Option<GrokResponse>,
     pub plan: Option<PlanInfo>,

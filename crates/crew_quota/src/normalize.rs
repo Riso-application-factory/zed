@@ -59,6 +59,11 @@ pub fn validate_observation(observation: &Observation, now: Timestamp) -> Result
             .is_some_and(|time| time > now.saturating_add(300))
         || observation
             .metadata
+            .native_provider
+            .as_ref()
+            .is_some_and(|info| !valid_text(&info.name, 256) || info.order > MAX_SCOPES)
+        || observation
+            .metadata
             .plan
             .as_ref()
             .is_some_and(|plan| !valid_text(&plan.name, 256))
@@ -146,6 +151,12 @@ pub fn decode_record(
             .source_version
             .as_ref()
             .is_some_and(|version| !valid_text(version, 256))
+        || record
+            .account
+            .metadata
+            .native_provider
+            .as_ref()
+            .is_some_and(|info| !valid_text(&info.name, 256) || info.order > MAX_SCOPES)
         || record.account.metadata.plan.as_ref().is_some_and(|plan| {
             !valid_text(&plan.name, 256) || plan.observed_at > now.saturating_add(300)
         })
