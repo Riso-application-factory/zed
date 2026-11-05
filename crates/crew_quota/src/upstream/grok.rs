@@ -36,19 +36,20 @@ impl HttpClient for Observer {
         &self,
         request: Request<AsyncBody>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        if !is_xai_host(&request) {
+            return self.inner.send(request);
+        }
         let endpoint = inference_endpoint(&request).map(str::to_owned);
+        if endpoint.is_none() {
+            log::info!("crew_quota: agent=Grok source=Headers outcome=Unmatched path_kind=Other");
+            return self.inner.send(request);
+        }
         let target = endpoint
             .as_ref()
             .and_then(|_| self.target.try_lock().ok()?.clone());
-        if endpoint.is_some() {
-            log::info!(
-                "crew_quota: agent=Grok source=Headers outcome={}",
-                if target.is_some() {
-                    "Eligible"
-                } else {
-                    "Gated"
-                }
-            );
+        log::info!("crew_quota: agent=Grok source=Headers outcome=Eligible");
+        if target.is_none() {
+            log::info!("crew_quota: agent=Grok source=Headers outcome=Gated");
         }
         let future = self.inner.send(request);
         let sender = self.sender.clone();
@@ -96,12 +97,17 @@ impl HttpClient for Observer {
     }
 }
 
+fn is_xai_host(request: &Request<AsyncBody>) -> bool {
+    let uri = request.uri();
+    uri.scheme_str() == Some("https")
+        && uri.host() == Some("api.x.ai")
+        && uri.port_u16().is_none_or(|port| port == 443)
+}
+
 fn inference_endpoint(request: &Request<AsyncBody>) -> Option<&str> {
     let uri = request.uri();
     (request.method() == http_client::Method::POST
-        && uri.scheme_str() == Some("https")
-        && uri.host() == Some("api.x.ai")
-        && uri.port_u16().is_none_or(|port| port == 443)
+        && is_xai_host(request)
         && matches!(
             uri.path(),
             "/v1/chat/completions"
@@ -195,6 +201,10 @@ fn parse(headers: &http_client::http::HeaderMap, scope: &str, endpoint: &str) ->
 }
 
 pub fn install_http_observer(cx: &mut App) {
+    if cx.has_global::<Bridge>() {
+        return;
+    }
+    log::info!("crew_quota: http_observer=Installed");
     let (sender, receiver) = async_channel::bounded(128);
     let target = Arc::new(Mutex::new(None));
     let inner = cx.http_client();
@@ -449,6 +459,112 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
 mod tests {
     use super::*;
     use futures::AsyncReadExt as _;
+
+    #[gpui::test]
+    async fn native_grok_43_thinking_stream_observes_headers(cx: &mut gpui::TestAppContext) {
+        async {
+            use futures::{StreamExt as _, TryStreamExt as _};
+            use language_model::{
+                LanguageModelClient, LanguageModelProvider, LanguageModelRequest,
+            };
+            let transport = http_client::FakeHttpClient::create(|mut request| async move {
+                assert_eq!(request.uri(), "https://api.x.ai/v1/chat/completions");
+                let mut body = String::new();
+                request.body_mut().read_to_string(&mut body).await?;
+                let body: serde_json::Value = serde_json::from_str(&body)?;
+                assert_eq!(body["model"], "grok-4.3");
+                assert_eq!(body["reasoning_effort"], "low");
+                assert_eq!(body["stream"], true);
+                let chunks = futures::stream::iter([
+                    Ok::<_, std::io::Error>(b"data: [DO".to_vec()),
+                    Ok(b"NE]\n\n".to_vec()),
+                ]);
+                Ok(Response::builder()
+                    .header("x-ratelimit-limit-requests", "100")
+                    .header("x-ratelimit-remaining-requests", "80")
+                    .body(AsyncBody::from_reader(chunks.into_async_read()))?)
+            });
+            let (provider, receiver) = cx.update(|cx| {
+                let settings = settings::SettingsStore::test(cx);
+                cx.set_global(settings);
+                language_models::AllLanguageModelSettings::register(cx);
+                cx.set_http_client(transport);
+                install_http_observer(cx);
+                let bridge = cx.global::<Bridge>();
+                *bridge.target.lock().expect("target lock") = Some(Target {
+                    scope: "test".into(),
+                    generation: 1,
+                });
+                let receiver = bridge.receiver.clone();
+                // Client::production wraps the decorated app client in HttpClientWithUrl.
+                let client = Arc::new(http_client::HttpClientWithUrl::new_url(
+                    cx.http_client(),
+                    "https://zed.dev",
+                    None,
+                ));
+                let provider = language_models::provider::x_ai::XAiLanguageModelProvider::new(
+                    client,
+                    Arc::new(
+                        credentials_provider::test_support::FakeCredentialsProvider::default(),
+                    ),
+                    cx,
+                );
+                (provider, receiver)
+            });
+            let store = cx.update(|cx| provider.set_api_key(Some("fixture-only".into()), cx));
+            store.await?;
+            let model = cx.update(|cx| {
+                provider
+                    .provided_models(cx)
+                    .into_iter()
+                    .find(|model| model.id.0.as_ref() == "grok-4.3")
+                    .expect("Grok 4.3")
+            });
+            for _ in 0..2 {
+                let request = LanguageModelRequest {
+                    thinking_allowed: true,
+                    thinking_effort: Some("low".into()),
+                    ..Default::default()
+                };
+                let mut stream = provider
+                    .stream_completion(&model, request, &cx.to_async())
+                    .await?;
+                assert!(receiver.try_recv().is_ok());
+                while let Some(event) = stream.next().await {
+                    event?;
+                }
+                assert!(receiver.try_recv().is_err());
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await
+        .expect("native streaming request");
+    }
+
+    #[test]
+    fn other_host_errors_bypass_grok_observation() -> anyhow::Result<()> {
+        smol::block_on(async {
+            let (sender, receiver) = async_channel::bounded(1);
+            let observer = Observer {
+                inner: Arc::new(http_client::BlockedHttpClient::new()),
+                sender,
+                target: Arc::new(Mutex::new(None)),
+            };
+            for uri in [
+                "http://localhost:8080/v1/chat/completions",
+                "https://example.com/v1/chat/completions",
+            ] {
+                let request = Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(AsyncBody::empty())?;
+                assert!(!is_xai_host(&request));
+                assert!(observer.send(request).await.is_err());
+                assert!(receiver.try_recv().is_err());
+            }
+            Ok(())
+        })
+    }
 
     #[test]
     fn fake_streaming_startup_coalesces_and_restart_restores_unverified_age() -> anyhow::Result<()>

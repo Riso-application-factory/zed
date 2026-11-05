@@ -4199,6 +4199,7 @@ dependencies = [
  "async-channel 2.5.0",
  "async-process",
  "chrono",
+ "credentials_provider",
  "db",
  "fs",
  "futures 0.3.34",
