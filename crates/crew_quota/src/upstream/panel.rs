@@ -256,6 +256,7 @@ impl QuotaPanel {
         .aria_expanded(!collapsed)
         .child(
             h_flex()
+                .w_full()
                 .gap_2()
                 .child(
                     Icon::new(if collapsed {
@@ -936,6 +937,14 @@ fn badge(label: impl Into<SharedString>, color: Color, cx: &App) -> impl IntoEle
     )
 }
 
+fn amount_number(unit: &Unit, value: f64) -> String {
+    if matches!(unit, Unit::Requests | Unit::Tokens) {
+        grouped_number(value)
+    } else {
+        format!("{value}")
+    }
+}
+
 fn amount_text(window: &QuotaWindow) -> Option<String> {
     let remaining = window.remaining.as_ref()?.value.as_ref()?;
     if !remaining.value.is_finite() {
@@ -947,14 +956,7 @@ fn amount_text(window: &QuotaWindow) -> Option<String> {
         Unit::UnspecifiedUnits => "units".into(),
         unit => format!("{unit:?}"),
     };
-    let numeric_value = |value| {
-        if matches!(remaining.unit, Unit::Requests | Unit::Tokens) {
-            grouped_number(value)
-        } else {
-            format!("{value}")
-        }
-    };
-    let remaining_value = numeric_value(remaining.value);
+    let remaining_value = amount_number(&remaining.unit, remaining.value);
     let limit = window
         .limit
         .as_ref()
@@ -963,11 +965,103 @@ fn amount_text(window: &QuotaWindow) -> Option<String> {
     Some(if let Some(limit) = limit {
         format!(
             "{remaining_value} / {} {unit} left",
-            numeric_value(limit.value)
+            amount_number(&limit.unit, limit.value)
         )
     } else {
         format!("{remaining_value} {unit} left")
     })
+}
+
+fn short_amount_text(window: &QuotaWindow) -> Option<String> {
+    let remaining = window.remaining.as_ref()?.value.as_ref()?;
+    if !matches!(remaining.unit, Unit::Requests | Unit::Tokens) || !remaining.value.is_finite() {
+        return None;
+    }
+    let remaining_value = amount_number(&remaining.unit, remaining.value);
+    let limit = window
+        .limit
+        .as_ref()
+        .and_then(|sample| sample.value.as_ref())
+        .filter(|limit| limit.unit == remaining.unit && limit.value.is_finite());
+    Some(if let Some(limit) = limit {
+        format!(
+            "{remaining_value} / {} left",
+            amount_number(&limit.unit, limit.value)
+        )
+    } else {
+        format!("{remaining_value} left")
+    })
+}
+
+fn native_window_title(window: &QuotaWindow) -> String {
+    match window.key.role.as_str() {
+        "requests" => "Requests",
+        "tokens" => "Tokens",
+        "input-tokens" => "Input tokens",
+        "output-tokens" => "Output tokens",
+        _ => "Quota",
+    }
+    .to_string()
+}
+
+fn dedupe_status<'a>(name: &str, status: &'a str) -> &'a str {
+    match status.strip_prefix(name) {
+        Some("") => "",
+        Some(rest) => rest.strip_prefix(" · ").unwrap_or(status),
+        None => status,
+    }
+}
+
+fn quota_window_section(
+    title: String,
+    value: String,
+    quota_window: &QuotaWindow,
+    show_used: bool,
+    show_reset: bool,
+    now: Timestamp,
+    cx: &App,
+) -> Div {
+    let used = used_fraction(quota_window);
+    let mut section = v_flex().gap_1().child(
+        h_flex()
+            .justify_between()
+            .gap_2()
+            .child(Label::new(title).size(LabelSize::Small))
+            .child(
+                Label::new(value)
+                    .size(LabelSize::Small)
+                    .color(used.map(severity).unwrap_or(Color::Muted)),
+            ),
+    );
+    if let Some(used) = used {
+        section = section.child(
+            div()
+                .w_full()
+                .h(px(6.))
+                .rounded_full()
+                .bg(cx.theme().colors().element_background)
+                .child(
+                    div()
+                        .h_full()
+                        .rounded_full()
+                        .w(relative(display_fraction(used, show_used) as f32))
+                        .bg(severity(used).color(cx)),
+                ),
+        );
+    }
+    if show_reset
+        && let Some(reset) = quota_window
+            .reset_at
+            .as_ref()
+            .and_then(|sample| sample.value)
+    {
+        section = section.child(
+            Label::new(countdown(Some(reset), now))
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        );
+    }
+    section
 }
 
 fn grouped_number(number: f64) -> String {
@@ -1147,52 +1241,15 @@ impl Render for QuotaPanel {
                     );
                 }
                 for (index, quota_window) in windows.iter().enumerate() {
-                    let used = used_fraction(quota_window);
-                    let mut section = v_flex().gap_1().child(
-                        h_flex()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                Label::new(window_title(account, quota_window))
-                                    .size(LabelSize::Small),
-                            )
-                            .child(
-                                Label::new(window_value(quota_window, preferences.used))
-                                    .size(LabelSize::Small)
-                                    .color(used.map(severity).unwrap_or(Color::Muted)),
-                            ),
+                    let section = quota_window_section(
+                        window_title(account, quota_window),
+                        window_value(quota_window, preferences.used),
+                        quota_window,
+                        preferences.used,
+                        provider_id != ProviderId::Grok,
+                        now,
+                        cx,
                     );
-                    if let Some(used) = used {
-                        section =
-                            section.child(
-                                div()
-                                    .w_full()
-                                    .h(px(6.))
-                                    .rounded_full()
-                                    .bg(cx.theme().colors().element_background)
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .rounded_full()
-                                            .w(relative(
-                                                display_fraction(used, preferences.used) as f32
-                                            ))
-                                            .bg(severity(used).color(cx)),
-                                    ),
-                            );
-                    }
-                    if provider_id != ProviderId::Grok
-                        && let Some(reset) = quota_window
-                            .reset_at
-                            .as_ref()
-                            .and_then(|sample| sample.value)
-                    {
-                        section = section.child(
-                            Label::new(countdown(Some(reset), now))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        );
-                    }
                     provider = provider
                         .child(section.id(format!("quota-window-{}-{index}", account.scope.id)));
                 }
@@ -1246,27 +1303,33 @@ impl Render for QuotaPanel {
                         language_model::IconOrSvg::Svg(path) => Icon::from_external_svg(path),
                     })
                     .unwrap_or_else(|| Icon::new(IconName::ZedAssistant));
-                let status = native_status(account, now);
+                let status_text = native_status(account, now);
+                let status = dedupe_status(&name, &status_text);
                 let mut provider = v_flex()
-                    .gap_1()
+                    .gap_2()
                     .pb_3()
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant);
+                let mut header = h_flex().w_full().justify_between().gap_2().child(
+                    h_flex()
+                        .gap_2()
+                        .child(icon.size(IconSize::Small))
+                        .child(Label::new(name)),
+                );
                 if preferences.compact {
                     let summary = if status.is_empty() {
-                        compact_summary(account, false, now)
+                        compact_summary(account, preferences.used, now)
                     } else {
-                        status
+                        status.to_string()
                     };
-                    provider = provider
-                        .child(Label::new(format!("{name} · {summary}")).size(LabelSize::Small));
-                } else {
-                    provider = provider.child(
-                        h_flex()
-                            .gap_2()
-                            .child(icon.size(IconSize::Small))
-                            .child(Label::new(name)),
+                    header = header.child(
+                        Label::new(summary)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     );
+                    provider = provider.child(header);
+                } else {
+                    provider = provider.child(header);
                     if !status.is_empty() {
                         provider = provider.child(
                             Label::new(status)
@@ -1275,36 +1338,38 @@ impl Render for QuotaPanel {
                         );
                     }
                     let windows = visible_windows(account);
-                    if let Some(first) = windows.first() {
-                        let provenance = match &first.key.bucket.applicability {
-                            Applicability::Family(family) => family.clone(),
-                            _ => "Latest API response · model unknown".into(),
-                        };
+                    if !windows.is_empty() {
                         provider = provider.child(
-                            Label::new(provenance)
+                            Label::new("Latest response")
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         );
                     }
-                    for quota_window in windows {
-                        if let Some(amount) = amount_text(quota_window) {
-                            provider = provider.child(Label::new(amount).size(LabelSize::Small));
-                        }
-                        if let Some(reset) = quota_window
-                            .reset_at
-                            .as_ref()
-                            .and_then(|sample| sample.value)
-                        {
-                            provider = provider.child(
-                                Label::new(countdown(Some(reset), now))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            );
-                        }
-                    }
-                    if account.last_success_at.is_some() {
+                    for (index, quota_window) in windows.iter().enumerate() {
+                        let section = quota_window_section(
+                            native_window_title(quota_window),
+                            short_amount_text(quota_window)
+                                .unwrap_or_else(|| window_value(quota_window, preferences.used)),
+                            quota_window,
+                            preferences.used,
+                            true,
+                            now,
+                            cx,
+                        );
                         provider = provider.child(
-                            Label::new(age(account.last_success_at, now))
+                            section.id(format!("quota-native-window-{}-{index}", account.scope.id)),
+                        );
+                    }
+                    let observed_at = account.last_success_at.or(account
+                        .metadata
+                        .grok_response
+                        .as_ref()
+                        .map(|response| response.observed_at));
+                    let has_observation =
+                        !windows.is_empty() || account.metadata.grok_response.is_some();
+                    if has_observation && observed_at.is_some() {
+                        provider = provider.child(
+                            Label::new(age(observed_at, now))
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted),
                         );
@@ -2074,6 +2139,50 @@ mod tests {
             .kind = NativeProviderKind::Ambiguous;
         assert!(native_status(&ambiguous, now).contains("cannot be attributed"));
         assert!(native_rows(&QuotaSnapshot::default()).is_empty());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn native_rows_dedupe_names_and_summarize_amounts_without_paths() {
+        let now = 100000;
+        let preview = preview::FixturePreview::new(now, false);
+        let rows = native_rows(&preview.snapshot);
+        let custom = rows
+            .iter()
+            .find(|account| account.scope.native_provider_id.as_deref() == Some("custom"))
+            .expect("custom endpoint fixture");
+        let name = &custom
+            .metadata
+            .native_provider
+            .as_ref()
+            .expect("native provider info")
+            .name;
+        assert_eq!(
+            dedupe_status(name, &native_status(custom, now)),
+            "no capture"
+        );
+        assert_eq!(
+            dedupe_status("Copilot", "quota not available"),
+            "quota not available"
+        );
+        assert_eq!(dedupe_status("Custom endpoint", "Custom endpoint"), "");
+        let xai = rows.first().expect("xAI fixture");
+        let windows = visible_windows(xai);
+        let titles: Vec<String> = windows
+            .iter()
+            .map(|window| native_window_title(window))
+            .collect();
+        assert_eq!(titles, ["Requests", "Tokens"]);
+        let amounts: Vec<String> = windows
+            .iter()
+            .map(|window| short_amount_text(window).expect("amount"))
+            .collect();
+        assert_eq!(amounts, ["0 / 2,000 left", "2,000,000 / 10,000,000 left"]);
+        assert!(
+            windows
+                .iter()
+                .all(|window| !native_window_title(window).contains('/'))
+        );
     }
 
     #[test]
