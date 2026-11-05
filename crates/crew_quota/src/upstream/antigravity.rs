@@ -7,7 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-const AGENT: &str = "antigravity-acp";
+pub(super) const AGENT: &str = "antigravity-acp";
 const SCOPE: &str = "antigravity-registry";
 const LIMIT: usize = 512 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);

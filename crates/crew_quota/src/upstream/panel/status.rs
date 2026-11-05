@@ -104,7 +104,7 @@ fn provider_for_thread(visible: bool, native: bool, agent: Option<&str>) -> Opti
     match agent? {
         "codex-acp" => Some(ProviderId::Codex),
         "claude-acp" => Some(ProviderId::Claude),
-        "antigravity" | "antigravity-acp" => Some(ProviderId::Antigravity),
+        "antigravity" | super::super::antigravity::AGENT => Some(ProviderId::Antigravity),
         "grok" | "grok-acp" => Some(ProviderId::Grok),
         _ => None,
     }
@@ -119,6 +119,44 @@ fn numeric_summary(account: &AccountState, used: bool) -> Option<String> {
         Availability::NotSetUp | Availability::NotLoggedIn
     ) {
         return None;
+    }
+    if account.scope.provider == ProviderId::Antigravity {
+        let mut groups = BTreeMap::<String, Vec<String>>::new();
+        for window in visible_windows(account) {
+            let value = if let Some(fraction) = used_fraction(window) {
+                format!("{:.0}%", display_fraction(fraction, used) * 100.)
+            } else if let Some(amount) = amount_text(window) {
+                amount
+            } else {
+                continue;
+            };
+            let group = window
+                .key
+                .bucket
+                .bucket
+                .strip_prefix("agy-v1/")
+                .unwrap_or(&window.key.bucket.bucket);
+            let group = match group {
+                "Claude and GPT models" | "Claude / GPT" => "Claude/GPT",
+                "Gemini Models" => "Gemini",
+                other => other,
+            };
+            let role = match window.key.duration_seconds {
+                Some(18000) => "5h",
+                Some(604800) => "Wk",
+                _ => continue,
+            };
+            groups
+                .entry(group.to_string())
+                .or_default()
+                .push(format!("{role} {value}"));
+        }
+        let summary = groups
+            .into_iter()
+            .map(|(group, windows)| format!("{group} {}", windows.join(" · ")))
+            .collect::<Vec<_>>()
+            .join(" │ ");
+        return (!summary.is_empty()).then_some(summary);
     }
     let summary = visible_windows(account)
         .iter()
@@ -225,6 +263,33 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_registry_identity_selects_provider() {
+        assert_eq!(
+            provider_for_thread(true, false, Some("antigravity-acp")),
+            Some(ProviderId::Antigravity)
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn antigravity_footer_preserves_both_groups() {
+        let preview = super::super::preview::FixturePreview::new(1000, false);
+        let account = preview
+            .snapshot
+            .accounts
+            .get("antigravity")
+            .expect("Antigravity fixture");
+        assert_eq!(
+            numeric_summary(account, false).as_deref(),
+            Some("Claude/GPT 5h 100% · Wk 11% │ Gemini 5h 99% · Wk 90%")
+        );
+        assert!(tooltip_text(account, 1000).contains("Gemini Models"));
+        let mut account = account.clone();
+        account.windows.clear();
+        assert!(numeric_summary(&account, false).is_none());
+    }
 
     #[cfg(debug_assertions)]
     #[test]

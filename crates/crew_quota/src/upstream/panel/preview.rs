@@ -78,7 +78,7 @@ impl FixturePreview {
         );
         add_window(
             &mut antigravity,
-            "Gemini Models",
+            "agy-v1/Gemini Models",
             "5h",
             Some(0.01),
             Some(now + 3 * 3600),
@@ -87,7 +87,7 @@ impl FixturePreview {
         );
         add_window(
             &mut antigravity,
-            "Gemini Models",
+            "agy-v1/Gemini Models",
             "Weekly",
             Some(0.10),
             Some(now + 4 * 86400),
@@ -96,7 +96,7 @@ impl FixturePreview {
         );
         add_window(
             &mut antigravity,
-            "Claude / GPT",
+            "agy-v1/Claude and GPT models",
             "5h",
             Some(0.),
             Some(now + 8040),
@@ -105,7 +105,7 @@ impl FixturePreview {
         );
         add_window(
             &mut antigravity,
-            "Claude / GPT",
+            "agy-v1/Claude and GPT models",
             "Weekly",
             Some(0.89),
             Some(now + 86400 + 2 * 3600),
