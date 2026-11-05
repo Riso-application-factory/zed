@@ -1,0 +1,64 @@
+[package]
+name = "crew_quota"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/crew_quota.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+language_model.workspace = true
+language_models.workspace = true
+acp_thread.workspace = true
+agent_servers.workspace = true
+agent_ui.workspace = true
+http_client.workspace = true
+async-process.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+db.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui.workspace = true
+libc.workspace = true
+log.workspace = true
+node_runtime.workspace = true
+paths.workspace = true
+project.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+settings.workspace = true
+smol.workspace = true
+ui.workspace = true
+util.workspace = true
+uuid.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+client.workspace = true
+credentials_provider = { workspace = true, features = ["test-support"] }
+remote_connection = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+theme.workspace = true
+theme_settings.workspace = true
+anyhow.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+
+[[bin]]
+name = "crew_quota_process_fixture"
+path = "tests/fixtures/process.rs"
+test = false
+bench = false

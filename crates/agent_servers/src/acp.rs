@@ -130,7 +130,11 @@ pub async fn connect(
     default_config_options: HashMap<String, settings::AgentConfigOptionValue>,
     cx: &mut AsyncApp,
 ) -> Result<Rc<dyn acp_thread::AgentConnection>> {
-    let negotiation_error = if cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>()) {
+    // Antigravity 1.4.5 selects v2 but sends legacy identity, capabilities and auth.
+    // Offer v1 directly until its wire response supports v2 (ADR-0005).
+    let negotiation_error = if agent_id.as_ref() != "antigravity-acp"
+        && cx.update(|cx| cx.has_flag::<AcpBetaFeatureFlag>())
+    {
         match AcpV2Connection::stdio(
             agent_id.clone(),
             project.clone(),
@@ -1194,9 +1198,11 @@ mod selection_tests {
         let project = Project::example([directory.path()], &mut cx.to_async()).await;
         let v1 = r#""result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"selected-v1","version":"1"}}"#;
         let v2 = r#""result":{"protocolVersion":2,"info":{"name":"selected-v2","version":"1"},"capabilities":{"session":{}}}"#;
-        for (beta, response, exit_after_response, expected, requests) in [
+        let legacy_v2 = r#""result":{"protocolVersion":2,"agentCapabilities":{},"agentInfo":{"name":"antigravity","version":"1.4.5"},"authMethods":[]}"#;
+        for (agent_id, (beta, response, exit_after_response, expected, requests)) in [
             (false, v2, false, Some(false), "1"),
             (true, v2, false, Some(true), "2"),
+            (true, legacy_v2, false, None, "2"),
             (true, v1, false, Some(false), "2 1"),
             (
                 true,
@@ -1255,7 +1261,13 @@ mod selection_tests {
                 "2",
             ),
             (true, "", true, None, "2"),
-        ] {
+        ]
+        .into_iter()
+        .map(|case| ("selection", case))
+        .chain([(
+            "antigravity-acp",
+            (true, legacy_v2, false, Some(false), "1"),
+        )]) {
             cx.update(|cx| {
                 set_beta(beta, cx);
             });
@@ -1296,7 +1308,7 @@ done
                 let project = project.clone();
                 async move |mut cx| {
                     connect(
-                        AgentId::new("selection"),
+                        AgentId::new(agent_id),
                         project,
                         command,
                         WeakEntity::new_invalid(),

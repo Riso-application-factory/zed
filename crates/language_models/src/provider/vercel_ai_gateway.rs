@@ -308,6 +308,14 @@ impl LanguageModelProvider for VercelAiGatewayLanguageModelProvider {
             .collect()
     }
 
+    fn loaded_api_key(&self, cx: &App) -> Option<String> {
+        self.state
+            .read(cx)
+            .api_key_state
+            .key(&Self::api_url(cx))
+            .map(|key| key.to_string())
+    }
+
     fn is_authenticated(&self, cx: &App) -> bool {
         self.state.read(cx).is_authenticated()
     }

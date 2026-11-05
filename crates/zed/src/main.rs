@@ -519,6 +519,7 @@ fn main() {
                 .expect("could not start HTTP client")
         };
         cx.set_http_client(Arc::new(http));
+        crew_quota::install_http_observer(cx);
 
         <dyn Fs>::set_global(fs.clone(), cx);
 
@@ -793,6 +794,7 @@ fn main() {
         onboarding::init(cx);
         settings_ui::init(cx);
         crew_model_catalog::init(app_state.clone(), cx);
+        crew_quota::init(app_state.clone(), cx);
         keymap_editor::init(cx);
         extensions_ui::init(cx);
         edit_prediction::init(cx);

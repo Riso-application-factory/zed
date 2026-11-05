@@ -560,6 +560,10 @@ pub trait LanguageModelProvider: LanguageModelClient {
         Vec::new()
     }
 
+    fn loaded_api_key(&self, _cx: &App) -> Option<String> {
+        None
+    }
+
     fn is_authenticated(&self, cx: &App) -> bool;
     fn authenticate(&self, cx: &mut App) -> Task<Result<(), AuthenticateError>>;
     fn refresh_models(&self, _cx: &mut App) {}
