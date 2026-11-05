@@ -218,9 +218,11 @@ impl Scheduler {
                 !state.in_flight
                     && !state.suspended
                     && !state.restoring
-                    && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
-                        || (state.provider == ProviderId::Claude
-                            && (state.startup_pending || state.demand_until > now)))
+                    && (matches!(
+                        state.provider,
+                        ProviderId::Codex | ProviderId::Antigravity | ProviderId::LlmProvider
+                    ) || (state.provider == ProviderId::Claude
+                        && (state.startup_pending || state.demand_until > now)))
             })
             .map(|state| {
                 let due = Self::next_for(state, now, monotonic);
@@ -245,9 +247,11 @@ impl Scheduler {
             if !state.in_flight
                 && !state.suspended
                 && !state.restoring
-                && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
-                    || (state.provider == ProviderId::Claude
-                        && (state.startup_pending || state.demand_until > now)))
+                && (matches!(
+                    state.provider,
+                    ProviderId::Codex | ProviderId::Antigravity | ProviderId::LlmProvider
+                ) || (state.provider == ProviderId::Claude
+                    && (state.startup_pending || state.demand_until > now)))
                 && Self::next_for(state, now, monotonic) <= now
             {
                 state.queued_at.get_or_insert(now);
@@ -262,9 +266,11 @@ impl Scheduler {
                 !state.in_flight
                     && !state.suspended
                     && !state.restoring
-                    && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
-                        || (state.provider == ProviderId::Claude
-                            && (state.startup_pending || state.demand_until > now)))
+                    && (matches!(
+                        state.provider,
+                        ProviderId::Codex | ProviderId::Antigravity | ProviderId::LlmProvider
+                    ) || (state.provider == ProviderId::Claude
+                        && (state.startup_pending || state.demand_until > now)))
                     && Self::next_for(state, now, monotonic) <= now
                     && (state.startup_pending
                         || state.last_monotonic.is_none_or(|attempt| {

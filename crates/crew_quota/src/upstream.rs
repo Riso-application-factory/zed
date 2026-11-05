@@ -400,7 +400,12 @@ impl QuotaService {
         }
         if self.core.snapshot.accounts.values().any(|account| {
             request.selector.matches(&account.scope)
-                && (account.scope.category == AccountCategory::LlmProvider
+                && ((account.scope.category == AccountCategory::LlmProvider
+                    && !account
+                        .scope
+                        .native_provider_id
+                        .as_deref()
+                        .is_some_and(native::active))
                     || account.scope.provider == ProviderId::Grok)
         }) {
             return Task::ready(Err(RefreshError::NotRefreshable));
@@ -936,7 +941,14 @@ impl QuotaService {
                                 return Err(RefreshError::Cancelled);
                             }
                             let read = cx.update(|cx| {
-                                source.refresh(scope.clone(), generation, sequence, cx)
+                                if scope
+                                    .strip_prefix("llm-provider:")
+                                    .is_some_and(native::active)
+                                {
+                                    native::refresh(scope.clone(), generation, sequence, cx)
+                                } else {
+                                    source.refresh(scope.clone(), generation, sequence, cx)
+                                }
                             });
                             read.await
                         };
@@ -993,8 +1005,21 @@ impl QuotaService {
             _ => None,
         };
         if let Some(retry_at) = retry_at {
-            self.scheduler
-                .defer(scope, now, self.ports.clock.monotonic(), retry_at);
+            if scope
+                .strip_prefix("llm-provider:")
+                .is_some_and(native::active)
+            {
+                self.scheduler.complete(
+                    scope,
+                    now,
+                    self.ports.clock.monotonic(),
+                    false,
+                    Some(retry_at),
+                );
+            } else {
+                self.scheduler
+                    .defer(scope, now, self.ports.clock.monotonic(), retry_at);
+            }
         } else {
             self.scheduler.complete(
                 scope,

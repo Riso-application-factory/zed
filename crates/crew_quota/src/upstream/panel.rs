@@ -580,6 +580,14 @@ fn window_title(account: &AccountState, window: &QuotaWindow) -> String {
 
 fn compact_summary(account: &AccountState, show_used: bool, now: Timestamp) -> String {
     let windows = visible_windows(account);
+    let balances = windows
+        .iter()
+        .filter(|window| window.key.role == "balance")
+        .filter_map(|window| amount_text(window))
+        .collect::<Vec<_>>();
+    if !balances.is_empty() {
+        return balances.join(" · ");
+    }
     if account.scope.category == AccountCategory::LlmProvider
         || account.scope.provider == ProviderId::Grok
     {
@@ -954,6 +962,8 @@ fn amount_text(window: &QuotaWindow) -> Option<String> {
         Unit::Requests => "requests".into(),
         Unit::Tokens => "tokens".into(),
         Unit::UnspecifiedUnits => "units".into(),
+        Unit::Money { currency, .. } => currency.clone(),
+        Unit::Credits { denomination } => denomination.clone().unwrap_or_else(|| "credits".into()),
         unit => format!("{unit:?}"),
     };
     let remaining_value = amount_number(&remaining.unit, remaining.value);
@@ -973,6 +983,14 @@ fn amount_text(window: &QuotaWindow) -> Option<String> {
 }
 
 fn short_amount_text(window: &QuotaWindow) -> Option<String> {
+    if window
+        .remaining
+        .as_ref()
+        .and_then(|sample| sample.value.as_ref())
+        .is_some_and(|amount| matches!(amount.unit, Unit::Money { .. } | Unit::Credits { .. }))
+    {
+        return amount_text(window);
+    }
     let remaining = window.remaining.as_ref()?.value.as_ref()?;
     if !matches!(remaining.unit, Unit::Requests | Unit::Tokens) || !remaining.value.is_finite() {
         return None;

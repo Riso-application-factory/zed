@@ -20,12 +20,18 @@ fn endpoint(id: &str, settings: &language_models::AllLanguageModelSettings) -> O
         "lmstudio" => (&settings.lmstudio.api_url, ""),
         "llama.cpp" => (&settings.llama_cpp.api_url, ""),
         "ollama" => (&settings.ollama.api_url, ""),
-        "deepseek" => (&settings.deepseek.api_url, ""),
+        "deepseek" => (&settings.deepseek.api_url, "https://api.deepseek.com/v1"),
         "google" => (&settings.google.api_url, ""),
         "mistral" => (&settings.mistral.api_url, ""),
-        "openrouter" => (&settings.open_router.api_url, ""),
+        "openrouter" => (
+            &settings.open_router.api_url,
+            "https://openrouter.ai/api/v1",
+        ),
         "opencode" => (&settings.opencode.api_url, ""),
-        "vercel_ai_gateway" => (&settings.vercel_ai_gateway.api_url, ""),
+        "vercel_ai_gateway" => (
+            &settings.vercel_ai_gateway.api_url,
+            "https://ai-gateway.vercel.sh/v1",
+        ),
         id => {
             return settings
                 .openai_compatible
@@ -54,6 +60,9 @@ fn trusted_host(id: &str, endpoint: &str) -> Option<&'static str> {
         "x_ai" => ("https://api.x.ai/v1", "api.x.ai"),
         "anthropic" => ("https://api.anthropic.com", "api.anthropic.com"),
         "openai" => ("https://api.openai.com/v1", "api.openai.com"),
+        "deepseek" => ("https://api.deepseek.com/v1", "api.deepseek.com"),
+        "openrouter" => ("https://openrouter.ai/api/v1", "openrouter.ai"),
+        "vercel_ai_gateway" => ("https://ai-gateway.vercel.sh/v1", "ai-gateway.vercel.sh"),
         _ => return None,
     };
     (endpoint.trim_end_matches('/') == expected).then_some(host)
@@ -270,6 +279,11 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
                     }
                     if let Some(account) = service.core.snapshot.accounts.get_mut(&scope) {
                         account.metadata.native_provider = Some(candidate.info.clone());
+                    }
+                    if active(&candidate.id) && candidate.capture_host.is_some() {
+                        service.scheduler.startup(&scope);
+                    } else if let Some(schedule) = service.scheduler.scopes.get_mut(&scope) {
+                        schedule.suspended = true;
                     }
                     service
                         .native_inventory
@@ -701,5 +715,319 @@ mod tests {
             });
             assert!(!collect(cx).iter().any(|provider| provider.id == "custom" || provider.id == "openai"));
         });
+    }
+}
+
+pub(super) fn active(id: &str) -> bool {
+    matches!(id, "deepseek" | "openrouter" | "vercel_ai_gateway")
+}
+
+pub(super) fn refresh(
+    scope: String,
+    generation: u64,
+    sequence: u64,
+    cx: &mut App,
+) -> Task<Result<Observation, RefreshError>> {
+    let id = scope.trim_start_matches("llm-provider:").to_owned();
+    let candidate = collect(cx)
+        .into_iter()
+        .find(|candidate| candidate.id == id && candidate.capture_host.is_some());
+    let key = LanguageModelRegistry::read_global(cx)
+        .providers()
+        .into_iter()
+        .find(|provider| provider.id().0.as_ref() == id)
+        .and_then(|provider| provider.loaded_api_key(cx));
+    let client = cx.http_client();
+    let timer = cx.background_executor().timer(Duration::from_secs(30));
+    cx.background_spawn(async move {
+        let operation = async {
+            if candidate.is_none() {
+                return Err(RefreshError::NotRefreshable);
+            }
+            let key = key.ok_or(RefreshError::NotLoggedIn)?;
+            read_balance(client, &id, key, scope, generation, sequence).await
+        }
+        .fuse();
+        let timer = timer.fuse();
+        futures::pin_mut!(operation, timer);
+        let result = futures::select_biased! {
+            result = operation => result,
+            _ = timer => Err(RefreshError::Failed(ErrorCode::Timeout)),
+        };
+        match &result {
+            Ok(_) => {
+                log::info!("crew_quota: native_active provider={id} outcome=Ok reason=Balance")
+            }
+            Err(error) => {
+                log::info!("crew_quota: native_active provider={id} outcome=Error reason={error:?}")
+            }
+        }
+        result
+    })
+}
+
+async fn read_balance(
+    client: Arc<dyn http_client::HttpClient>,
+    id: &str,
+    key: String,
+    scope: String,
+    generation: u64,
+    sequence: u64,
+) -> Result<Observation, RefreshError> {
+    use futures::AsyncReadExt;
+    use http_client::HttpRequestExt as _;
+    let url = match id {
+        "deepseek" => "https://api.deepseek.com/user/balance",
+        "openrouter" => "https://openrouter.ai/api/v1/key",
+        "vercel_ai_gateway" => "https://ai-gateway.vercel.sh/v1/credits",
+        _ => return Err(RefreshError::NotRefreshable),
+    };
+    let mut authorization = http_client::http::HeaderValue::from_str(&format!("Bearer {key}"))
+        .map_err(|_| RefreshError::Failed(ErrorCode::InvalidData))?;
+    authorization.set_sensitive(true);
+    let request = http_client::Request::get(url)
+        .extension(super::grok::AgentProbe)
+        .follow_redirects(http_client::RedirectPolicy::NoFollow)
+        .timeout(Duration::from_secs(30))
+        .header("authorization", authorization)
+        .body(http_client::AsyncBody::empty())
+        .map_err(|_| RefreshError::Failed(ErrorCode::InvalidData))?;
+    let response = client
+        .send(request)
+        .await
+        .map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
+    let now = chrono::Utc::now().timestamp();
+    match response.status().as_u16() {
+        200 => {}
+        401 | 403 => return Err(RefreshError::NotLoggedIn),
+        429 => {
+            return Err(RefreshError::Deferred {
+                retry_at: response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| retry_after(value, now))
+                    .unwrap_or(now + 120),
+            });
+        }
+        _ => return Err(RefreshError::Failed(ErrorCode::Transport)),
+    }
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .take(65537)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
+    if bytes.len() > 65536 {
+        return Err(RefreshError::Failed(ErrorCode::InvalidData));
+    }
+    parse_balance(id, &bytes, scope, generation, sequence, now)
+}
+
+fn parse_balance(
+    id: &str,
+    bytes: &[u8],
+    scope: String,
+    generation: u64,
+    sequence: u64,
+    now: Timestamp,
+) -> Result<Observation, RefreshError> {
+    let invalid = || RefreshError::Failed(ErrorCode::InvalidData);
+    let body: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| invalid())?;
+    let number = |value: &serde_json::Value| -> Option<f64> {
+        let number = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+        number.is_finite().then_some(number)
+    };
+    let mut balances = Vec::new();
+    let available = match id {
+        "deepseek" => {
+            for balance in body["balance_infos"].as_array().ok_or_else(invalid)? {
+                let currency = balance["currency"]
+                    .as_str()
+                    .filter(|currency| {
+                        currency.len() == 3
+                            && currency.bytes().all(|byte| byte.is_ascii_uppercase())
+                    })
+                    .ok_or_else(invalid)?;
+                balances.push((
+                    currency.to_owned(),
+                    number(&balance["total_balance"]).ok_or_else(invalid)?,
+                    None,
+                ));
+            }
+            body["is_available"].as_bool().ok_or_else(invalid)?
+        }
+        "openrouter" => {
+            let data = &body["data"];
+            let limit = number(&data["limit"]).filter(|limit| *limit >= 0.0);
+            let remaining =
+                number(&data["limit_remaining"]).or_else(|| Some(limit? - number(&data["usage"])?));
+            if let Some(remaining) = remaining {
+                balances.push(("USD".into(), remaining, limit));
+            } else if !data["limit"].is_null() || number(&data["usage"]).is_none() {
+                return Err(invalid());
+            }
+            true
+        }
+        "vercel_ai_gateway" => {
+            number(&body["total_used"]).ok_or_else(invalid)?;
+            balances.push((
+                "USD".into(),
+                number(&body["balance"]).ok_or_else(invalid)?,
+                None,
+            ));
+            true
+        }
+        _ => return Err(invalid()),
+    };
+    let blocked = !available
+        || (!balances.is_empty() && balances.iter().all(|(_, remaining, _)| *remaining <= 0.0));
+    let windows = balances
+        .into_iter()
+        .map(|(currency, remaining, limit)| {
+            let unit = Unit::Money {
+                currency: currency.clone(),
+                scale: 0,
+            };
+            WindowPatch {
+                key: WindowKey {
+                    bucket: BucketKey {
+                        scope: scope.clone(),
+                        bucket: currency,
+                        applicability: Applicability::AllModels,
+                    },
+                    role: "balance".into(),
+                    duration_seconds: None,
+                },
+                used_fraction: Patch::Set(
+                    limit
+                        .filter(|limit| *limit > 0.0 && remaining >= 0.0 && remaining <= *limit)
+                        .map(|limit| 1.0 - remaining / limit),
+                ),
+                remaining: Patch::Set(Some(Amount {
+                    value: remaining.max(0.0),
+                    unit: unit.clone(),
+                })),
+                limit: Patch::Set(limit.map(|value| Amount { value, unit })),
+                reset_at: Patch::Set(None),
+                admission: Patch::Set(Admission::Unknown),
+                disabled: Patch::Missing,
+                precision: Precision::Exact,
+            }
+        })
+        .collect();
+    Ok(Observation {
+        scope,
+        generation,
+        source: SourceKind::NativeBalanceRead,
+        source_version: "native-balance-v1".into(),
+        observed_at: now,
+        provider_sample_at: None,
+        sequence: sequence.saturating_add(1),
+        start_sequence: Some(sequence),
+        windows,
+        complete: false,
+        metadata: AccountMetadata {
+            grok_response: Some(GrokResponse {
+                blocked: blocked.then_some(GrokBlockReason::SpendingLimit),
+                status: 200,
+                observed_at: now,
+                retry_at: None,
+            }),
+            ..Default::default()
+        },
+    })
+}
+
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    #[test]
+    fn documented_balances_and_zero() {
+        for (id, body, expected) in [
+            (
+                "deepseek",
+                r#"{"is_available":true,"balance_infos":[{"currency":"CNY","total_balance":"12.50"}]}"#,
+                12.5,
+            ),
+            (
+                "openrouter",
+                r#"{"data":{"limit":10,"usage":3,"limit_remaining":7}}"#,
+                7.0,
+            ),
+            (
+                "vercel_ai_gateway",
+                r#"{"balance":"4.25","total_used":"5.75"}"#,
+                4.25,
+            ),
+        ] {
+            let observation =
+                parse_balance(id, body.as_bytes(), "scope".into(), 1, 0, 100).expect("schema");
+            assert!(
+                matches!(observation.windows.first().expect("window").remaining, Patch::Set(Some(Amount {value, ..})) if value == expected)
+            );
+        }
+        let observation = parse_balance(
+            "deepseek",
+            br#"{"is_available":false,"balance_infos":[{"currency":"USD","total_balance":"0"}]}"#,
+            "scope".into(),
+            1,
+            0,
+            100,
+        )
+        .expect("zero");
+        assert_eq!(
+            observation.metadata.grok_response.expect("state").blocked,
+            Some(GrokBlockReason::SpendingLimit)
+        );
+        assert!(parse_balance("deepseek", b"{}", "scope".into(), 1, 0, 100).is_err());
+        assert_eq!(trusted_host("deepseek", "https://custom.example"), None);
+        assert_eq!(
+            trusted_host("openrouter", "https://openrouter.ai/api/v1/evil"),
+            None
+        );
+    }
+
+    #[gpui::test]
+    async fn fake_transport_statuses(cx: &mut gpui::TestAppContext) {
+        for status in [200, 401, 429] {
+            let client = http_client::FakeHttpClient::create(move |request| async move {
+                assert_eq!(request.uri(), "https://ai-gateway.vercel.sh/v1/credits");
+                assert!(
+                    request
+                        .extensions()
+                        .get::<super::super::grok::AgentProbe>()
+                        .is_some()
+                );
+                Ok(http_client::Response::builder().status(status).body(
+                    http_client::AsyncBody::from(r#"{"balance":"0","total_used":"2"}"#),
+                )?)
+            });
+            let result = read_balance(
+                client,
+                "vercel_ai_gateway",
+                "fake-key".into(),
+                "scope".into(),
+                1,
+                0,
+            )
+            .await;
+            match status {
+                200 => assert_eq!(
+                    result
+                        .expect("balance")
+                        .metadata
+                        .grok_response
+                        .expect("state")
+                        .blocked,
+                    Some(GrokBlockReason::SpendingLimit)
+                ),
+                401 => assert_eq!(result, Err(RefreshError::NotLoggedIn)),
+                _ => assert!(matches!(result, Err(RefreshError::Deferred { .. }))),
+            }
+        }
+        cx.run_until_parked();
     }
 }

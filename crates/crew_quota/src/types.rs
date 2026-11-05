@@ -102,6 +102,7 @@ pub enum SourceKind {
     ClaudeHeaderProbe,
     AntigravityAcpUsage,
     GrokResponseHeaders,
+    NativeBalanceRead,
     Persisted,
 }
 
