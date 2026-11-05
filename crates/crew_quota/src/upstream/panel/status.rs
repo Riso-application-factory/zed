@@ -88,23 +88,17 @@ impl QuotaStatusItem {
         let panel = workspace.read(cx).panel::<AgentPanel>(cx)?;
         let conversation = panel.read(cx).active_conversation_view()?;
         let conversation = conversation.read(cx);
-        if conversation.agent_key().is_native() {
-            let thread = conversation.as_native_thread(cx)?;
-            return thread
-                .read(cx)
-                .model()
-                .filter(|model| {
-                    model.provider_id() == language_model::LanguageModelProviderId::new("x_ai")
-                })
-                .map(|_| ProviderId::Grok);
-        }
         let agent = conversation.agent_key().id();
-        provider_for_thread(true, Some(agent.as_ref()))
+        provider_for_thread(
+            true,
+            conversation.agent_key().is_native(),
+            Some(agent.as_ref()),
+        )
     }
 }
 
-fn provider_for_thread(visible: bool, agent: Option<&str>) -> Option<ProviderId> {
-    if !visible {
+fn provider_for_thread(visible: bool, native: bool, agent: Option<&str>) -> Option<ProviderId> {
+    if !visible || native {
         return None;
     }
     match agent? {
@@ -117,20 +111,8 @@ fn provider_for_thread(visible: bool, agent: Option<&str>) -> Option<ProviderId>
 }
 
 fn numeric_summary(account: &AccountState, used: bool) -> Option<String> {
-    if let Some(reason) = account
-        .metadata
-        .grok_response
-        .as_ref()
-        .and_then(|response| response.blocked)
-    {
-        return Some(
-            match reason {
-                GrokBlockReason::SpendingLimit => "Grok: out of credits",
-                GrokBlockReason::RateLimited => "Grok: rate limited",
-                GrokBlockReason::Forbidden => "Grok: blocked",
-            }
-            .into(),
-        );
+    if account.scope.category != AccountCategory::ExternalAgent {
+        return None;
     }
     if matches!(
         account.availability,
@@ -205,6 +187,10 @@ impl Render for QuotaStatusItem {
             .as_ref()
             .map(|preview| preview.snapshot.clone())
             .unwrap_or(snapshot);
+        let mut snapshot = snapshot;
+        Arc::make_mut(&mut snapshot)
+            .accounts
+            .retain(|_, account| account.scope.category == AccountCategory::ExternalAgent);
         let mut content = h_flex().gap_1();
         if !preferences.hide_status
             && let Some(provider) = provider
@@ -213,7 +199,11 @@ impl Render for QuotaStatusItem {
                 .into_iter()
                 .filter(|row| row.provider == provider)
             {
-                for account in row.accounts {
+                for account in row
+                    .accounts
+                    .into_iter()
+                    .filter(|account| account.scope.category == AccountCategory::ExternalAgent)
+                {
                     let tooltip = tooltip_text(account, now);
                     let Some(summary) = numeric_summary(account, preferences.used) else {
                         continue;
@@ -222,16 +212,7 @@ impl Render for QuotaStatusItem {
                         div()
                             .id("quota-active-thread")
                             .tooltip(Tooltip::text(tooltip))
-                            .child(
-                                Label::new(summary).size(LabelSize::Small).when(
-                                    account
-                                        .metadata
-                                        .grok_response
-                                        .as_ref()
-                                        .is_some_and(|response| response.blocked.is_some()),
-                                    |label| label.color(Color::Error),
-                                ),
-                            ),
+                            .child(Label::new(summary).size(LabelSize::Small)),
                     );
                 }
             }
@@ -243,47 +224,6 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn blocked_grok_footer_and_panel_override_waiting() {
-        let preview = super::super::preview::FixturePreview::new(1000, false);
-        let mut account = preview.snapshot.accounts["codex"].clone();
-        account.scope.provider = ProviderId::Grok;
-        account.availability = Availability::Unknown;
-        account.windows.clear();
-        for (reason, summary, panel) in [
-            (
-                GrokBlockReason::SpendingLimit,
-                "Grok: out of credits",
-                "Out of credits / spending limit",
-            ),
-            (
-                GrokBlockReason::RateLimited,
-                "Grok: rate limited",
-                "Rate limited · Retry in 20s",
-            ),
-            (
-                GrokBlockReason::Forbidden,
-                "Grok: blocked",
-                "Blocked · HTTP 4xx",
-            ),
-        ] {
-            account.metadata.grok_response = Some(GrokResponse {
-                blocked: Some(reason),
-                status: 403,
-                observed_at: 1000,
-                retry_at: Some(1030),
-            });
-            assert_eq!(numeric_summary(&account, false).as_deref(), Some(summary));
-            let status = account_status(&account, 1010);
-            assert!(status.contains(panel), "{status}");
-            assert!(status.contains("observed 10s ago"));
-            assert!(!status.contains("Waiting"));
-        }
-        account.metadata.grok_response = None;
-        assert!(numeric_summary(&account, false).is_none());
-    }
 
     #[cfg(debug_assertions)]
     #[test]
@@ -340,19 +280,39 @@ mod tests {
         }
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn native_threads_and_native_accounts_never_select_status_quota() {
+        for provider in [
+            "x_ai",
+            "openai",
+            "anthropic",
+            "zed.dev",
+            "codex-acp",
+            "grok-acp",
+        ] {
+            assert_eq!(provider_for_thread(true, true, Some(provider)), None);
+        }
+        let preview = super::super::preview::FixturePreview::new(1000, false);
+        let mut native = preview.snapshot.accounts["codex"].clone();
+        native.scope.category = AccountCategory::LlmProvider;
+        native.scope.native_provider_id = Some("openai".into());
+        assert!(numeric_summary(&native, false).is_none());
+    }
+
     #[test]
     fn follows_visible_thread_and_hides_for_other_surfaces() {
         assert_eq!(
-            provider_for_thread(true, Some("codex-acp")),
+            provider_for_thread(true, false, Some("codex-acp")),
             Some(ProviderId::Codex)
         );
         assert_eq!(
-            provider_for_thread(true, Some("claude-acp")),
+            provider_for_thread(true, false, Some("claude-acp")),
             Some(ProviderId::Claude)
         );
-        assert_eq!(provider_for_thread(false, Some("codex-acp")), None);
-        assert_eq!(provider_for_thread(true, None), None);
-        assert_eq!(provider_for_thread(true, Some("zed")), None);
+        assert_eq!(provider_for_thread(false, false, Some("codex-acp")), None);
+        assert_eq!(provider_for_thread(true, false, None), None);
+        assert_eq!(provider_for_thread(true, false, Some("zed")), None);
     }
 
     #[gpui::test]
