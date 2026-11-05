@@ -6,6 +6,7 @@ use std::sync::Mutex;
 struct Target {
     scope: String,
     generation: u64,
+    gate_reason: Option<String>,
 }
 struct HeaderObservation {
     quota: Observation,
@@ -50,21 +51,21 @@ impl HttpClient for Observer {
             log::info!("crew_quota: agent=Grok source=Headers outcome=Unmatched path_kind=Other");
             return self.inner.send(request);
         }
-        let target = endpoint.as_ref().and_then(|_| {
-            self.target
-                .try_lock()
-                .ok()?
-                .get(request.uri().host()?)
-                .cloned()
-        });
-        log::info!(
-            "crew_quota: agent=Grok source=Headers outcome={}",
-            if target.is_some() {
-                "Eligible"
-            } else {
-                "Gated"
+        let target = endpoint
+            .as_ref()
+            .and_then(|_| self.target.lock().ok()?.get(request.uri().host()?).cloned());
+        log::info!("crew_quota: agent=Grok source=Headers outcome=Eligible");
+        let target = match target {
+            Some(target) if target.gate_reason.is_none() => Some(target),
+            target => {
+                let reason = target
+                    .as_ref()
+                    .and_then(|target| target.gate_reason.as_deref())
+                    .unwrap_or("NoCaptureTarget");
+                log::info!("crew_quota: agent=Grok source=Headers outcome=Gated reason={reason}");
+                None
             }
-        );
+        };
         let host = request.uri().host().unwrap_or_default().to_owned();
         let future = self.inner.send(request);
         let sender = self.sender.clone();
@@ -435,7 +436,12 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
             .native_inventory
             .values()
             .filter_map(|candidate| {
-                let host = candidate.capture_host?;
+                let host = candidate.capture_host.or(match candidate.id.as_str() {
+                    "x_ai" => Some("api.x.ai"),
+                    "anthropic" => Some("api.anthropic.com"),
+                    "openai" => Some("api.openai.com"),
+                    _ => None,
+                })?;
                 let account = service
                     .core
                     .snapshot
@@ -446,6 +452,12 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
                     Target {
                         scope: account.scope.id.clone(),
                         generation: account.generation,
+                        gate_reason: candidate.capture_host.is_none().then(|| {
+                            candidate
+                                .gate_reason
+                                .clone()
+                                .unwrap_or_else(|| "EndpointPolicy".into())
+                        }),
                     },
                 ))
             })
@@ -597,6 +609,57 @@ mod tests {
     use super::*;
     use futures::{AsyncReadExt as _, StreamExt as _};
     use settings::Settings;
+
+    #[test]
+    fn target_reconciliation_contention_does_not_gate_capture() {
+        let targets = Arc::new(Mutex::new(BTreeMap::from([(
+            "api.x.ai".into(),
+            Target {
+                scope: "test".into(),
+                generation: 1,
+                gate_reason: None,
+            },
+        )])));
+        let (locked_sender, locked_receiver) = std::sync::mpsc::channel();
+        let reconciliation = std::thread::spawn({
+            let targets = targets.clone();
+            move || {
+                let guard = targets.lock().expect("target lock");
+                locked_sender.send(()).expect("locked signal");
+                std::thread::sleep(Duration::from_millis(50));
+                drop(guard);
+            }
+        });
+        locked_receiver.recv().expect("reconciliation holds lock");
+        let (sender, receiver) = async_channel::bounded(1);
+        let observer = Observer {
+            inner: http_client::FakeHttpClient::create(|_| async {
+                Ok(Response::builder().status(429).body(AsyncBody::empty())?)
+            }),
+            target: targets,
+            sender,
+        };
+        smol::block_on(
+            observer.send(
+                Request::post("https://api.x.ai/v1/chat/completions")
+                    .body(AsyncBody::empty())
+                    .expect("request"),
+            ),
+        )
+        .expect("response");
+        reconciliation.join().expect("reconciliation");
+        let observation = receiver
+            .try_recv()
+            .expect("capture survives reconciliation");
+        assert_eq!(
+            observation
+                .quota
+                .metadata
+                .grok_response
+                .and_then(|response| response.blocked),
+            Some(GrokBlockReason::RateLimited)
+        );
+    }
 
     #[test]
     #[allow(
@@ -809,6 +872,7 @@ mod tests {
                     Target {
                         scope: "test".into(),
                         generation: 0,
+                        gate_reason: None,
                     },
                 )]))),
             };
@@ -874,6 +938,7 @@ mod tests {
                         Target {
                             scope: "test".into(),
                             generation: 0,
+                            gate_reason: None,
                         },
                     )]))),
                 };
@@ -965,6 +1030,7 @@ mod tests {
                     Target {
                         scope: "test".into(),
                         generation: 1,
+                        gate_reason: None,
                     },
                 )]);
                 let receiver = bridge.receiver.clone();
@@ -1053,6 +1119,7 @@ mod tests {
                     Target {
                         scope: "test".into(),
                         generation: 1,
+                        gate_reason: None,
                     },
                 )]))),
             };
@@ -1118,6 +1185,7 @@ mod tests {
                     Target {
                         scope: "other".into(),
                         generation: 0,
+                        gate_reason: None,
                     },
                 )]),
             ] {
@@ -1182,6 +1250,7 @@ mod tests {
                             Target {
                                 scope: "xai-test".into(),
                                 generation: 0,
+                                gate_reason: None,
                             },
                         )]))),
                     };

@@ -908,7 +908,7 @@ fn native_status(account: &AccountState, now: Timestamp) -> String {
             Freshness::Fresh
         )
     }) {
-        return "Stale · waiting for a provider response".into();
+        return "Stale".into();
     }
     String::new()
 }
@@ -1316,8 +1316,17 @@ impl Render for QuotaPanel {
                         .child(icon.size(IconSize::Small))
                         .child(Label::new(name)),
                 );
+                if status == "Stale" {
+                    header = header.child(badge("Stale", Color::Warning, cx));
+                }
                 if preferences.compact {
-                    let summary = if status.is_empty() {
+                    let summary = if status == "Stale" {
+                        format!(
+                            "{} · {}",
+                            compact_summary(account, preferences.used, now),
+                            age(account.last_success_at, now)
+                        )
+                    } else if status.is_empty() {
                         compact_summary(account, preferences.used, now)
                     } else {
                         status.to_string()
@@ -1330,7 +1339,7 @@ impl Render for QuotaPanel {
                     provider = provider.child(header);
                 } else {
                     provider = provider.child(header);
-                    if !status.is_empty() {
+                    if !status.is_empty() && status != "Stale" {
                         provider = provider.child(
                             Label::new(status)
                                 .size(LabelSize::XSmall)
@@ -2124,6 +2133,11 @@ mod tests {
         );
         let xai = rows.first().expect("xai");
         assert!(native_status(xai, now + 121).contains("Stale"));
+        assert!(
+            !native_status(xai, now + 121)
+                .to_lowercase()
+                .contains("waiting")
+        );
         assert!(compact_summary(xai, false, now).contains("Req"));
         assert!(
             visible_windows(xai)

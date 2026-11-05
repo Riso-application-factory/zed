@@ -1006,6 +1006,16 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                         Err(_) => service.persistence_failure(SCOPE.into(), cx),
                         Ok(None) => {}
                     }
+                    if let Some(schedule) = service.scheduler.scopes.get(SCOPE) {
+                        let now = service.ports.clock.now();
+                        let next = Scheduler::next_for(schedule, now, service.ports.clock.monotonic());
+                        if next > now {
+                            log::info!(
+                                "crew_quota: agent=Antigravity source=Active outcome=Deferred next_in={} reason=RestoredTiming",
+                                next.saturating_sub(now)
+                            );
+                        }
+                    }
                     cx.emit(QuotaEvent::AvailabilityChanged(scope.id));
                     service.wake();
                     cx.notify();

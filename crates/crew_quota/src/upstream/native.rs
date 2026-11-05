@@ -8,6 +8,7 @@ pub(super) struct Candidate {
     pub info: NativeProviderInfo,
     pub capture_host: Option<&'static str>,
     fingerprint: String,
+    pub gate_reason: Option<String>,
 }
 
 fn endpoint(id: &str, settings: &language_models::AllLanguageModelSettings) -> Option<String> {
@@ -122,12 +123,14 @@ pub(super) fn collect(cx: &App) -> Vec<Candidate> {
             } else {
                 NativeProviderKind::Unavailable
             };
+            let mut gate_reason = None;
             if let Some(host) = capture_host {
-                if authenticated.iter().any(|other| {
+                if let Some(other) = authenticated.iter().find(|other| {
                     other.id().0.as_ref() != id
                         && endpoint_for_provider(other.as_ref(), settings)
                             .is_some_and(|endpoint| shares_host(&endpoint, host))
                 }) {
+                    gate_reason = Some(format!("SharedHost({})", other.id().0));
                     kind = NativeProviderKind::Ambiguous;
                     capture_host = None;
                 }
@@ -139,6 +142,7 @@ pub(super) fn collect(cx: &App) -> Vec<Candidate> {
                 info: NativeProviderInfo { name, kind, order },
                 capture_host,
                 fingerprint,
+                gate_reason,
             })
         })
         .collect()
@@ -152,17 +156,27 @@ fn endpoint_for_provider(
 }
 
 pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
-    for provider in LanguageModelRegistry::read_global(cx).visible_providers() {
-        let id = provider.id().0;
-        if valid_text(&id, 128) {
-            let state = if provider.is_authenticated(cx) {
-                "Authenticated"
-            } else {
-                "NotAuthenticated"
-            };
-            log::info!("crew_quota: native_inventory provider={id} state={state}");
+    let authentication = LanguageModelRegistry::read_global(cx)
+        .visible_providers()
+        .into_iter()
+        .filter_map(|provider| {
+            let id = provider.id().0.to_string();
+            valid_text(&id, 128).then(|| (id, provider.is_authenticated(cx)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    service.update(cx, |service, _| {
+        for (id, authenticated) in &authentication {
+            if service.native_authentication.get(id) != Some(authenticated) {
+                let state = if *authenticated {
+                    "Authenticated"
+                } else {
+                    "NotAuthenticated"
+                };
+                log::info!("crew_quota: native_inventory provider={id} state={state}");
+            }
         }
-    }
+        service.native_authentication = authentication;
+    });
     let candidates = collect(cx);
     service.update(cx, |service, cx| {
         let retained = candidates
@@ -332,6 +346,86 @@ mod tests {
         fn delete(&self, _: String, _: &App) -> Task<Result<(), ErrorCode>> {
             Task::ready(Ok(()))
         }
+    }
+
+    #[gpui::test]
+    async fn unauthenticated_subscription_does_not_gate_xai(cx: &mut gpui::TestAppContext) {
+        struct LiveClock;
+        impl Clock for LiveClock {
+            fn now(&self) -> Timestamp {
+                chrono::Utc::now().timestamp()
+            }
+            fn monotonic(&self) -> u64 {
+                0
+            }
+        }
+        let service = cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            language_models::AllLanguageModelSettings::register(cx);
+            language_model::init(cx);
+            let registry = LanguageModelRegistry::global(cx);
+            for (id, authenticated) in [("x_ai", true), ("x_ai_subscribed", false)] {
+                let provider = Arc::new(FakeProvider {
+                    id,
+                    authenticated: AtomicBool::new(authenticated),
+                    authenticate_calls: AtomicUsize::new(0),
+                    state: cx.new(|_| ()),
+                });
+                registry.update(cx, |registry, cx| registry.register_provider(provider, cx));
+            }
+            let candidates = collect(cx);
+            let candidate = candidates
+                .iter()
+                .find(|candidate| candidate.id == "x_ai")
+                .expect("xai");
+            assert_eq!(candidate.capture_host, Some("api.x.ai"));
+            cx.set_http_client(http_client::FakeHttpClient::create(|_| async {
+                Ok(http_client::Response::builder()
+                    .status(429)
+                    .body(http_client::AsyncBody::empty())?)
+            }));
+            super::super::grok::install_http_observer(cx);
+            let service = cx.new(|cx| {
+                QuotaService::new(
+                    Ports {
+                        source: Rc::new(InMemoryPorts),
+                        store: Rc::new(InMemoryPorts),
+                        clock: Rc::new(LiveClock),
+                    },
+                    cx,
+                )
+            });
+            service.update(cx, |service, _| service.finish_init(Ok(())));
+            super::super::grok::init(&service, cx);
+            service
+        });
+        let client = cx.read(|cx| cx.http_client());
+        client
+            .send(
+                http_client::Request::post("https://api.x.ai/v1/chat/completions")
+                    .body(http_client::AsyncBody::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            let account = service
+                .core
+                .snapshot
+                .accounts
+                .get("llm-provider:x_ai")
+                .expect("xai row");
+            assert_eq!(
+                account
+                    .metadata
+                    .grok_response
+                    .as_ref()
+                    .and_then(|response| response.blocked),
+                Some(GrokBlockReason::RateLimited)
+            );
+        });
     }
 
     #[gpui::test]

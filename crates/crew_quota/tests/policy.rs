@@ -138,3 +138,22 @@ fn generation_change_discards_backoff_but_preserves_floor() {
     assert!(scheduler.start_due(119, 119).is_empty());
     assert_eq!(scheduler.start_due(120, 120), vec![("scope".into(), 2)]);
 }
+
+#[test]
+fn antigravity_first_read_is_immediate_but_restored_attempt_honors_floor() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("antigravity".into(), ProviderId::Antigravity, 1);
+    assert_eq!(
+        scheduler.start_due(1000, 0),
+        vec![("antigravity".into(), 1)]
+    );
+    let mut restored = Scheduler::default();
+    restored.track("antigravity".into(), ProviderId::Antigravity, 1);
+    restored.restore_timing("antigravity", Some(990), 0, 0, 1000, 0);
+    assert!(restored.start_due(1000, 0).is_empty());
+    assert_eq!(restored.next_deadline(1000, 0), Some(1890));
+    assert_eq!(
+        restored.start_due(1890, 890),
+        vec![("antigravity".into(), 1)]
+    );
+}
