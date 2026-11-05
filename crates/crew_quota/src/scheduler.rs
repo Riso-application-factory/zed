@@ -10,6 +10,7 @@ pub const MAX_QUEUE: usize = 64;
 #[derive(Clone, Debug)]
 pub struct Schedule {
     pub provider: ProviderId,
+    pub event_probe: bool,
     pub generation: u64,
     pub last_attempt: Option<Timestamp>,
     pub last_monotonic: Option<u64>,
@@ -51,9 +52,10 @@ impl Scheduler {
         let previous = self.scopes.remove(&scope);
         self.order = self.order.saturating_add(1);
         self.scopes.insert(
-            scope,
+            scope.clone(),
             Schedule {
                 provider,
+                event_probe: scope == "llm-provider:x_ai",
                 generation,
                 last_attempt: previous.as_ref().and_then(|state| state.last_attempt),
                 last_monotonic: previous.as_ref().and_then(|state| state.last_monotonic),
@@ -121,7 +123,7 @@ impl Scheduler {
         }
     }
     pub fn next_for(state: &Schedule, now: Timestamp, monotonic: u64) -> Timestamp {
-        if state.startup_pending {
+        if state.startup_pending && !state.event_probe {
             return now;
         }
         let until = |at: Option<Timestamp>, anchor: Option<u64>, interval: u64| -> u64 {
@@ -137,7 +139,7 @@ impl Scheduler {
         let reset_due = state
             .reset_at
             .is_some_and(|reset| reset <= now && !state.handled_resets.contains(&reset));
-        let cadence = if state.forced || reset_due {
+        let cadence = if state.forced || reset_due || state.event_probe {
             0
         } else {
             until(
@@ -151,7 +153,11 @@ impl Scheduler {
                 until(
                     state.last_attempt,
                     state.last_monotonic,
-                    Self::floor(state.provider),
+                    if state.event_probe {
+                        900
+                    } else {
+                        Self::floor(state.provider)
+                    },
                 )
             },
             |deadline| deadline.saturating_sub(monotonic),
@@ -182,9 +188,20 @@ impl Scheduler {
         };
         if let Some(attempt) = attempt {
             let remaining = attempt
-                .saturating_add(Self::floor(state.provider) as i64)
+                .saturating_add(if state.event_probe {
+                    900
+                } else {
+                    Self::floor(state.provider)
+                } as i64)
                 .saturating_sub(now)
-                .clamp(0, Self::floor(state.provider) as i64) as u64;
+                .clamp(
+                    0,
+                    if state.event_probe {
+                        900
+                    } else {
+                        Self::floor(state.provider)
+                    } as i64,
+                ) as u64;
             if state.last_monotonic.is_none()
                 && state
                     .restored_attempt_at
@@ -216,6 +233,7 @@ impl Scheduler {
             .values()
             .filter(|state| {
                 !state.in_flight
+                    && (!state.event_probe || state.startup_pending || state.forced)
                     && !state.suspended
                     && !state.restoring
                     && (matches!(
@@ -236,15 +254,17 @@ impl Scheduler {
     }
     pub fn start_due(&mut self, now: Timestamp, monotonic: u64) -> Vec<(String, u64)> {
         for state in self.scopes.values_mut() {
-            if state
-                .reset_at
-                .is_some_and(|reset| reset <= now && !state.handled_resets.contains(&reset))
+            if !state.event_probe
+                && state
+                    .reset_at
+                    .is_some_and(|reset| reset <= now && !state.handled_resets.contains(&reset))
             {
                 state.forced = true;
             }
         }
         for state in self.scopes.values_mut() {
             if !state.in_flight
+                && (!state.event_probe || state.startup_pending || state.forced)
                 && !state.suspended
                 && !state.restoring
                 && (matches!(
@@ -264,6 +284,7 @@ impl Scheduler {
             .iter()
             .filter(|(_, state)| {
                 !state.in_flight
+                    && (!state.event_probe || state.startup_pending || state.forced)
                     && !state.suspended
                     && !state.restoring
                     && (matches!(
@@ -274,7 +295,12 @@ impl Scheduler {
                     && Self::next_for(state, now, monotonic) <= now
                     && (state.startup_pending
                         || state.last_monotonic.is_none_or(|attempt| {
-                            monotonic.saturating_sub(attempt) >= Self::floor(state.provider)
+                            monotonic.saturating_sub(attempt)
+                                >= if state.event_probe {
+                                    900
+                                } else {
+                                    Self::floor(state.provider)
+                                }
                         }))
             })
             .map(|(scope, state)| {
@@ -431,5 +457,24 @@ mod tests {
             state.restoring = true;
             assert!(scheduler.start_due(100, 0).is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    #[test]
+    fn probe_floor_survives_restart_and_visible_ticks_do_not_probe() {
+        let mut scheduler = Scheduler::default();
+        scheduler.track("llm-provider:x_ai".into(), ProviderId::LlmProvider, 1);
+        scheduler.restore_timing("llm-provider:x_ai", Some(100), 0, 0, 200, 0);
+        scheduler.startup("llm-provider:x_ai");
+        assert!(scheduler.start_due(200, 0).is_empty());
+        assert_eq!(scheduler.start_due(1000, 800).len(), 1);
+        scheduler.complete("llm-provider:x_ai", 1000, 800, true, None);
+        scheduler.demand("llm-provider:x_ai", 10000);
+        assert!(scheduler.start_due(1900, 1700).is_empty());
+        scheduler.force("llm-provider:x_ai");
+        assert_eq!(scheduler.start_due(1900, 1700).len(), 1);
     }
 }

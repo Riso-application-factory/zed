@@ -719,7 +719,7 @@ mod tests {
 }
 
 pub(super) fn active(id: &str) -> bool {
-    matches!(id, "deepseek" | "openrouter" | "vercel_ai_gateway")
+    matches!(id, "x_ai" | "deepseek" | "openrouter" | "vercel_ai_gateway")
 }
 
 pub(super) fn refresh(
@@ -737,6 +737,9 @@ pub(super) fn refresh(
         .into_iter()
         .find(|provider| provider.id().0.as_ref() == id)
         .and_then(|provider| provider.loaded_api_key(cx));
+    if id == "x_ai" {
+        return probe(scope, generation, sequence, candidate.is_some(), key, cx);
+    }
     let client = cx.http_client();
     let timer = cx.background_executor().timer(Duration::from_secs(30));
     cx.background_spawn(async move {
@@ -1029,5 +1032,261 @@ mod balance_tests {
             }
         }
         cx.run_until_parked();
+    }
+}
+
+fn probe(
+    scope: String,
+    generation: u64,
+    sequence: u64,
+    eligible: bool,
+    key: Option<String>,
+    cx: &mut App,
+) -> Task<Result<Observation, RefreshError>> {
+    let client = cx.http_client();
+    let store = KeyValueStore::global(cx);
+    let timer = cx.background_executor().timer(Duration::from_secs(30));
+    cx.background_spawn(async move {
+        let operation = async {
+            if !eligible {
+                return Err(RefreshError::NotRefreshable);
+            }
+            let key = key.ok_or(RefreshError::NotLoggedIn)?;
+            // The latch deliberately survives credential rotation; only explicit removal re-enables paid probes.
+            if store
+                .scoped("crew_quota")
+                .read("xai-probe-no-inference")
+                .map_err(|_| RefreshError::Failed(ErrorCode::Persistence))?
+                .is_some()
+            {
+                return Err(RefreshError::NotRefreshable);
+            }
+            let (observation, denied) =
+                read_probe(client, key, scope, generation, sequence).await?;
+            if denied {
+                store
+                    .scoped("crew_quota")
+                    .write("xai-probe-no-inference".into(), "true".into())
+                    .await
+                    .map_err(|_| RefreshError::Failed(ErrorCode::Persistence))?;
+            }
+            Ok(observation)
+        };
+        let result = match futures::future::select(Box::pin(operation), Box::pin(timer)).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(RefreshError::Failed(ErrorCode::Timeout)),
+        };
+        match &result {
+            Ok(observation) => log::info!(
+                "crew_quota: native_probe provider=x_ai outcome={:?}",
+                observation
+                    .metadata
+                    .grok_response
+                    .as_ref()
+                    .and_then(|response| response.blocked)
+            ),
+            Err(error) => log::info!("crew_quota: native_probe provider=x_ai outcome={error:?}"),
+        }
+        result
+    })
+}
+
+async fn send_probe(
+    client: &Arc<dyn http_client::HttpClient>,
+    key: &str,
+    fallback: bool,
+) -> Result<http_client::Response<http_client::AsyncBody>, RefreshError> {
+    use http_client::HttpRequestExt as _;
+    let mut authorization = http_client::http::HeaderValue::from_str(&format!("Bearer {key}"))
+        .map_err(|_| RefreshError::Failed(ErrorCode::InvalidData))?;
+    authorization.set_sensitive(true);
+    let body = if fallback {
+        r#"{"model":"grok-4.20-0309-non-reasoning","max_tokens":1,"messages":[{"role":"user","content":"."}]}"#
+    } else {
+        r#"{"model":"grok-4.3","reasoning_effort":"none","max_tokens":1,"messages":[{"role":"user","content":"."}]}"#
+    };
+    let request = http_client::Request::post("https://api.x.ai/v1/chat/completions")
+        .extension(super::grok::AgentProbe)
+        .follow_redirects(http_client::RedirectPolicy::NoFollow)
+        .timeout(Duration::from_secs(30))
+        .header("authorization", authorization)
+        .header("content-type", "application/json")
+        .body(http_client::AsyncBody::from(body))
+        .map_err(|_| RefreshError::Failed(ErrorCode::InvalidData))?;
+    client
+        .send(request)
+        .await
+        .map_err(|_| RefreshError::Failed(ErrorCode::Transport))
+}
+
+async fn read_probe(
+    client: Arc<dyn http_client::HttpClient>,
+    key: String,
+    scope: String,
+    generation: u64,
+    sequence: u64,
+) -> Result<(Observation, bool), RefreshError> {
+    use futures::AsyncReadExt as _;
+    let mut response = send_probe(&client, &key, false).await?;
+    if response.status().as_u16() == 400 {
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .take(8193)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
+        let rejected_reasoning = bytes.len() <= 8192
+            && serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .is_some_and(|body| {
+                    body.get("error")
+                        .and_then(|value| value.as_str())
+                        .or_else(|| {
+                            body.pointer("/error/message")
+                                .and_then(|value| value.as_str())
+                        })
+                        .is_some_and(|message| {
+                            message.contains("reasoning_effort")
+                                && (message.contains("unsupported")
+                                    || message.contains("not supported")
+                                    || message.contains("invalid"))
+                        })
+                });
+        if rejected_reasoning {
+            log::info!("crew_quota: native_probe provider=x_ai outcome=FallbackNonReasoning");
+            response = send_probe(&client, &key, true).await?;
+        } else {
+            *response.body_mut() = http_client::AsyncBody::from(bytes);
+        }
+    }
+    let now = chrono::Utc::now().timestamp();
+    let status = response.status().as_u16();
+    if status == 429 {
+        return Err(RefreshError::Deferred {
+            retry_at: response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| retry_after(value, now))
+                .unwrap_or(now + 900),
+        });
+    }
+    let mut denied = false;
+    if status == 403 {
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .take(8193)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| RefreshError::Failed(ErrorCode::Transport))?;
+        if bytes.len() <= 8192 {
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            denied = body
+                .get("code")
+                .and_then(|code| code.as_str())
+                .is_some_and(|code| {
+                    matches!(
+                        code,
+                        "permission-denied"
+                            | "inference-permission-denied"
+                            | "missing-inference-permission"
+                    )
+                });
+        }
+        *response.body_mut() = http_client::AsyncBody::from(bytes);
+    }
+    let blocked = if status == 402 {
+        Some(GrokBlockReason::SpendingLimit)
+    } else {
+        super::grok::classify_response(&mut response, "api.x.ai").await
+    };
+    if !(200..300).contains(&status) && blocked.is_none() {
+        return Err(RefreshError::Failed(ErrorCode::Transport));
+    }
+    let windows = if (200..300).contains(&status) {
+        super::grok::parse_dialect(
+            response.headers(),
+            &scope,
+            "/v1/chat/completions",
+            "api.x.ai",
+            now,
+        )
+    } else {
+        Vec::new()
+    };
+    Ok((
+        Observation {
+            scope,
+            generation,
+            source: SourceKind::GrokResponseHeaders,
+            source_version: "xai-active-probe-v1".into(),
+            observed_at: now,
+            provider_sample_at: None,
+            sequence: sequence.saturating_add(1),
+            start_sequence: Some(sequence),
+            windows,
+            complete: false,
+            metadata: AccountMetadata {
+                grok_response: Some(GrokResponse {
+                    blocked,
+                    status,
+                    observed_at: now,
+                    retry_at: None,
+                }),
+                ..Default::default()
+            },
+        },
+        denied,
+    ))
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    #[gpui::test]
+    async fn responses_and_internal_marker(_cx: &mut gpui::TestAppContext) {
+        for (status, body, expected) in [
+            (200, "{}", None),
+            (402, "{}", Some(GrokBlockReason::SpendingLimit)),
+            (
+                400,
+                r#"{"code":"team-spending-limit"}"#,
+                Some(GrokBlockReason::SpendingLimit),
+            ),
+            (403, "{}", Some(GrokBlockReason::Forbidden)),
+            (429, "{}", Some(GrokBlockReason::RateLimited)),
+        ] {
+            let client = http_client::FakeHttpClient::create(move |request| async move {
+                assert!(
+                    request
+                        .extensions()
+                        .get::<super::super::grok::AgentProbe>()
+                        .is_some()
+                );
+                assert_eq!(request.uri(), "https://api.x.ai/v1/chat/completions");
+                Ok(http_client::Response::builder()
+                    .status(status)
+                    .header("x-ratelimit-limit-requests", "100")
+                    .header("x-ratelimit-remaining-requests", "90")
+                    .header("retry-after", "1800")
+                    .body(http_client::AsyncBody::from(body))?)
+            });
+            let before = chrono::Utc::now().timestamp();
+            let result = read_probe(client, "fake".into(), "scope".into(), 1, 0).await;
+            if status == 429 {
+                assert!(
+                    matches!(result, Err(RefreshError::Deferred { retry_at }) if retry_at >= before + 1800)
+                );
+            } else {
+                let (observation, _) = result.expect("observation");
+                assert_eq!(
+                    observation.metadata.grok_response.expect("state").blocked,
+                    expected
+                );
+                assert_eq!(observation.windows.is_empty(), status != 200);
+            }
+        }
     }
 }

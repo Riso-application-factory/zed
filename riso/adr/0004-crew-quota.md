@@ -322,3 +322,31 @@ These default-endpoint authenticated providers join the native startup refresh h
 two-minute demand cadence and fifteen-minute idle cadence with scheduler backoff.
 Custom endpoints remain list-only; native providers remain excluded from status quota.
 Detailed and compact panel rows carry currency and observation age.
+
+## Human-approved active xAI probe
+
+The authenticated native xAI provider at the default api.x.ai endpoint joins the
+startup pass and probes when the Quota panel opens. It never probes on the visible
+tick. A durable attempt reservation and a 900-second floor apply even across
+restarts and startup, with single-flight scheduling and error backoff. The request
+uses the provider's loaded credential, disables redirects, and carries AgentProbe
+so passive observation ignores it. Real responses remain a supplementary source;
+the observation sequence prevents an older active result replacing newer evidence.
+
+The paid request is POST /v1/chat/completions with model grok-4.3,
+reasoning_effort="none", max_tokens=1 and one user message containing a period.
+At the researched $1.25/M input and $2.50/M output prices, 20 input tokens plus one
+output token cost approximately $0.0000275; 187 input tokens cost $0.00023625.
+Framing affects cost, so these are estimates. No live inference was performed in
+implementation validation. A bounded HTTP 400 error explicitly rejecting reasoning_effort triggers one
+fallback to documented grok-4.20-0309-non-reasoning with the same input and cap;
+other model errors back off without automatic inference retries.
+
+HTTP 402 or a bounded spending-limit code shows Out of credits without invented
+capacity figures; the account needs credits before headers can be refreshed. The
+historical out-of-credits probe returned 402 with no rate headers. Successful
+responses reuse passive header parsing; 429 respects Retry-After, and 401/403
+indicate forbidden access. Explicit inference permission denial codes durably latch
+probing off. The latch contains no credential and requires explicit removal to
+re-enable probing. Diagnostic output is crew_quota: native_probe provider=x_ai
+outcome=Some(SpendingLimit) for an out-of-credits response.

@@ -162,7 +162,7 @@ struct NestedCodeBody {
     clippy::disallowed_methods,
     reason = "The HTTP decorator runs independently of a GPUI dispatcher and must enforce a wall-clock deadline."
 )]
-async fn classify_response(
+pub(super) async fn classify_response(
     response: &mut Response<AsyncBody>,
     host: &str,
 ) -> Option<GrokBlockReason> {
@@ -351,7 +351,7 @@ fn duration_reset(text: &str, now: Timestamp) -> Option<Timestamp> {
         .then(|| now.checked_add(seconds.ceil() as i64))
         .flatten()
 }
-fn parse_dialect(
+pub(super) fn parse_dialect(
     headers: &http_client::http::HeaderMap,
     scope: &str,
     endpoint: &str,

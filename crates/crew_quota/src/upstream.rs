@@ -173,8 +173,14 @@ impl QuotaService {
             schedule.restoring = true;
         }
         let record = self.ports.store.load(format!("snapshot/{}", scope.id), cx);
+        let attempt = if scope.id == "llm-provider:x_ai" {
+            self.ports.store.load(format!("attempt/{}", scope.id), cx)
+        } else {
+            Task::ready(Ok(None))
+        };
         cx.spawn(async move |this, cx| {
             let record = record.await;
+            let attempt = attempt.await;
             this.update(cx, |service, cx| {
                 let Some(account) = service.core.snapshot.accounts.get(&scope.id) else {
                     return;
@@ -184,6 +190,34 @@ impl QuotaService {
                 }
                 if let Some(schedule) = service.scheduler.scopes.get_mut(&scope.id) {
                     schedule.restoring = false;
+                }
+                match attempt {
+                    Ok(Some(record)) => {
+                        match decode_attempt(&record, &scope, service.ports.clock.now()) {
+                            Ok(attempt) => service.scheduler.restore_timing(
+                                &scope.id,
+                                Some(attempt.at),
+                                0,
+                                0,
+                                service.ports.clock.now(),
+                                service.ports.clock.monotonic(),
+                            ),
+                            Err(_) => {
+                                if let Some(schedule) = service.scheduler.scopes.get_mut(&scope.id)
+                                {
+                                    schedule.suspended = true;
+                                }
+                                service.persistence_failure(scope.id.clone(), cx);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(schedule) = service.scheduler.scopes.get_mut(&scope.id) {
+                            schedule.suspended = true;
+                        }
+                        service.persistence_failure(scope.id.clone(), cx);
+                    }
+                    Ok(None) => {}
                 }
                 match record {
                     Ok(Some(record)) => {
@@ -263,6 +297,9 @@ impl QuotaService {
                     Some(record) => store.save(key, record, cx),
                     None => {
                         let snapshot = store.delete(key, cx);
+                        if scope == "llm-provider:x_ai" {
+                            return snapshot;
+                        }
                         let attempt = store.delete(format!("attempt/{scope}"), cx);
                         cx.background_spawn(async move {
                             snapshot.await?;
@@ -366,6 +403,16 @@ impl QuotaService {
             .deadline
             .min(self.ports.clock.now().saturating_add(300));
         let until = Rc::new(Cell::new(until));
+        if request.selector.matches(&AccountScope {
+            id: "llm-provider:x_ai".into(),
+            provider: ProviderId::LlmProvider,
+            category: AccountCategory::LlmProvider,
+            native_provider_id: Some("x_ai".into()),
+            runtime: "native-api".into(),
+            identity_known: false,
+        }) {
+            self.scheduler.force("llm-provider:x_ai");
+        }
         self.demands.push(Demand {
             allow_inference: request.allow_inference,
             selector: request.selector,
@@ -855,7 +902,9 @@ impl QuotaService {
                 })
                 .min();
             if let Some(reset) = reset {
-                self.scheduler.reset_due(&account.scope.id, reset);
+                if account.scope.id != "llm-provider:x_ai" {
+                    self.scheduler.reset_due(&account.scope.id, reset);
+                }
             }
             cx.emit(QuotaEvent::FreshnessChanged(account.scope.id.clone()));
         }
