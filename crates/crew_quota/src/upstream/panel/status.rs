@@ -132,7 +132,10 @@ fn numeric_summary(account: &AccountState, used: bool) -> Option<String> {
             .into(),
         );
     }
-    if account.availability == Availability::NotLoggedIn {
+    if matches!(
+        account.availability,
+        Availability::NotSetUp | Availability::NotLoggedIn
+    ) {
         return None;
     }
     let summary = visible_windows(account)
@@ -315,6 +318,8 @@ mod tests {
         let preview = super::super::preview::FixturePreview::new(1000, false);
         let mut account = preview.snapshot.accounts["codex"].clone();
         assert!(numeric_summary(&account, false).is_some());
+        account.availability = Availability::NotSetUp;
+        assert!(numeric_summary(&account, false).is_none());
         account.availability = Availability::NotLoggedIn;
         assert!(numeric_summary(&account, false).is_none());
         account.windows.clear();

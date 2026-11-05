@@ -723,6 +723,7 @@ pub(super) fn account_status(account: &AccountState, now: Timestamp) -> String {
             "Probe access unavailable — listening for session updates"
         }
         Availability::NotInstalled => "Not installed",
+        Availability::NotSetUp => "Not set up",
         Availability::NotLoggedIn => "Not logged in",
         Availability::Unavailable(ErrorCode::AttributionAmbiguous) => {
             "Unavailable · cannot attribute: SuperGrok and API key both signed in"
@@ -931,6 +932,18 @@ impl Render for QuotaPanel {
                         .child(Icon::new(icon).size(IconSize::Small))
                         .child(Label::new(name)),
                 );
+                if account.availability == Availability::NotSetUp {
+                    provider = provider.child(
+                        header.child(
+                            ButtonLike::new(format!("quota-setup-{provider_id:?}"))
+                                .child(badge("Not set up", Color::Muted, cx))
+                                .tooltip(Tooltip::text(
+                                    "Open a thread with this agent to finish installing",
+                                )),
+                        ),
+                    );
+                    continue;
+                }
                 if logged_out {
                     provider =
                         provider.child(header.child(badge("Not logged in", Color::Muted, cx)));
@@ -1688,8 +1701,19 @@ mod tests {
             .expect("codex")
             .scope
             .clone();
-        core.inventory(scope, 2, Availability::NotLoggedIn)
-            .expect("installed after startup");
+        core.inventory(scope.clone(), 2, Availability::NotSetUp)
+            .expect("configured before download");
+        assert_eq!(provider_rows(&core.snapshot).len(), 2);
+        assert_eq!(
+            account_status(&core.snapshot.accounts["codex"], 100),
+            "Not set up"
+        );
+        assert!(visible_windows(&core.snapshot.accounts["codex"]).is_empty());
+        core.inventory(scope.clone(), 3, Availability::Ready)
+            .expect("download completed");
+        assert_eq!(provider_rows(&core.snapshot).len(), 2);
+        core.inventory(scope, 4, Availability::NotLoggedIn)
+            .expect("installed without login");
         assert_eq!(provider_rows(&core.snapshot).len(), 2);
         for account in core.snapshot.accounts.values() {
             let text = account_status(account, 100);

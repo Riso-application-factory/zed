@@ -697,6 +697,7 @@ impl QuotaService {
                     matches!(
                         account.availability,
                         Availability::NotInstalled
+                            | Availability::NotSetUp
                             | Availability::NotLoggedIn
                             | Availability::Unsupported(_)
                     )
@@ -1235,7 +1236,7 @@ fn sync_inventory(
                     .map_or(1, |account| account.generation.saturating_add(1));
                 let availability = match status {
                     Ok(AgentInstallStatus::Installed { .. }) => Availability::Ready,
-                    Ok(AgentInstallStatus::NotInstalled) => Availability::NotInstalled,
+                    Ok(AgentInstallStatus::NotInstalled) => Availability::NotSetUp,
                     Ok(AgentInstallStatus::Unmanaged) => {
                         Availability::Unsupported(ErrorCode::UnsupportedVersion)
                     }
@@ -1316,6 +1317,7 @@ fn sync_inventory(
                 }
                 this.finish_init(Ok(()));
                 cx.emit(QuotaEvent::AvailabilityChanged(scope_id));
+                cx.notify();
                 this.evaluate(cx);
                 this.wake();
             })
@@ -1594,8 +1596,12 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        let (service, _, _, _) = harness(cx);
-        service.update(cx, |service, _| service._project = Some(project));
+        let (service, _, source, _) = harness(cx);
+        service.update(cx, |service, _| {
+            service.core.snapshot.accounts.clear();
+            service.scheduler.scopes.clear();
+            service._project = Some(project);
+        });
         let task = service.update(cx, |service, cx| service.recheck_inventory("tick", cx));
         task.await;
         service.read_with(cx, |service, _| {
@@ -1606,9 +1612,11 @@ mod tests {
                     .accounts
                     .values()
                     .any(|account| account.scope.provider == ProviderId::Codex
-                        && account.availability == Availability::NotInstalled)
+                        && account.availability == Availability::NotSetUp)
             )
         });
+        service.update(cx, |service, cx| service.evaluate(cx));
+        assert_eq!(source.calls.get(), 0);
         filesystem.insert_tree(paths::external_agents_dir().join("registry/npx/codex-acp/node_modules"), serde_json::json!({ "codex-acp": { "package.json": r#"{"version":"1.0.0","bin":"cli.js"}"#, "cli.js": "" } })).await;
         let task = service.update(cx, |service, cx| service.recheck_inventory("tick", cx));
         task.await;
@@ -1963,6 +1971,7 @@ mod tests {
 fn installation_code(availability: &Availability) -> &'static str {
     match availability {
         Availability::NotInstalled => "not_installed",
+        Availability::NotSetUp => "not_set_up",
         Availability::Unsupported(_) => "unsupported",
         Availability::Error(_) => "error",
         _ => "installed",

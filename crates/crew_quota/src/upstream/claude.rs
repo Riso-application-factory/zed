@@ -377,7 +377,7 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
             let availability = match status {
                 Some(status) => match status.await {
                     Ok(AgentInstallStatus::Installed { .. }) if eligible => Availability::Unknown,
-                    Ok(AgentInstallStatus::NotInstalled) => Availability::NotInstalled,
+                    Ok(AgentInstallStatus::NotInstalled) => Availability::NotSetUp,
                     _ => Availability::Unsupported(ErrorCode::UnsupportedVersion),
                 },
                 None => Availability::NotInstalled,
@@ -456,6 +456,7 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                         }
                         Ok(None) => {}
                     }
+                    cx.emit(QuotaEvent::AvailabilityChanged(scope.id));
                     service.wake();
                     cx.notify();
                 })

@@ -187,7 +187,9 @@ impl QuotaCore {
         {
             matched = true;
             match account.availability {
-                Availability::NotInstalled => return Err(RefreshError::NotInstalled),
+                Availability::NotInstalled | Availability::NotSetUp => {
+                    return Err(RefreshError::NotInstalled);
+                }
                 Availability::NotLoggedIn => return Err(RefreshError::NotLoggedIn),
                 Availability::Unsupported(_) => return Err(RefreshError::Unsupported),
                 _ => {}

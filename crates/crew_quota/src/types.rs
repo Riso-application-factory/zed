@@ -131,6 +131,7 @@ pub enum Availability {
     Unknown,
     Unsupported(ErrorCode),
     NotInstalled,
+    NotSetUp,
     NotLoggedIn,
     Unavailable(ErrorCode),
     Error(ErrorCode),
