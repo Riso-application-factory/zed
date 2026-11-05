@@ -301,3 +301,11 @@ KeychainCredentialsProvider, so its reads can prompt exactly as Settings can.
 Only provider IDs and coarse authentication/load states are logged; errors and
 credential material are not logged. Observation-only providers appear once Zed
 itself authenticates them.
+
+On every app start, hydration displays persisted data before a single startup
+refresh per eligible active source. This pass bypasses TTL, minimum intervals,
+and retry timing while retaining safety latches, protocol gates, single-flight,
+and bounded concurrency. Normal cadence and backoff resume after that attempt.
+Antigravity therefore creates one `/usage` session per app start in addition to
+normal cadence; this is an accepted cost of showing current usage at startup.
+Native providers remain passive until an active adapter joins the startup hook.

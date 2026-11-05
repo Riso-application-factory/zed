@@ -25,6 +25,7 @@ pub struct Schedule {
     pub restoring: bool,
     pub demand_until: Timestamp,
     pub forced: bool,
+    pub startup_pending: bool,
     pub reset_at: Option<Timestamp>,
     pub handled_resets: BTreeSet<Timestamp>,
     pub order: u64,
@@ -35,6 +36,7 @@ pub struct Schedule {
 pub struct Scheduler {
     pub scopes: BTreeMap<String, Schedule>,
     order: u64,
+    startup_seen: BTreeSet<String>,
 }
 
 impl Scheduler {
@@ -71,12 +73,21 @@ impl Scheduler {
                 restoring: false,
                 demand_until: 0,
                 forced: false,
+                startup_pending: previous.as_ref().is_some_and(|state| state.startup_pending),
                 reset_at: None,
                 handled_resets: BTreeSet::new(),
                 order: self.order,
                 queued_at: None,
             },
         );
+    }
+    /// Native providers are passive today; active adapters can join this pass here.
+    pub fn startup(&mut self, scope: &str) {
+        if self.startup_seen.insert(scope.to_owned()) {
+            if let Some(state) = self.scopes.get_mut(scope) {
+                state.startup_pending = true;
+            }
+        }
     }
     pub fn demand(&mut self, scope: &str, until: Timestamp) {
         if let Some(state) = self.scopes.get_mut(scope) {
@@ -110,6 +121,9 @@ impl Scheduler {
         }
     }
     pub fn next_for(state: &Schedule, now: Timestamp, monotonic: u64) -> Timestamp {
+        if state.startup_pending {
+            return now;
+        }
         let until = |at: Option<Timestamp>, anchor: Option<u64>, interval: u64| -> u64 {
             match anchor {
                 Some(anchor) => anchor.saturating_add(interval).saturating_sub(monotonic),
@@ -205,7 +219,8 @@ impl Scheduler {
                     && !state.suspended
                     && !state.restoring
                     && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
-                        || (state.provider == ProviderId::Claude && state.demand_until > now))
+                        || (state.provider == ProviderId::Claude
+                            && (state.startup_pending || state.demand_until > now)))
             })
             .map(|state| {
                 let due = Self::next_for(state, now, monotonic);
@@ -231,7 +246,8 @@ impl Scheduler {
                 && !state.suspended
                 && !state.restoring
                 && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
-                    || (state.provider == ProviderId::Claude && state.demand_until > now))
+                    || (state.provider == ProviderId::Claude
+                        && (state.startup_pending || state.demand_until > now)))
                 && Self::next_for(state, now, monotonic) <= now
             {
                 state.queued_at.get_or_insert(now);
@@ -247,11 +263,13 @@ impl Scheduler {
                     && !state.suspended
                     && !state.restoring
                     && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
-                        || (state.provider == ProviderId::Claude && state.demand_until > now))
+                        || (state.provider == ProviderId::Claude
+                            && (state.startup_pending || state.demand_until > now)))
                     && Self::next_for(state, now, monotonic) <= now
-                    && state.last_monotonic.is_none_or(|attempt| {
-                        monotonic.saturating_sub(attempt) >= Self::floor(state.provider)
-                    })
+                    && (state.startup_pending
+                        || state.last_monotonic.is_none_or(|attempt| {
+                            monotonic.saturating_sub(attempt) >= Self::floor(state.provider)
+                        }))
             })
             .map(|(scope, state)| {
                 (
@@ -282,6 +300,13 @@ impl Scheduler {
                 billable = true;
             }
             if let Some(state) = self.scopes.get_mut(&scope) {
+                if state.startup_pending {
+                    log::info!(
+                        "crew_quota: refresh_trigger=startup agent={:?} outcome=Attempt",
+                        state.provider
+                    );
+                    state.startup_pending = false;
+                }
                 state.queued_at = None;
                 state.in_flight = true;
                 state.forced = false;
@@ -354,4 +379,51 @@ pub fn retry_after(value: &str, now: Timestamp) -> Option<Timestamp> {
     chrono::DateTime::parse_from_rfc2822(value)
         .ok()
         .map(|date| date.timestamp().max(now))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_bypasses_timing_once_for_every_active_provider() {
+        for provider in [
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Antigravity,
+        ] {
+            let mut scheduler = Scheduler::default();
+            scheduler.track("scope".into(), provider, 1);
+            scheduler.restore_timing("scope", Some(100), 900, 3, 100, 0);
+            scheduler.passive("scope", 100, 0);
+            scheduler.startup("scope");
+            assert_eq!(scheduler.start_due(100, 0), vec![("scope".into(), 1)]);
+            scheduler.startup("scope");
+            assert!(scheduler.start_due(100, 0).is_empty());
+            scheduler.complete("scope", 100, 0, true, None);
+            scheduler.track("scope".into(), provider, 2);
+            scheduler.startup("scope");
+            assert!(scheduler.start_due(100, 0).is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_respects_suspension_and_hydration() {
+        for provider in [
+            ProviderId::Codex,
+            ProviderId::Claude,
+            ProviderId::Antigravity,
+        ] {
+            let mut scheduler = Scheduler::default();
+            scheduler.track("scope".into(), provider, 1);
+            scheduler.startup("scope");
+            let state = scheduler.scopes.get_mut("scope").expect("tracked");
+            state.suspended = true;
+            assert!(scheduler.start_due(100, 0).is_empty());
+            let state = scheduler.scopes.get_mut("scope").expect("tracked");
+            state.suspended = false;
+            state.restoring = true;
+            assert!(scheduler.start_due(100, 0).is_empty());
+        }
+    }
 }

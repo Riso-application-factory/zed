@@ -168,6 +168,7 @@ impl EventEmitter<QuotaEvent> for QuotaService {}
 
 impl QuotaService {
     fn restore_snapshot(&mut self, scope: AccountScope, generation: u64, cx: &mut Context<Self>) {
+        self.scheduler.startup(&scope.id);
         if let Some(schedule) = self.scheduler.scopes.get_mut(&scope.id) {
             schedule.restoring = true;
         }
@@ -1581,7 +1582,7 @@ mod tests {
         }
     }
     #[gpui::test]
-    async fn restart_restores_numbers_without_reading_before_floor(cx: &mut TestAppContext) {
+    async fn restart_restores_numbers_then_schedules_startup_before_floor(cx: &mut TestAppContext) {
         let (service, clock, source, store) = harness(cx);
         let observation = cx
             .update(|cx| source.refresh("scope".into(), 1, 0, cx))
@@ -1645,6 +1646,7 @@ mod tests {
                     ..
                 }
             )));
+            assert!(!service.scheduler.scopes[&scope.id].startup_pending);
             assert!(
                 service
                     .scheduler
@@ -1652,7 +1654,7 @@ mod tests {
                     .is_empty()
             );
         });
-        assert_eq!(source.calls.get(), calls);
+        assert_eq!(source.calls.get(), calls + 1);
         let saved = store
             .records
             .borrow()
