@@ -141,6 +141,35 @@ fn numeric_summary(account: &AccountState, used: bool) -> Option<String> {
     (!summary.is_empty()).then_some(summary)
 }
 
+fn tooltip_text(account: &AccountState, now: Timestamp) -> String {
+    let name = match account.scope.provider {
+        ProviderId::Claude => "Claude",
+        ProviderId::Codex => "Codex",
+        ProviderId::Antigravity => "Antigravity",
+        ProviderId::Grok => "Grok",
+    };
+    let mut lines = vec![name.to_string()];
+    for window in visible_windows(account) {
+        let reset = window.reset_at.as_ref().and_then(|sample| sample.value);
+        let reset = if reset.is_some() {
+            countdown(reset, now)
+        } else {
+            "Reset time unavailable".into()
+        };
+        lines.push(format!(
+            "{} {} · {}",
+            window_title(account, window),
+            window_value(window, false),
+            reset
+        ));
+    }
+    let status = account_status(account, now);
+    if !status.is_empty() {
+        lines.push(status);
+    }
+    lines.join("\n")
+}
+
 impl Render for QuotaStatusItem {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let provider = self.visible_provider(cx);
@@ -167,14 +196,14 @@ impl Render for QuotaStatusItem {
                 .filter(|row| row.provider == provider)
             {
                 for account in row.accounts {
-                    let status = account_status(account, now);
+                    let tooltip = tooltip_text(account, now);
                     let Some(summary) = numeric_summary(account, preferences.used) else {
                         continue;
                     };
                     content = content.child(
                         div()
                             .id("quota-active-thread")
-                            .tooltip(Tooltip::text(status))
+                            .tooltip(Tooltip::text(tooltip))
                             .child(Label::new(summary).size(LabelSize::Small)),
                     );
                 }
@@ -187,6 +216,33 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn healthy_footer_tooltip_has_provider_remaining_quota_and_resets() {
+        let preview = super::super::preview::FixturePreview::new(1000, false);
+        let mut account = preview
+            .snapshot
+            .accounts
+            .get("codex")
+            .expect("Codex fixture")
+            .clone();
+        account.availability = Availability::Ready;
+        account.refresh = RefreshState::Idle;
+        for window in account.windows.values_mut() {
+            if let Some(used) = &mut window.used_fraction {
+                used.value = Some(0.16);
+            }
+            if let Some(reset) = &mut window.reset_at {
+                reset.value = Some(4600);
+            }
+        }
+        let text = tooltip_text(&account, 1000);
+        assert!(text.contains("Codex"), "tooltip has no provider: {text:?}");
+        assert!(text.contains("5h 84% left"), "{text}");
+        assert!(text.contains("Week 84% left"), "{text}");
+        assert_eq!(text.matches("Resets in 1h 0m").count(), 2, "{text}");
+    }
 
     #[cfg(debug_assertions)]
     #[test]
