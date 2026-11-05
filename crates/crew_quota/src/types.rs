@@ -298,8 +298,25 @@ pub struct PlanInfo {
     pub source: SourceKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrokBlockReason {
+    SpendingLimit,
+    RateLimited,
+    Forbidden,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GrokResponse {
+    pub blocked: Option<GrokBlockReason>,
+    pub status: u16,
+    pub observed_at: Timestamp,
+    pub retry_at: Option<Timestamp>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AccountMetadata {
+    #[serde(default)]
+    pub grok_response: Option<GrokResponse>,
     pub plan: Option<PlanInfo>,
     pub ordinary_usage_allowed: Option<bool>,
     pub spend_control_reached: Option<bool>,

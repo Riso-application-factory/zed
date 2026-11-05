@@ -54,7 +54,7 @@ impl HttpClient for Observer {
         let future = self.inner.send(request);
         let sender = self.sender.clone();
         Box::pin(async move {
-            let response = future.await.inspect_err(|_| {
+            let mut response = future.await.inspect_err(|_| {
                 if endpoint.is_some() {
                     log::info!("crew_quota: agent=Grok source=Headers outcome=TransportError");
                 }
@@ -62,7 +62,14 @@ impl HttpClient for Observer {
             if let (Some(endpoint), Some(target)) = (endpoint, target) {
                 let now = chrono::Utc::now().timestamp();
                 let windows = parse(response.headers(), &target.scope, &endpoint);
-                if !windows.is_empty() {
+                let status = response.status().as_u16();
+                let blocked = classify_response(&mut response).await;
+                if let Some(reason) = blocked {
+                    log::info!(
+                        "crew_quota: agent=Grok source=Headers outcome=Blocked reason={reason:?}"
+                    );
+                }
+                if blocked.is_some() || (response.status().is_success() && !windows.is_empty()) {
                     let observation = Observation {
                         scope: target.scope,
                         generation: target.generation,
@@ -74,7 +81,15 @@ impl HttpClient for Observer {
                         start_sequence: None,
                         windows,
                         complete: false,
-                        metadata: AccountMetadata::default(),
+                        metadata: AccountMetadata {
+                            grok_response: Some(GrokResponse {
+                                blocked,
+                                status,
+                                observed_at: now,
+                                retry_at: retry_after(response.headers(), now),
+                            }),
+                            ..Default::default()
+                        },
                     };
                     // Losing telemetry must never apply backpressure to inference.
                     match sender.try_send(HeaderObservation {
@@ -95,6 +110,70 @@ impl HttpClient for Observer {
             Ok(response)
         })
     }
+}
+
+#[derive(serde::Deserialize)]
+struct ErrorCodeBody {
+    code: Option<String>,
+}
+
+async fn classify_response(response: &mut Response<AsyncBody>) -> Option<GrokBlockReason> {
+    use futures::AsyncReadExt as _;
+    let status = response.status();
+    if status.is_success() {
+        return None;
+    }
+    let fallback = if status.as_u16() == 429 {
+        Some(GrokBlockReason::RateLimited)
+    } else if status.is_client_error() {
+        Some(GrokBlockReason::Forbidden)
+    } else {
+        None
+    };
+    if response.headers().get("content-type").is_some_and(|value| {
+        value
+            .to_str()
+            .is_ok_and(|value| value.starts_with("text/event-stream"))
+    }) {
+        return fallback;
+    }
+    let mut body = std::mem::replace(response.body_mut(), AsyncBody::empty());
+    let mut prefix = Vec::new();
+    // Retain the unread tail and replay even read errors to preserve the caller's response.
+    let mut exhausted = false;
+    while prefix.len() < 8192 {
+        let mut buffer = [0; 1024];
+        let length = (8192 - prefix.len()).min(buffer.len());
+        match body.read(&mut buffer[..length]).await {
+            Ok(0) => {
+                exhausted = true;
+                break;
+            }
+            Ok(length) => prefix.extend_from_slice(&buffer[..length]),
+            Err(error) => {
+                let replay = futures::stream::once(async move { Err::<Vec<u8>, _>(error) });
+                use futures::TryStreamExt as _;
+                *response.body_mut() = AsyncBody::from_reader(
+                    futures::io::Cursor::new(prefix)
+                        .chain(replay.into_async_read())
+                        .chain(body),
+                );
+                return fallback;
+            }
+        }
+    }
+    let reason = if exhausted {
+        serde_json::from_slice::<ErrorCodeBody>(&prefix)
+            .ok()
+            .and_then(|value| value.code)
+            .filter(|code| code.contains("spending-limit"))
+            .map(|_| GrokBlockReason::SpendingLimit)
+            .or(fallback)
+    } else {
+        fallback
+    };
+    *response.body_mut() = AsyncBody::from_reader(futures::io::Cursor::new(prefix).chain(body));
+    reason
 }
 
 fn is_xai_host(request: &Request<AsyncBody>) -> bool {
@@ -316,11 +395,12 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
                         match result {
                             Ok(Some(record)) => {
                                 if let Some(account) = service.core.snapshot.accounts.get_mut(&scope)
-                                    && account.generation == generation && account.windows.is_empty()
+                                    && account.generation == generation && account.windows.is_empty() && account.metadata.grok_response.is_none()
                                 {
                                     match decode_record(&record, &account.scope, service.ports.clock.now()) {
                                         Ok(record) => {
                                             account.windows = record.account.windows;
+                                            account.metadata.grok_response = record.account.metadata.grok_response;
                                             account.last_success_at = record.account.last_success_at;
                                             account.availability = Availability::Ready;
                                             service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
@@ -462,6 +542,138 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
 mod tests {
     use super::*;
     use futures::AsyncReadExt as _;
+
+    #[test]
+    fn non_xai_errors_are_untouched() -> anyhow::Result<()> {
+        smol::block_on(async {
+            let inner = http_client::FakeHttpClient::create(|_| async {
+                Ok(Response::builder().status(403).body(AsyncBody::from(
+                    r#"{"code":"personal-team-blocked:spending-limit"}"#,
+                ))?)
+            });
+            let (sender, receiver) = async_channel::bounded(1);
+            let observer = Observer {
+                inner,
+                sender,
+                target: Arc::new(Mutex::new(Some(Target {
+                    scope: "test".into(),
+                    generation: 0,
+                }))),
+            };
+            let mut response = observer
+                .send(
+                    Request::builder()
+                        .method("POST")
+                        .uri("https://example.com/v1/chat/completions")
+                        .body(AsyncBody::empty())?,
+                )
+                .await?;
+            let mut bytes = String::new();
+            response.body_mut().read_to_string(&mut bytes).await?;
+            assert_eq!(bytes, r#"{"code":"personal-team-blocked:spending-limit"}"#);
+            assert_eq!(response.status(), 403);
+            assert!(receiver.try_recv().is_err());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn blocked_responses_are_transparent_and_success_clears() -> anyhow::Result<()> {
+        smol::block_on(async {
+            let mut core = QuotaCore::default();
+            core.inventory(
+                AccountScope {
+                    id: "test".into(),
+                    provider: ProviderId::Grok,
+                    runtime: "native-xai".into(),
+                    identity_known: false,
+                },
+                0,
+                Availability::Unknown,
+            )
+            .expect("inventory");
+            let cases = [
+                (403, r#"{"code":"personal-team-blocked:spending-limit","error":"never retain this"}"#.to_string(), Some(GrokBlockReason::SpendingLimit)),
+                (429, "invalid".into(), Some(GrokBlockReason::RateLimited)),
+                (403, "invalid".into(), Some(GrokBlockReason::Forbidden)),
+                (403, format!(r#"{{"code":"personal-team-blocked:spending-limit","error":"{}"}}"#, "x".repeat(8192)), Some(GrokBlockReason::Forbidden)),
+                (200, "success".into(), None),
+            ];
+            for (index, (status, bytes, expected)) in cases.into_iter().enumerate() {
+                let original = bytes.clone();
+                let inner = http_client::FakeHttpClient::create(move |_| {
+                    let bytes = bytes.clone();
+                    async move {
+                        Ok(Response::builder()
+                            .status(status)
+                            .header("retry-after", "30")
+                            .header("x-ratelimit-limit-requests", "100")
+                            .body(AsyncBody::from(bytes))?)
+                    }
+                });
+                let (sender, receiver) = async_channel::bounded(1);
+                let observer = Observer {
+                    inner,
+                    sender,
+                    target: Arc::new(Mutex::new(Some(Target {
+                        scope: "test".into(),
+                        generation: 0,
+                    }))),
+                };
+                let mut response = observer
+                    .send(
+                        Request::builder()
+                            .method("POST")
+                            .uri("https://api.x.ai/v1/chat/completions")
+                            .body(AsyncBody::empty())?,
+                    )
+                    .await?;
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(response.headers()["retry-after"], "30");
+                let mut forwarded = String::new();
+                response.body_mut().read_to_string(&mut forwarded).await?;
+                assert_eq!(forwarded, original);
+                let mut observation = receiver.try_recv()?.quota;
+                observation.sequence = index as u64 + 1;
+                let now = observation.observed_at;
+                let signal = observation.metadata.grok_response.as_ref().expect("signal");
+                assert_eq!(signal.blocked, expected);
+                assert_eq!(signal.retry_at, Some(now + 30));
+                core.apply(observation, now).expect("apply");
+                let account = core.snapshot.accounts.get("test").expect("account");
+                assert_eq!(
+                    account
+                        .metadata
+                        .grok_response
+                        .as_ref()
+                        .expect("signal")
+                        .blocked,
+                    expected
+                );
+                let stored = encode_record(&StoredRecord {
+                    schema_version: 1,
+                    revision: core.snapshot.revision,
+                    account: account.clone(),
+                    failures: 0,
+                    retry_at: 0,
+                })
+                .expect("encode signal");
+                assert!(!stored.contains("never retain this"));
+                let restored =
+                    decode_record(&stored, &account.scope, now + 60).expect("restore signal");
+                assert_eq!(
+                    restored.account.metadata.grok_response,
+                    account.metadata.grok_response
+                );
+                let panel = super::super::panel::account_status(account, now);
+                if expected == Some(GrokBlockReason::SpendingLimit) {
+                    assert!(panel.contains("Out of credits"));
+                    assert!(panel.contains("grok.com"));
+                }
+            }
+            Ok(())
+        })
+    }
 
     #[gpui::test]
     async fn native_grok_43_thinking_stream_observes_headers(cx: &mut gpui::TestAppContext) {

@@ -117,6 +117,21 @@ fn provider_for_thread(visible: bool, agent: Option<&str>) -> Option<ProviderId>
 }
 
 fn numeric_summary(account: &AccountState, used: bool) -> Option<String> {
+    if let Some(reason) = account
+        .metadata
+        .grok_response
+        .as_ref()
+        .and_then(|response| response.blocked)
+    {
+        return Some(
+            match reason {
+                GrokBlockReason::SpendingLimit => "Grok: out of credits",
+                GrokBlockReason::RateLimited => "Grok: rate limited",
+                GrokBlockReason::Forbidden => "Grok: blocked",
+            }
+            .into(),
+        );
+    }
     if account.availability == Availability::NotLoggedIn {
         return None;
     }
@@ -204,7 +219,16 @@ impl Render for QuotaStatusItem {
                         div()
                             .id("quota-active-thread")
                             .tooltip(Tooltip::text(tooltip))
-                            .child(Label::new(summary).size(LabelSize::Small)),
+                            .child(
+                                Label::new(summary).size(LabelSize::Small).when(
+                                    account
+                                        .metadata
+                                        .grok_response
+                                        .as_ref()
+                                        .is_some_and(|response| response.blocked.is_some()),
+                                    |label| label.color(Color::Error),
+                                ),
+                            ),
                     );
                 }
             }
@@ -216,6 +240,47 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn blocked_grok_footer_and_panel_override_waiting() {
+        let preview = super::super::preview::FixturePreview::new(1000, false);
+        let mut account = preview.snapshot.accounts["codex"].clone();
+        account.scope.provider = ProviderId::Grok;
+        account.availability = Availability::Unknown;
+        account.windows.clear();
+        for (reason, summary, panel) in [
+            (
+                GrokBlockReason::SpendingLimit,
+                "Grok: out of credits",
+                "Out of credits / spending limit",
+            ),
+            (
+                GrokBlockReason::RateLimited,
+                "Grok: rate limited",
+                "Rate limited · Retry in 20s",
+            ),
+            (
+                GrokBlockReason::Forbidden,
+                "Grok: blocked",
+                "Blocked · HTTP 4xx",
+            ),
+        ] {
+            account.metadata.grok_response = Some(GrokResponse {
+                blocked: Some(reason),
+                status: 403,
+                observed_at: 1000,
+                retry_at: Some(1030),
+            });
+            assert_eq!(numeric_summary(&account, false).as_deref(), Some(summary));
+            let status = account_status(&account, 1010);
+            assert!(status.contains(panel), "{status}");
+            assert!(status.contains("observed 10s ago"));
+            assert!(!status.contains("Waiting"));
+        }
+        account.metadata.grok_response = None;
+        assert!(numeric_summary(&account, false).is_none());
+    }
 
     #[cfg(debug_assertions)]
     #[test]

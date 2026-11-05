@@ -674,7 +674,30 @@ fn age(updated: Option<Timestamp>, now: Timestamp) -> String {
         })
         .unwrap_or_else(|| "Not yet updated".into())
 }
-fn account_status(account: &AccountState, now: Timestamp) -> String {
+pub(super) fn account_status(account: &AccountState, now: Timestamp) -> String {
+    if let Some(response) = account.metadata.grok_response.as_ref()
+        && let Some(reason) = response.blocked
+    {
+        let description = match reason {
+            GrokBlockReason::SpendingLimit => {
+                "Out of credits / spending limit · Add credits or upgrade at grok.com".to_string()
+            }
+            GrokBlockReason::RateLimited => response.retry_at.map_or_else(
+                || "Rate limited".to_string(),
+                |retry_at| {
+                    format!(
+                        "Rate limited · Retry in {}s",
+                        retry_at.saturating_sub(now).max(0)
+                    )
+                },
+            ),
+            GrokBlockReason::Forbidden => format!("Blocked · HTTP {}xx", response.status / 100),
+        };
+        return format!(
+            "{description} · observed {}s ago",
+            now.saturating_sub(response.observed_at).max(0)
+        );
+    }
     let availability = match account.availability {
         Availability::Unknown if account.scope.provider == ProviderId::Grok => {
             "Waiting for a Grok response"
