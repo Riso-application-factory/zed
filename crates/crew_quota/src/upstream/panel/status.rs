@@ -206,6 +206,7 @@ fn tooltip_text(account: &AccountState, now: Timestamp) -> String {
     if !status.is_empty() {
         lines.push(status);
     }
+    lines.push(age(account.last_success_at, now));
     lines.join("\n")
 }
 
@@ -251,7 +252,18 @@ impl Render for QuotaStatusItem {
                         div()
                             .id("quota-active-thread")
                             .tooltip(Tooltip::text(tooltip))
-                            .child(Label::new(summary).size(LabelSize::Small)),
+                            .child(Label::new(summary).size(LabelSize::Small).color(
+                                if account.windows.values().any(|window| {
+                                    window.freshness(
+                                        now,
+                                        default_max_age(account.scope.provider, true),
+                                    ) != Freshness::Fresh
+                                }) {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                },
+                            )),
                     );
                 }
             }
@@ -263,6 +275,39 @@ impl Render for QuotaStatusItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn restored_antigravity_is_visible_with_age_and_stale_state() {
+        let preview = super::super::preview::FixturePreview::new(1000, false);
+        let account = preview
+            .snapshot
+            .accounts
+            .get("antigravity")
+            .expect("fixture");
+        let record = StoredRecord {
+            schema_version: 1,
+            revision: 1,
+            account: account.clone(),
+            failures: 0,
+            retry_at: 0,
+        };
+        let encoded = encode_record(&record).expect("encode");
+        let restored = decode_record(&encoded, &account.scope, 1120).expect("restore");
+        assert_eq!(
+            numeric_summary(&restored.account, false),
+            numeric_summary(account, false)
+        );
+        assert!(account_status(&restored.account, 1120).contains("Stale"));
+        assert!(tooltip_text(&restored.account, 1120).contains("Updated 3 min ago"));
+        assert!(tooltip_text(&restored.account, 1120).contains("Stale"));
+        let mut scope = account.scope.clone();
+        scope.runtime = "different-account".into();
+        assert!(decode_record(&encoded, &scope, 1120).is_err());
+        let mut empty = restored.account;
+        empty.windows.clear();
+        assert!(numeric_summary(&empty, false).is_none());
+    }
 
     #[test]
     fn antigravity_registry_identity_selects_provider() {

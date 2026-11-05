@@ -27,6 +27,7 @@ use project::{
     agent_server_store::{AgentInstallStatus, AllAgentServersSettings, CustomAgentServerSettings},
 };
 use settings::SettingsStore;
+use util::ResultExt as _;
 use workspace::AppState;
 
 use crate::*;
@@ -166,6 +167,81 @@ pub struct QuotaService {
 impl EventEmitter<QuotaEvent> for QuotaService {}
 
 impl QuotaService {
+    fn restore_snapshot(&mut self, scope: AccountScope, generation: u64, cx: &mut Context<Self>) {
+        if let Some(schedule) = self.scheduler.scopes.get_mut(&scope.id) {
+            schedule.restoring = true;
+        }
+        let record = self.ports.store.load(format!("snapshot/{}", scope.id), cx);
+        cx.spawn(async move |this, cx| {
+            let record = record.await;
+            this.update(cx, |service, cx| {
+                let Some(account) = service.core.snapshot.accounts.get(&scope.id) else {
+                    return;
+                };
+                if account.scope != scope || account.generation != generation {
+                    return;
+                }
+                if let Some(schedule) = service.scheduler.scopes.get_mut(&scope.id) {
+                    schedule.restoring = false;
+                }
+                match record {
+                    Ok(Some(record)) => {
+                        match decode_record(&record, &scope, service.ports.clock.now()) {
+                            Ok(record) => {
+                                service.scheduler.restore_timing(
+                                    &scope.id,
+                                    record.account.last_attempt_at,
+                                    record.retry_at,
+                                    record.failures,
+                                    service.ports.clock.now(),
+                                    service.ports.clock.monotonic(),
+                                );
+                                if let Some(account) =
+                                    service.core.snapshot.accounts.get_mut(&scope.id)
+                                {
+                                    // A live observation may arrive while storage is being read.
+                                    if account.last_success_at.is_none() {
+                                        account.windows = record.account.windows;
+                                        account.last_success_at = record.account.last_success_at;
+                                        account.source_version = record.account.source_version;
+                                        account.complete = record.account.complete;
+                                        account.sequence = record.account.sequence;
+                                        let native_provider =
+                                            account.metadata.native_provider.clone();
+                                        account.metadata = record.account.metadata;
+                                        if native_provider.is_some() {
+                                            account.metadata.native_provider = native_provider;
+                                        }
+                                    }
+                                }
+                                service.core.snapshot.revision =
+                                    service.core.snapshot.revision.saturating_add(1);
+                                cx.emit(QuotaEvent::Changed {
+                                    scopes: vec![scope.id],
+                                    windows: Vec::new(),
+                                    revision: service.core.snapshot.revision,
+                                });
+                                service.wake();
+                                cx.notify();
+                            }
+                            Err(error) => {
+                                if error == ErrorCode::UnsupportedVersion {
+                                    service.persistence_blocked.insert(scope.id.clone());
+                                }
+                                service.persistence_failure(scope.id, cx);
+                            }
+                        }
+                    }
+                    Err(_) => service.persistence_failure(scope.id, cx),
+                    Ok(None) => {}
+                }
+                service.wake();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     pub fn global(cx: &App) -> Option<Entity<Self>> {
         cx.try_global::<GlobalQuota>()
             .map(|global| global.0.clone())
@@ -1324,9 +1400,6 @@ fn sync_inventory(
             runtime: "local".into(),
             identity_known: false,
         };
-        let record = cx
-            .update(|cx| store.load(format!("snapshot/{scope_id}"), cx))
-            .await;
         let attempt = cx
             .update(|cx| store.load(format!("attempt/{scope_id}"), cx))
             .await;
@@ -1374,30 +1447,8 @@ fn sync_inventory(
                 }
                 this.scheduler
                     .track(scope_id.clone(), ProviderId::Codex, generation);
-                match record {
-                    Ok(Some(record)) => {
-                        match decode_record(&record, &scope, this.ports.clock.now()) {
-                            Ok(record) => {
-                                // Installation scope cannot prove account identity across restarts; retain attempt guards, never hydrate numbers into an unverified login.
-                                this.scheduler.restore_timing(
-                                    &scope_id,
-                                    record.account.last_attempt_at,
-                                    record.retry_at,
-                                    record.failures,
-                                    this.ports.clock.now(),
-                                    this.ports.clock.monotonic(),
-                                );
-                            }
-                            Err(error) => {
-                                if error == ErrorCode::UnsupportedVersion {
-                                    this.persistence_blocked.insert(scope_id.clone());
-                                }
-                                this.persistence_failure(scope_id.clone(), cx);
-                            }
-                        }
-                    }
-                    Err(_) => this.persistence_failure(scope_id.clone(), cx),
-                    Ok(None) => {}
+                if generation == 1 {
+                    this.restore_snapshot(scope.clone(), generation, cx);
                 }
                 match attempt {
                     Ok(Some(record)) => {
@@ -1529,6 +1580,122 @@ mod tests {
             })
         }
     }
+    #[gpui::test]
+    async fn restart_restores_numbers_without_reading_before_floor(cx: &mut TestAppContext) {
+        let (service, clock, source, store) = harness(cx);
+        let observation = cx
+            .update(|cx| source.refresh("scope".into(), 1, 0, cx))
+            .await
+            .expect("observation");
+        let scope = service.update(cx, |service, _| {
+            service.core.apply(observation, clock.now()).expect("apply");
+            let account = service
+                .core
+                .snapshot
+                .accounts
+                .get_mut("scope")
+                .expect("account");
+            account.scope.provider = ProviderId::Antigravity;
+            account.last_attempt_at = Some(clock.now());
+            let scope = account.scope.clone();
+            store.records.borrow_mut().insert(
+                "snapshot/scope".into(),
+                encode_record(&StoredRecord {
+                    schema_version: 1,
+                    revision: 1,
+                    account: account.clone(),
+                    failures: 0,
+                    retry_at: 0,
+                })
+                .expect("encode"),
+            );
+            scope
+        });
+        clock.wall.set(clock.now() + 180);
+        clock.elapsed.set(180);
+        let calls = source.calls.get();
+        service.update(cx, |service, cx| {
+            service
+                .core
+                .inventory(scope.clone(), 2, Availability::Ready)
+                .expect("restart inventory");
+            service.scheduler.track(scope.id.clone(), scope.provider, 2);
+            service.restore_snapshot(scope.clone(), 2, cx);
+            assert!(
+                service
+                    .scheduler
+                    .start_due(clock.now(), clock.monotonic())
+                    .is_empty()
+            );
+        });
+        cx.run_until_parked();
+        service.update(cx, |service, _| {
+            let account = service
+                .core
+                .snapshot
+                .accounts
+                .get("scope")
+                .expect("restored account");
+            assert!(!account.windows.is_empty());
+            assert_eq!(account.generation, 2);
+            assert!(account.windows.values().all(|window| matches!(
+                window.freshness(clock.now(), Duration::from_secs(900)),
+                Freshness::Stale {
+                    reason: StaleReason::Persisted,
+                    ..
+                }
+            )));
+            assert!(
+                service
+                    .scheduler
+                    .start_due(clock.now(), clock.monotonic())
+                    .is_empty()
+            );
+        });
+        assert_eq!(source.calls.get(), calls);
+        let saved = store
+            .records
+            .borrow()
+            .get("snapshot/scope")
+            .cloned()
+            .expect("saved snapshot");
+        for mismatch in [false, true] {
+            service.update(cx, |service, cx| {
+                service
+                    .core
+                    .inventory(scope.clone(), 3, Availability::Ready)
+                    .expect("new generation");
+                if mismatch {
+                    store
+                        .records
+                        .borrow_mut()
+                        .insert("snapshot/scope".into(), saved.clone());
+                    service
+                        .core
+                        .snapshot
+                        .accounts
+                        .get_mut("scope")
+                        .expect("account")
+                        .scope
+                        .runtime = "other-account".into();
+                } else {
+                    store.records.borrow_mut().clear();
+                }
+                let account = service
+                    .core
+                    .snapshot
+                    .accounts
+                    .get("scope")
+                    .expect("account");
+                service.restore_snapshot(account.scope.clone(), 3, cx);
+            });
+            cx.run_until_parked();
+            service.read_with(cx, |service, _| {
+                assert!(service.core.snapshot.accounts["scope"].windows.is_empty())
+            });
+        }
+    }
+
     #[gpui::test]
     fn isolated_reader_exit_removes_its_account(cx: &mut TestAppContext) {
         let (service, _, _, _) = harness(cx);

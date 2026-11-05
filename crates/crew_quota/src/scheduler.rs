@@ -22,6 +22,7 @@ pub struct Schedule {
     pub failures: u32,
     pub in_flight: bool,
     pub suspended: bool,
+    pub restoring: bool,
     pub demand_until: Timestamp,
     pub forced: bool,
     pub reset_at: Option<Timestamp>,
@@ -67,6 +68,7 @@ impl Scheduler {
                 failures: 0,
                 in_flight: false,
                 suspended: false,
+                restoring: false,
                 demand_until: 0,
                 forced: false,
                 reset_at: None,
@@ -201,6 +203,7 @@ impl Scheduler {
             .filter(|state| {
                 !state.in_flight
                     && !state.suspended
+                    && !state.restoring
                     && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                         || (state.provider == ProviderId::Claude && state.demand_until > now))
             })
@@ -226,6 +229,7 @@ impl Scheduler {
         for state in self.scopes.values_mut() {
             if !state.in_flight
                 && !state.suspended
+                && !state.restoring
                 && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                     || (state.provider == ProviderId::Claude && state.demand_until > now))
                 && Self::next_for(state, now, monotonic) <= now
@@ -241,6 +245,7 @@ impl Scheduler {
             .filter(|(_, state)| {
                 !state.in_flight
                     && !state.suspended
+                    && !state.restoring
                     && (matches!(state.provider, ProviderId::Codex | ProviderId::Antigravity)
                         || (state.provider == ProviderId::Claude && state.demand_until > now))
                     && Self::next_for(state, now, monotonic) <= now

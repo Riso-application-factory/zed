@@ -251,6 +251,7 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
             } else {
                 Availability::Unknown
             };
+            let restore = !service.core.snapshot.accounts.contains_key(&scope);
             match service.core.inventory(
                 AccountScope {
                     category: AccountCategory::LlmProvider,
@@ -264,6 +265,9 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
                 availability,
             ) {
                 Ok(()) => {
+                    if restore && let Some(account) = service.core.snapshot.accounts.get(&scope) {
+                        service.restore_snapshot(account.scope.clone(), account.generation, cx);
+                    }
                     if let Some(account) = service.core.snapshot.accounts.get_mut(&scope) {
                         account.metadata.native_provider = Some(candidate.info.clone());
                     }

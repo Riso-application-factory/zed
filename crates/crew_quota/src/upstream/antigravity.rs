@@ -1000,6 +1000,9 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                     service
                         .scheduler
                         .track(SCOPE.into(), ProviderId::Antigravity, generation);
+                    if generation == 1 {
+                    service.restore_snapshot(scope.clone(), generation, cx);
+                }
                     match attempt {
                         Ok(Some(record)) => {
                             match decode_attempt(&record, &scope, service.ports.clock.now()) {
