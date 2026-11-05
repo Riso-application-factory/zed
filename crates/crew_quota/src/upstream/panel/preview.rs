@@ -18,12 +18,15 @@ impl FixturePreview {
             std::env::var("CREW_QUOTA_PREVIEW_COMPACT").as_deref() == Ok("1");
         preview.preferences.used = std::env::var("CREW_QUOTA_PREVIEW_USED").as_deref() == Ok("1");
         preview.left = std::env::var("CREW_QUOTA_PREVIEW_LEFT").as_deref() == Ok("1");
-        if std::env::var("CREW_QUOTA_PREVIEW_COLLAPSED").as_deref() == Ok("mixed") {
+        let collapsed = std::env::var("CREW_QUOTA_PREVIEW_COLLAPSED").ok();
+        if collapsed.as_deref() == Some("mixed") {
             preview
                 .preferences
                 .collapsed
                 .extend([ProviderId::Grok, ProviderId::Antigravity]);
         }
+        preview.preferences.agents_collapsed = collapsed.as_deref() == Some("agents");
+        preview.preferences.llm_providers_collapsed = collapsed.as_deref() == Some("llm");
         Some(preview)
     }
 
@@ -109,26 +112,39 @@ impl FixturePreview {
             SourceKind::AntigravityAcpUsage,
             now - 60,
         );
-        let mut grok = account("grok", ProviderId::Grok, "API · per model", now - 60);
-        for (model, role, used, remaining, limit, unit) in [
-            ("grok-4", "Requests", 1., 0., 2000., Unit::Requests),
-            ("grok-4", "Tokens", 0.80, 2000000., 10000000., Unit::Tokens),
+        let mut grok = native_account("x_ai", "xAI API", NativeProviderKind::Passive, 0, now - 60);
+        for (bucket, role, used, remaining, limit, unit) in [
+            (
+                "api.x.ai/v1/chat/completions/requests",
+                "requests",
+                1.,
+                0.,
+                2000.,
+                Unit::Requests,
+            ),
+            (
+                "api.x.ai/v1/chat/completions/tokens",
+                "tokens",
+                0.80,
+                2000000.,
+                10000000.,
+                Unit::Tokens,
+            ),
         ] {
             add_window(
                 &mut grok,
-                model,
+                bucket,
                 role,
                 Some(used),
-                None,
+                Some(now + 60),
                 SourceKind::GrokResponseHeaders,
                 now - 60,
             );
             if let Some(window) = grok
                 .windows
                 .values_mut()
-                .find(|window| window.key.bucket.bucket == model && window.key.role == role)
+                .find(|window| window.key.bucket.bucket == bucket && window.key.role == role)
             {
-                window.key.bucket.applicability = Applicability::Model(model.into());
                 window.remaining = Some(sample(
                     Some(Amount {
                         value: remaining,
@@ -142,9 +158,12 @@ impl FixturePreview {
                     SourceKind::GrokResponseHeaders,
                     now - 60,
                 ));
+                window.key.bucket.applicability = Applicability::Family(
+                    "Latest api.x.ai response · Model unverified (/v1/chat/completions)".into(),
+                );
             }
         }
-        // Model applicability is part of the map key, so changing it requires re-keying.
+        // Applicability is part of the map key, so changing it requires re-keying.
         grok.windows = grok
             .windows
             .into_values()
@@ -154,7 +173,7 @@ impl FixturePreview {
             claude.availability = Availability::NotLoggedIn;
             claude.windows.clear();
             claude.last_success_at = None;
-            grok.availability = Availability::NotInstalled;
+
             codex.availability = Availability::Error(ErrorCode::Transport);
             codex.last_success_at = Some(now - 23 * 60);
             for window in codex.windows.values_mut() {
@@ -166,7 +185,45 @@ impl FixturePreview {
                 }
             }
         }
-        for account in [codex, claude, antigravity, grok] {
+        let mut anthropic = native_account(
+            "anthropic",
+            "Anthropic API",
+            NativeProviderKind::Passive,
+            1,
+            now - 60,
+        );
+        anthropic.metadata.grok_response = Some(GrokResponse {
+            blocked: Some(GrokBlockReason::SpendingLimit),
+            status: 400,
+            observed_at: now - 60,
+            retry_at: None,
+        });
+        let mut openai =
+            native_account("openai", "OpenAI API", NativeProviderKind::Passive, 2, now);
+        openai.last_success_at = None;
+        for account in [
+            codex,
+            claude,
+            antigravity,
+            grok,
+            anthropic,
+            openai,
+            native_account("ollama", "Ollama", NativeProviderKind::Local, 3, now),
+            native_account(
+                "copilot_chat",
+                "Copilot",
+                NativeProviderKind::Unavailable,
+                4,
+                now,
+            ),
+            native_account(
+                "custom",
+                "Custom endpoint",
+                NativeProviderKind::CustomEndpoint,
+                5,
+                now,
+            ),
+        ] {
             snapshot.accounts.insert(account.scope.id.clone(), account);
         }
         Self {
@@ -176,6 +233,25 @@ impl FixturePreview {
             states,
         }
     }
+}
+
+fn native_account(
+    id: &str,
+    name: &str,
+    kind: NativeProviderKind,
+    order: usize,
+    now: Timestamp,
+) -> AccountState {
+    let mut account = account(id, ProviderId::LlmProvider, "", now);
+    account.scope.category = AccountCategory::LlmProvider;
+    account.scope.native_provider_id = Some(id.into());
+    account.metadata.plan = None;
+    account.metadata.native_provider = Some(NativeProviderInfo {
+        name: name.into(),
+        kind,
+        order,
+    });
+    account
 }
 
 fn sample<T>(value: T, source: SourceKind, observed_at: Timestamp) -> Measurement<T> {
@@ -274,7 +350,7 @@ mod tests {
     fn fixtures_keep_windows_states_and_units_distinct() {
         let now = 100000;
         let preview = FixturePreview::new(now, false);
-        assert_eq!(preview.snapshot.accounts.len(), 4);
+        assert_eq!(preview.snapshot.accounts.len(), 9);
         let codex = preview
             .snapshot
             .accounts
@@ -282,12 +358,15 @@ mod tests {
             .expect("Codex fixture");
         assert_eq!(codex.windows.len(), 2);
         assert!(codex.metadata.credit_balance.is_none());
-        let grok = preview.snapshot.accounts.get("grok").expect("Grok fixture");
+        let grok = preview.snapshot.accounts.get("x_ai").expect("Grok fixture");
         assert_eq!(grok.windows.len(), 2);
         let mut amount_only = grok
             .windows
             .values()
-            .find(|window| window.key.bucket.bucket == "grok-4" && window.key.role == "Requests")
+            .find(|window| {
+                window.key.bucket.bucket == "api.x.ai/v1/chat/completions/requests"
+                    && window.key.role == "requests"
+            })
             .expect("request fixture")
             .clone();
         amount_only.limit = None;
@@ -298,13 +377,13 @@ mod tests {
         assert!(
             grok.windows
                 .iter()
-                .all(|(key, window)| key == &window.key && window.reset_at.is_none())
+                .all(|(key, window)| key == &window.key && window.reset_at.is_some())
         );
         assert_eq!(
             provider_rows(&preview.snapshot)
                 .first()
                 .map(|row| row.provider),
-            Some(ProviderId::Grok)
+            Some(ProviderId::Antigravity)
         );
         let states = FixturePreview::new(now, true);
         let statuses = states
@@ -317,7 +396,7 @@ mod tests {
         for state in ["Error", "Stale", "Not logged in"] {
             assert!(statuses.contains(state), "missing {state}");
         }
-        assert_eq!(states.snapshot.accounts.len(), 4);
+        assert_eq!(states.snapshot.accounts.len(), 9);
         let antigravity = preview
             .snapshot
             .accounts

@@ -33,6 +33,8 @@ struct Preferences {
     used: bool,
     hide_status: bool,
     collapsed: BTreeSet<ProviderId>,
+    agents_collapsed: bool,
+    llm_providers_collapsed: bool,
 }
 
 struct PanelPreferences {
@@ -235,6 +237,48 @@ impl QuotaPanel {
             refresh_error: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn group_header(
+        &self,
+        name: &'static str,
+        native: bool,
+        collapsed: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        ButtonLike::new(if native {
+            "quota-llm-group"
+        } else {
+            "quota-agents-group"
+        })
+        .width(relative(1.))
+        .aria_label(name)
+        .aria_expanded(!collapsed)
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Icon::new(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .size(IconSize::Small),
+                )
+                .child(Label::new(name)),
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            #[cfg(debug_assertions)]
+            if let Some(preview) = &mut this.preview {
+                toggle_group(&mut preview.preferences, native);
+                cx.notify();
+                return;
+            }
+            this.preferences.update(cx, |preferences, cx| {
+                toggle_group(&mut preferences.value, native);
+                preferences.save(cx);
+            });
+        }))
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -446,7 +490,8 @@ fn provider_rows(snapshot: &QuotaSnapshot) -> Vec<ProviderRow<'_>> {
             .accounts
             .values()
             .filter(|account| {
-                account.scope.provider == provider
+                account.scope.category == AccountCategory::ExternalAgent
+                    && account.scope.provider == provider
                     && account.availability != Availability::NotInstalled
             })
             .collect::<Vec<_>>();
@@ -480,17 +525,26 @@ fn visible_windows(account: &AccountState) -> Vec<&QuotaWindow> {
         .values()
         .filter(|window| {
             !window.disabled.as_ref().is_some_and(|sample| sample.value)
-                && if account.scope.provider == ProviderId::Grok {
+                && if account.scope.category == AccountCategory::LlmProvider
+                    || account.scope.provider == ProviderId::Grok
+                {
                     matches!(
                         window.key.role.as_str(),
-                        "Requests" | "Tokens" | "requests" | "tokens"
+                        "Requests"
+                            | "Tokens"
+                            | "requests"
+                            | "tokens"
+                            | "input-tokens"
+                            | "output-tokens"
                     )
                 } else {
                     matches!(window.key.duration_seconds, Some(18000 | 604800))
                 }
         })
         .collect::<Vec<_>>();
-    if account.scope.provider == ProviderId::Grok {
+    if account.scope.category == AccountCategory::LlmProvider
+        || account.scope.provider == ProviderId::Grok
+    {
         windows.sort_by_key(|window| {
             std::cmp::Reverse(window.remaining.as_ref().map(|sample| sample.observed_at))
         });
@@ -525,7 +579,9 @@ fn window_title(account: &AccountState, window: &QuotaWindow) -> String {
 
 fn compact_summary(account: &AccountState, show_used: bool, now: Timestamp) -> String {
     let windows = visible_windows(account);
-    if account.scope.provider == ProviderId::Grok {
+    if account.scope.category == AccountCategory::LlmProvider
+        || account.scope.provider == ProviderId::Grok
+    {
         let number = |value: f64| {
             if value >= 1_000_000. {
                 format!("{:.1}M", value / 1_000_000.)
@@ -545,10 +601,12 @@ fn compact_summary(account: &AccountState, show_used: bool, now: Timestamp) -> S
                     .and_then(|sample| sample.value.as_ref());
                 Some(format!(
                     "{} {}/{}",
-                    if remaining.unit == Unit::Requests {
-                        "Req"
-                    } else {
-                        "Tok"
+                    match (&remaining.unit, window.key.role.as_str()) {
+                        (Unit::Requests, _) => "Req",
+                        (Unit::Tokens, "input-tokens") => "InTok",
+                        (Unit::Tokens, "output-tokens") => "OutTok",
+                        (Unit::Tokens, _) => "Tok",
+                        (_, role) => role,
                     },
                     number(remaining.value),
                     limit
@@ -788,6 +846,81 @@ pub(super) fn account_status(account: &AccountState, now: Timestamp) -> String {
     }
     states.join(" · ")
 }
+fn native_rows(snapshot: &QuotaSnapshot) -> Vec<&AccountState> {
+    let mut accounts = snapshot
+        .accounts
+        .values()
+        .filter(|account| account.scope.category == AccountCategory::LlmProvider)
+        .collect::<Vec<_>>();
+    accounts.sort_by_key(|account| {
+        account
+            .metadata
+            .native_provider
+            .as_ref()
+            .map(|info| info.order)
+            .unwrap_or(usize::MAX)
+    });
+    accounts
+}
+
+fn native_status(account: &AccountState, now: Timestamp) -> String {
+    match account
+        .metadata
+        .native_provider
+        .as_ref()
+        .map(|info| info.kind)
+    {
+        Some(NativeProviderKind::Local) => return "Local · no quota".into(),
+        Some(NativeProviderKind::Unavailable) => return "quota not available".into(),
+        Some(NativeProviderKind::CustomEndpoint) => return "Custom endpoint · no capture".into(),
+        Some(NativeProviderKind::Ambiguous) => {
+            return "Quota unavailable · shared endpoint cannot be attributed safely".into();
+        }
+        _ => {}
+    }
+    if let Some(response) = &account.metadata.grok_response {
+        if let Some(blocked) = response.blocked {
+            return match blocked {
+                GrokBlockReason::SpendingLimit => "Out of credits / spending limit".into(),
+                GrokBlockReason::RateLimited => response.retry_at.map_or_else(
+                    || "Rate limited".into(),
+                    |retry_at| {
+                        format!(
+                            "Rate limited · Retry in {}s",
+                            retry_at.saturating_sub(now).max(0)
+                        )
+                    },
+                ),
+                GrokBlockReason::Forbidden => "Blocked · request rejected".into(),
+            };
+        }
+        if account.windows.is_empty() {
+            return "No quota data in latest response".into();
+        }
+    }
+    if account.windows.is_empty() {
+        return "Waiting for a provider response".into();
+    }
+    if account.windows.values().any(|window| {
+        !matches!(
+            window.freshness(now, Duration::from_secs(120)),
+            Freshness::Fresh
+        )
+    }) {
+        return "Stale · waiting for a provider response".into();
+    }
+    String::new()
+}
+
+fn toggle_group(preferences: &mut Preferences, native: bool) {
+    let collapsed = if native {
+        &mut preferences.llm_providers_collapsed
+    } else {
+        &mut preferences.agents_collapsed
+    };
+    *collapsed = !*collapsed;
+}
+
 fn toggle_collapsed(preferences: &mut Preferences, provider: ProviderId) {
     if !preferences.collapsed.remove(&provider) {
         preferences.collapsed.insert(provider);
@@ -876,8 +1009,14 @@ impl Render for QuotaPanel {
             })
             .min();
         let mut content = v_flex().gap_3();
-        let rows = provider_rows(&snapshot);
-        if rows.is_empty() {
+        content =
+            content.child(self.group_header("Agents", false, preferences.agents_collapsed, cx));
+        let rows = if preferences.agents_collapsed {
+            Vec::new()
+        } else {
+            provider_rows(&snapshot)
+        };
+        if rows.is_empty() && !preferences.agents_collapsed {
             let inventoried = self
                 .service
                 .as_ref()
@@ -1059,6 +1198,120 @@ impl Render for QuotaPanel {
                 }
             }
             content = content.child(provider);
+        }
+        content = content.child(self.group_header(
+            "LLM Providers",
+            true,
+            preferences.llm_providers_collapsed,
+            cx,
+        ));
+        if !preferences.llm_providers_collapsed {
+            let accounts = native_rows(&snapshot);
+            if accounts.is_empty() {
+                content = content
+                    .child(Label::new("No LLM providers configured").color(Color::Muted))
+                    .child(
+                        ButtonLike::new("configure-llm-providers")
+                            .child(Label::new("Configure LLM Providers"))
+                            .on_click(|_, window, cx| {
+                                match cx.build_action(
+                                    "zed::OpenSettingsPage",
+                                    Some(serde_json::json!({"page": "LLM Providers"})),
+                                ) {
+                                    Ok(action) => window.dispatch_action(action, cx),
+                                    Err(error) => log::error!(
+                                        "crew_quota: cannot open provider settings: {error}"
+                                    ),
+                                }
+                            }),
+                    );
+            }
+            for account in accounts {
+                let name = account
+                    .metadata
+                    .native_provider
+                    .as_ref()
+                    .map(|info| info.name.clone())
+                    .unwrap_or_else(|| "LLM Provider".into());
+                let icon = account
+                    .scope
+                    .native_provider_id
+                    .as_ref()
+                    .and_then(|id| {
+                        language_model::LanguageModelRegistry::read_global(cx)
+                            .provider(&language_model::LanguageModelProviderId::from(id.clone()))
+                    })
+                    .map(|provider| match provider.icon() {
+                        language_model::IconOrSvg::Icon(name) => Icon::new(name),
+                        language_model::IconOrSvg::Svg(path) => Icon::from_external_svg(path),
+                    })
+                    .unwrap_or_else(|| Icon::new(IconName::ZedAssistant));
+                let status = native_status(account, now);
+                let mut provider = v_flex()
+                    .gap_1()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant);
+                if preferences.compact {
+                    let summary = if status.is_empty() {
+                        compact_summary(account, false, now)
+                    } else {
+                        status
+                    };
+                    provider = provider
+                        .child(Label::new(format!("{name} · {summary}")).size(LabelSize::Small));
+                } else {
+                    provider = provider.child(
+                        h_flex()
+                            .gap_2()
+                            .child(icon.size(IconSize::Small))
+                            .child(Label::new(name)),
+                    );
+                    if !status.is_empty() {
+                        provider = provider.child(
+                            Label::new(status)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        );
+                    }
+                    let windows = visible_windows(account);
+                    if let Some(first) = windows.first() {
+                        let provenance = match &first.key.bucket.applicability {
+                            Applicability::Family(family) => family.clone(),
+                            _ => "Latest API response · model unknown".into(),
+                        };
+                        provider = provider.child(
+                            Label::new(provenance)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        );
+                    }
+                    for quota_window in windows {
+                        if let Some(amount) = amount_text(quota_window) {
+                            provider = provider.child(Label::new(amount).size(LabelSize::Small));
+                        }
+                        if let Some(reset) = quota_window
+                            .reset_at
+                            .as_ref()
+                            .and_then(|sample| sample.value)
+                        {
+                            provider = provider.child(
+                                Label::new(countdown(Some(reset), now))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            );
+                        }
+                    }
+                    if account.last_success_at.is_some() {
+                        provider = provider.child(
+                            Label::new(age(account.last_success_at, now))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        );
+                    }
+                }
+                content = content.child(provider);
+            }
         }
         let controls = h_flex()
             .child(
@@ -1302,6 +1555,7 @@ mod tests {
             cx.set_global(settings);
             cx.set_global(db::AppDatabase::test_new());
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
             init(cx);
             let service = cx.new(|cx| {
                 QuotaService::new(
@@ -1428,6 +1682,7 @@ mod tests {
             cx.set_global(settings);
             cx.set_global(db::AppDatabase::test_new());
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            language_model::init(cx);
             init(cx);
             let service = cx.new(|cx| {
                 QuotaService::new(
@@ -1758,6 +2013,67 @@ mod tests {
                 assert!(!text.contains(raw), "{text}");
             }
         }
+    }
+
+    #[test]
+    fn group_disclosure_defaults_and_round_trips_independently() {
+        let mut preferences: Preferences = serde_json::from_str("{}").expect("legacy preferences");
+        assert!(!preferences.agents_collapsed && !preferences.llm_providers_collapsed);
+        toggle_group(&mut preferences, true);
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&preferences).expect("serialize"))
+                .expect("restore");
+        assert!(restored.llm_providers_collapsed && !restored.agents_collapsed);
+        toggle_group(&mut preferences, false);
+        toggle_group(&mut preferences, true);
+        assert!(preferences.agents_collapsed && !preferences.llm_providers_collapsed);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn native_rows_keep_inventory_order_states_and_freshness_separate_from_agents() {
+        let now = 100000;
+        let preview = preview::FixturePreview::new(now, false);
+        let rows = native_rows(&preview.snapshot);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(
+            rows.first()
+                .and_then(|account| account.scope.native_provider_id.as_deref()),
+            Some("x_ai")
+        );
+        assert_eq!(provider_rows(&preview.snapshot).len(), 3);
+        let statuses = rows
+            .iter()
+            .map(|account| native_status(account, now))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            [
+                "",
+                "Out of credits / spending limit",
+                "Waiting for a provider response",
+                "Local · no quota",
+                "quota not available",
+                "Custom endpoint · no capture"
+            ]
+        );
+        let xai = rows.first().expect("xai");
+        assert!(native_status(xai, now + 121).contains("Stale"));
+        assert!(compact_summary(xai, false, now).contains("Req"));
+        assert!(
+            visible_windows(xai)
+                .iter()
+                .all(|window| amount_text(window).is_some())
+        );
+        let mut ambiguous = (*xai).clone();
+        ambiguous
+            .metadata
+            .native_provider
+            .as_mut()
+            .expect("metadata")
+            .kind = NativeProviderKind::Ambiguous;
+        assert!(native_status(&ambiguous, now).contains("cannot be attributed"));
+        assert!(native_rows(&QuotaSnapshot::default()).is_empty());
     }
 
     #[test]
