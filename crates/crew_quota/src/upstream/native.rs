@@ -66,6 +66,30 @@ fn shares_host(endpoint: &str, host: &str) -> bool {
     })
 }
 
+// These implementations only call ApiKeyState::load_if_needed. Anthropic,
+// OpenRouter and Vercel also fetch models, so must remain observation-only.
+pub(super) fn load_credentials(cx: &mut App) {
+    let providers = LanguageModelRegistry::read_global(cx).providers();
+    for provider in providers {
+        let id = provider.id().0.to_string();
+        if !matches!(id.as_str(), "x_ai" | "openai" | "deepseek" | "mistral")
+            || provider.is_authenticated(cx)
+        {
+            continue;
+        }
+        let task = provider.authenticate(cx);
+        cx.spawn(async move |_| {
+            let state = if task.await.is_ok() {
+                "Completed"
+            } else {
+                "Unavailable"
+            };
+            log::info!("crew_quota: native_credentials provider={id} state={state}");
+        })
+        .detach();
+    }
+}
+
 pub(super) fn collect(cx: &App) -> Vec<Candidate> {
     let registry = LanguageModelRegistry::read_global(cx);
     let settings = language_models::AllLanguageModelSettings::get_global(cx);
@@ -128,6 +152,17 @@ fn endpoint_for_provider(
 }
 
 pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
+    for provider in LanguageModelRegistry::read_global(cx).visible_providers() {
+        let id = provider.id().0;
+        if valid_text(&id, 128) {
+            let state = if provider.is_authenticated(cx) {
+                "Authenticated"
+            } else {
+                "NotAuthenticated"
+            };
+            log::info!("crew_quota: native_inventory provider={id} state={state}");
+        }
+    }
     let candidates = collect(cx);
     service.update(cx, |service, cx| {
         let retained = candidates
@@ -214,11 +249,12 @@ mod tests {
     use futures::future::BoxFuture;
     use gpui::{AsyncApp, BorrowAppContext};
     use language_model::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct FakeProvider {
         id: &'static str,
         authenticated: AtomicBool,
+        authenticate_calls: AtomicUsize,
         state: Entity<()>,
     }
     impl LanguageModelProviderState for FakeProvider {
@@ -258,7 +294,8 @@ mod tests {
             self.authenticated.load(Ordering::SeqCst)
         }
         fn authenticate(&self, _: &mut App) -> Task<Result<(), AuthenticateError>> {
-            panic!("no authentication prompts")
+            self.authenticate_calls.fetch_add(1, Ordering::SeqCst);
+            Task::ready(Err(AuthenticateError::CredentialsNotFound))
         }
         fn settings_view(&self, _: &mut App) -> Option<ProviderSettingsView> {
             panic!("no settings views")
@@ -298,6 +335,131 @@ mod tests {
     }
 
     #[gpui::test]
+    fn startup_loads_only_local_credentials(cx: &mut gpui::TestAppContext) {
+        let providers = cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            language_models::AllLanguageModelSettings::register(cx);
+            language_model::init(cx);
+            cx.set_http_client(http_client::FakeHttpClient::create(|_| async {
+                panic!("credential loading must not call HTTP")
+            }));
+            super::super::grok::install_http_observer(cx);
+            let registry = LanguageModelRegistry::global(cx);
+            let mut providers = Vec::new();
+            for id in [
+                "x_ai",
+                "openai",
+                "deepseek",
+                "mistral",
+                "anthropic",
+                "openrouter",
+                "vercel_ai_gateway",
+                "google",
+                "copilot_chat",
+                "chatgpt",
+                "zed.dev",
+                "bedrock",
+                "custom",
+            ] {
+                let provider = Arc::new(FakeProvider {
+                    id,
+                    authenticated: AtomicBool::new(false),
+                    authenticate_calls: AtomicUsize::new(0),
+                    state: cx.new(|_| ()),
+                });
+                registry.update(cx, |registry, cx| {
+                    registry.register_provider(provider.clone(), cx)
+                });
+                providers.push(provider);
+            }
+            let service = cx.new(|cx| {
+                QuotaService::new(
+                    Ports {
+                        source: Rc::new(InMemoryPorts),
+                        store: Rc::new(InMemoryPorts),
+                        clock: Rc::new(InMemoryPorts),
+                    },
+                    cx,
+                )
+            });
+            super::super::grok::init(&service, cx);
+            (providers, service)
+        });
+        cx.run_until_parked();
+        for provider in &providers.0 {
+            let expected = usize::from(matches!(
+                provider.id,
+                "x_ai" | "openai" | "deepseek" | "mistral"
+            ));
+            assert_eq!(
+                provider.authenticate_calls.load(Ordering::SeqCst),
+                expected,
+                "{}",
+                provider.id
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn late_provider_state_change_creates_row(cx: &mut gpui::TestAppContext) {
+        let (provider, service) = cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            language_models::AllLanguageModelSettings::register(cx);
+            language_model::init(cx);
+            cx.set_http_client(http_client::FakeHttpClient::create(|_| async {
+                panic!("inventory must not call HTTP")
+            }));
+            super::super::grok::install_http_observer(cx);
+            let provider = Arc::new(FakeProvider {
+                id: "x_ai",
+                authenticate_calls: AtomicUsize::new(0),
+                authenticated: AtomicBool::new(false),
+                state: cx.new(|_| ()),
+            });
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(provider.clone(), cx)
+            });
+            let service = cx.new(|cx| {
+                QuotaService::new(
+                    Ports {
+                        source: Rc::new(InMemoryPorts),
+                        store: Rc::new(InMemoryPorts),
+                        clock: Rc::new(InMemoryPorts),
+                    },
+                    cx,
+                )
+            });
+            super::super::grok::init(&service, cx);
+            (provider, service)
+        });
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert!(
+                !service
+                    .core
+                    .snapshot
+                    .accounts
+                    .contains_key("llm-provider:x_ai")
+            )
+        });
+        provider.authenticated.store(true, Ordering::SeqCst);
+        provider.state.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            let account = service
+                .core
+                .snapshot
+                .accounts
+                .get("llm-provider:x_ai")
+                .expect("late ProviderStateChanged must create the provider row");
+            assert_eq!(account.scope.category, AccountCategory::LlmProvider);
+            assert_eq!(account.scope.native_provider_id.as_deref(), Some("x_ai"));
+        });
+    }
+
+    #[gpui::test]
     fn registry_events_reconcile_rows_and_invalidate_generations(cx: &mut gpui::TestAppContext) {
         let (registry, provider, service) = cx.update(|cx| {
             let settings = SettingsStore::test(cx);
@@ -311,6 +473,7 @@ mod tests {
             let registry = LanguageModelRegistry::global(cx);
             let provider = Arc::new(FakeProvider {
                 id: "x_ai",
+                authenticate_calls: AtomicUsize::new(0),
                 authenticated: AtomicBool::new(true),
                 state: cx.new(|_| ()),
             });
@@ -373,7 +536,7 @@ mod tests {
             let registry = LanguageModelRegistry::global(cx);
             let mut providers = Vec::new();
             for id in ["x_ai", "anthropic", "openai", "ollama", "lmstudio", "llama.cpp", "copilot_chat", "zed.dev", "custom"] {
-                let provider = Arc::new(FakeProvider { id, authenticated: AtomicBool::new(true), state: cx.new(|_| ()) });
+                let provider = Arc::new(FakeProvider { id, authenticate_calls: AtomicUsize::new(0), authenticated: AtomicBool::new(true), state: cx.new(|_| ()) });
                 registry.update(cx, |registry, cx| registry.register_provider(provider.clone(), cx));
                 providers.push(provider);
             }

@@ -490,11 +490,18 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
     if cx.try_global::<Bridge>().is_none() {
         return;
     }
+    super::native::load_credentials(cx);
     sync(service, cx);
     let registry = language_model::LanguageModelRegistry::global(cx);
     let subscription = cx.subscribe(&registry, {
         let service = service.downgrade();
         move |_, event, cx| {
+            if matches!(
+                event,
+                language_model::Event::AddedProvider(_) | language_model::Event::ProvidersChanged
+            ) {
+                super::native::load_credentials(cx);
+            }
             if matches!(
                 event,
                 language_model::Event::ProviderStateChanged(_)
@@ -511,6 +518,7 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
     let settings = cx.observe_global::<SettingsStore>({
         let service = service.downgrade();
         move |cx| {
+            super::native::load_credentials(cx);
             if let Some(service) = service.upgrade() {
                 sync(&service, cx);
             }
