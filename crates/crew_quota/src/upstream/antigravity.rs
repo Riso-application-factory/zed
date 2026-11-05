@@ -443,16 +443,22 @@ async fn resolve(
         conversations: home
             .join("antigravity-acp/conversations")
             .canonicalize()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    RefreshError::NotLoggedIn
-                } else {
-                    cleanup_error()
-                }
-            })?,
+            .map_err(conversations_error)?,
         version: version.to_string(),
         timeout: TIMEOUT,
     })
+}
+
+fn conversations_error(_error: std::io::Error) -> RefreshError {
+    RefreshError::Failed(ErrorCode::Transport)
+}
+
+#[test]
+fn missing_conversations_is_not_evidence_of_missing_auth() {
+    assert_eq!(
+        conversations_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        RefreshError::Failed(ErrorCode::Transport)
+    );
 }
 
 #[cfg(unix)]
@@ -617,10 +623,9 @@ async fn read(
         if directory.identity()? != journal.identity {
             return Err(cleanup_error());
         }
-        directory.remove(
-            journal.session.as_deref().ok_or_else(cleanup_error)?,
-            &journal.before,
-        )?;
+        if let Some(session) = journal.session.as_deref() {
+            directory.remove(session, &journal.before)?;
+        }
         std::fs::remove_file(&journal_path).map_err(|_| cleanup_error())?;
     }
     // Missing conversations directories are not created on behalf of the producer.
@@ -791,10 +796,9 @@ async fn read(
     if files::Directory::open(&journal.directory)?.identity()? != journal.identity {
         return Err(cleanup_error());
     }
-    directory.remove(
-        journal.session.as_deref().ok_or_else(cleanup_error)?,
-        &journal.before,
-    )?;
+    if let Some(session) = journal.session.as_deref() {
+        directory.remove(session, &journal.before)?;
+    }
     std::fs::remove_file(journal_path).map_err(|_| cleanup_error())?;
     close.map_err(|_| cleanup_error())?;
     result
@@ -1239,6 +1243,47 @@ mod tests {
             "must remain"
         );
         assert!(temporary.path().join("pending-session.json").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_without_session_preserves_unattributed_files() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let conversations = temporary.path().join("conversations");
+        std::fs::create_dir(&conversations)?;
+        let conversations = conversations.canonicalize()?;
+        std::fs::write(conversations.join("owned.db"), "must remain")?;
+        let directory =
+            files::Directory::open(&conversations).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let group = i32::MAX;
+        let journal = Journal {
+            session: None,
+            group,
+            directory: conversations.clone(),
+            identity: directory
+                .identity()
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            before: BTreeSet::new(),
+        };
+        save_journal(&temporary.path().join("pending-session.json"), &journal)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let launch = Launch {
+            command: PathBuf::from("/must-not-spawn"),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            directory: temporary.path().into(),
+            conversations: conversations.clone(),
+            version: "fixture".into(),
+            timeout: TIMEOUT,
+        };
+        let executor = gpui::BackgroundExecutor::new(Arc::new(gpui::ThreadedDispatcher::new()));
+        assert!(smol::block_on(read(launch, executor)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(conversations.join("owned.db"))?,
+            "must remain"
+        );
+        assert!(!temporary.path().join("pending-session.json").exists());
         Ok(())
     }
 

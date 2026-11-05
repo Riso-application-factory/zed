@@ -1234,6 +1234,9 @@ mod tests {
 
     pub(super) struct InertPorts;
     impl QuotaStore for InertPorts {
+        fn delete(&self, _: String, _: &App) -> Task<Result<(), ErrorCode>> {
+            Task::ready(Ok(()))
+        }
         fn load(&self, _: String, _: &App) -> Task<Result<Option<String>, ErrorCode>> {
             Task::ready(Ok(None))
         }

@@ -636,6 +636,41 @@ mod tests {
             Some(18000)
         );
         assert!(!observation.complete);
+        let mut core = crate::QuotaCore::default();
+        core.inventory(
+            crate::AccountScope {
+                id: "scope".into(),
+                provider: crate::ProviderId::Codex,
+                runtime: "local".into(),
+                identity_known: false,
+            },
+            1,
+            crate::Availability::Ready,
+        )
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let selector = crate::Selector {
+            windows: observation
+                .windows
+                .iter()
+                .map(|window| window.key.clone())
+                .collect(),
+            ..Default::default()
+        };
+        core.apply(observation, 1793700000)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        assert!(
+            core.fresh(
+                &crate::FreshRequest {
+                    selector,
+                    max_age: Duration::from_secs(120),
+                    required_measurements: Vec::new(),
+                    deadline: 1793700120,
+                    allow_inference: false,
+                },
+                1793700000
+            )
+            .is_ok()
+        );
         Ok(())
     }
 

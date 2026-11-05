@@ -58,14 +58,14 @@ fn concurrency_is_bounded_and_waiting_scope_runs_after_a_slot_frees() {
 }
 
 #[test]
-fn generation_change_preserves_attempt_floor_and_backoff() {
+fn generation_change_preserves_attempt_floor() {
     let mut scheduler = Scheduler::default();
     scheduler.track("scope".into(), ProviderId::Codex, 1);
     assert_eq!(scheduler.start_due(1000, 0).len(), 1);
     scheduler.complete("scope", 1000, 0, false, Some(1600));
     scheduler.track("scope".into(), ProviderId::Codex, 2);
-    assert!(scheduler.start_due(1120, 120).is_empty());
-    assert_eq!(scheduler.start_due(1600, 600), vec![("scope".into(), 2)]);
+    assert!(scheduler.start_due(1119, 119).is_empty());
+    assert_eq!(scheduler.start_due(1120, 120), vec![("scope".into(), 2)]);
 }
 
 #[test]
@@ -125,4 +125,16 @@ fn newer_attempt_reservation_restores_a_floor_missing_from_the_snapshot() {
     scheduler.restore_timing("scope", Some(200), 0, 0, 250, 0);
     assert!(scheduler.start_due(250, 69).is_empty());
     assert_eq!(scheduler.start_due(250, 70).len(), 1);
+}
+
+#[test]
+fn generation_change_discards_backoff_but_preserves_floor() {
+    let mut scheduler = Scheduler::default();
+    scheduler.track("scope".into(), ProviderId::Codex, 1);
+    scheduler.start_due(0, 0);
+    scheduler.complete("scope", 0, 0, false, Some(3600));
+    scheduler.track("scope".into(), ProviderId::Codex, 2);
+    scheduler.force("scope");
+    assert!(scheduler.start_due(119, 119).is_empty());
+    assert_eq!(scheduler.start_due(120, 120), vec![("scope".into(), 2)]);
 }

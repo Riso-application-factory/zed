@@ -47,9 +47,20 @@ impl Clock for SystemClock {
 pub trait QuotaStore {
     fn load(&self, key: String, cx: &App) -> Task<Result<Option<String>, ErrorCode>>;
     fn save(&self, key: String, value: String, cx: &App) -> Task<Result<(), ErrorCode>>;
+    fn delete(&self, key: String, cx: &App) -> Task<Result<(), ErrorCode>>;
 }
 struct KvpStore;
 impl QuotaStore for KvpStore {
+    fn delete(&self, key: String, cx: &App) -> Task<Result<(), ErrorCode>> {
+        let store = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            store
+                .scoped("crew_quota")
+                .delete(key)
+                .await
+                .map_err(|_| ErrorCode::Persistence)
+        })
+    }
     fn load(&self, key: String, cx: &App) -> Task<Result<Option<String>, ErrorCode>> {
         let store = KeyValueStore::global(cx);
         cx.background_spawn(async move {
@@ -128,7 +139,7 @@ pub struct QuotaService {
     cancellations: BTreeMap<String, futures::future::AbortHandle>,
     demands: Vec<Demand>,
     wake: mpsc::UnboundedSender<()>,
-    writes: mpsc::UnboundedSender<(String, String)>,
+    writes: mpsc::UnboundedSender<(String, Option<String>)>,
     persistence_blocked: BTreeSet<String>,
     hydrated: bool,
     ready: Shared<Task<Result<(), ErrorCode>>>,
@@ -163,12 +174,22 @@ impl QuotaService {
             .spawn(async move |_, _| ready_receiver.await.unwrap_or(Err(ErrorCode::Unknown)))
             .shared();
         let (wake, mut receiver) = mpsc::unbounded();
-        let (writes, mut records) = mpsc::unbounded::<(String, String)>();
+        let (writes, mut records) = mpsc::unbounded::<(String, Option<String>)>();
         let store = ports.store.clone();
         let writer = cx.spawn(async move |this, cx| {
             while let Some((scope, record)) = records.next().await {
                 let key = format!("snapshot/{scope}");
-                let save = cx.update(|cx| store.save(key, record, cx));
+                let save = cx.update(|cx| match record {
+                    Some(record) => store.save(key, record, cx),
+                    None => {
+                        let snapshot = store.delete(key, cx);
+                        let attempt = store.delete(format!("attempt/{scope}"), cx);
+                        cx.background_spawn(async move {
+                            snapshot.await?;
+                            attempt.await
+                        })
+                    }
+                });
                 if save.await.is_err() {
                     if this
                         .update(cx, |this, cx| this.persistence_failure(scope, cx))
@@ -188,6 +209,7 @@ impl QuotaService {
                         .scheduler
                         .next_deadline(now, this.ports.clock.monotonic())
                         .unwrap_or(now.saturating_add(900));
+                    let next = if this.hydrated { next } else { next.min(now.saturating_add(60)) };
                     let expiry = this
                         .demands
                         .iter()
@@ -244,7 +266,8 @@ impl QuotaService {
     }
     fn finish_init(&mut self, result: Result<(), ErrorCode>) {
         self.hydrated = result.is_ok();
-        if let Some(sender) = self.ready_sender.take()
+        if result.is_ok()
+            && let Some(sender) = self.ready_sender.take()
             && sender.send(result).is_err()
         {
             log::debug!("crew_quota: readiness_receiver_closed");
@@ -276,6 +299,9 @@ impl QuotaService {
         }
     }
 
+    /// Acquires demand and waits for proven coverage. Callers must select explicit windows
+    /// when a producer cannot enumerate its complete account; Grok can only satisfy this
+    /// from passive observations and cannot be actively refreshed.
     pub fn ensure_fresh(
         &mut self,
         request: FreshRequest,
@@ -362,6 +388,7 @@ impl QuotaService {
             inventory.await;
             let pending = this
                 .update(cx, |service, cx| {
+                    service.retry_suspended(&selector, true);
                     for account in service
                         .core
                         .snapshot
@@ -397,6 +424,34 @@ impl QuotaService {
         })
     }
 
+    fn retry_suspended(&mut self, selector: &Selector, manual: bool) {
+        for account in self.core.snapshot.accounts.values_mut() {
+            if !selector.matches(&account.scope) {
+                continue;
+            }
+            let structural = account.scope.provider == ProviderId::Antigravity
+                && matches!(
+                    account.availability,
+                    Availability::Error(ErrorCode::Protocol | ErrorCode::InvalidData)
+                );
+            if structural && !manual {
+                continue;
+            }
+            if matches!(account.refresh, RefreshState::Suspended(_)) {
+                if let Some(schedule) = self.scheduler.scopes.get_mut(&account.scope.id) {
+                    schedule.suspended = false;
+                    if manual {
+                        schedule.retry_at = 0;
+                        schedule.retry_monotonic = None;
+                        schedule.failures = 0;
+                    }
+                }
+                account.availability = Availability::Unknown;
+                account.refresh = RefreshState::Idle;
+            }
+        }
+    }
+
     fn recheck_inventory(
         &mut self,
         trigger: &'static str,
@@ -406,6 +461,9 @@ impl QuotaService {
             return task.clone();
         }
         log::info!("crew_quota: refresh_trigger={trigger}");
+        if trigger == "tick" {
+            self.retry_suspended(&Selector::default(), false);
+        }
         let Some(project) = self._project.clone() else {
             return Task::ready(()).shared();
         };
@@ -479,7 +537,7 @@ impl QuotaService {
             {
                 cx.emit(QuotaEvent::AvailabilityChanged(scope.clone()));
             }
-            if live && !changed.is_empty() {
+            if live {
                 self.scheduler.passive(
                     &scope,
                     self.ports.clock.now(),
@@ -509,19 +567,30 @@ impl QuotaService {
         }
         self.auth_path = Some(home.clone());
         self._auth_watcher = Some(cx.spawn(async move |this, cx| {
-            let (mut events, watcher) = fs.watch(&home, Duration::from_millis(100)).await;
-            let _watcher = watcher;
-            while let Some(events) = events.next().await {
-                if events.iter().any(|event| {
-                    event.path == home.join("auth.json") || event.path == home.join("config.toml")
-                }) {
-                    if this
-                        .update(cx, |this, cx| this.invalidate_auth(cx))
-                        .is_err()
-                    {
-                        break;
+            let mut previous = None;
+            loop {
+                let auth = fs.metadata(&home.join("auth.json")).await;
+                let config = fs.metadata(&home.join("config.toml")).await;
+                match (auth, config) {
+                    (Ok(auth), Ok(config)) => {
+                        let fingerprint = |metadata: Option<fs::Metadata>| {
+                            metadata.map(|metadata| (metadata.inode, metadata.mtime, metadata.len))
+                        };
+                        let current = (fingerprint(auth), fingerprint(config));
+                        if previous
+                            .as_ref()
+                            .is_some_and(|previous| previous != &current)
+                            && this
+                                .update(cx, |this, cx| this.invalidate_auth(cx))
+                                .is_err()
+                        {
+                            break;
+                        }
+                        previous = Some(current);
                     }
+                    _ => log::debug!("crew_quota: auth_metadata_unavailable"),
                 }
+                cx.background_executor().timer(Duration::from_secs(5)).await;
             }
         }));
     }
@@ -584,6 +653,16 @@ impl QuotaService {
             log::debug!("crew_quota: scheduler_closed");
         }
     }
+    fn remove_scope(&mut self, scope: &str, cx: &mut Context<Self>) {
+        self.core.snapshot.accounts.remove(scope);
+        self.scheduler.scopes.remove(scope);
+        self.pending_persistence.remove(scope);
+        if !self.persistence_blocked.contains(scope)
+            && self.writes.unbounded_send((scope.into(), None)).is_err()
+        {
+            self.persistence_failure(scope.into(), cx);
+        }
+    }
     fn persistence_failure(&mut self, scope: String, cx: &mut Context<Self>) {
         log::warn!("crew_quota: persistence_failed");
         cx.emit(QuotaEvent::PersistenceFailed(scope));
@@ -627,7 +706,11 @@ impl QuotaService {
         };
         match encode_record(&record) {
             Ok(record) => {
-                if self.writes.unbounded_send((scope.into(), record)).is_err() {
+                if self
+                    .writes
+                    .unbounded_send((scope.into(), Some(record)))
+                    .is_err()
+                {
                     self.persistence_failure(scope.into(), cx);
                 }
             }
@@ -708,6 +791,7 @@ impl QuotaService {
         }
         for (scope, generation) in self.scheduler.start_due(now, monotonic) {
             let Some(account) = self.core.snapshot.accounts.get_mut(&scope) else {
+                self.scheduler.scopes.remove(&scope);
                 continue;
             };
             if account.availability != Availability::Ready
@@ -824,13 +908,18 @@ impl QuotaService {
             Err(RefreshError::Deferred { retry_at }) => Some(*retry_at),
             _ => None,
         };
-        self.scheduler.complete(
-            scope,
-            now,
-            self.ports.clock.monotonic(),
-            result.is_ok(),
-            retry_at,
-        );
+        if let Some(retry_at) = retry_at {
+            self.scheduler
+                .defer(scope, now, self.ports.clock.monotonic(), retry_at);
+        } else {
+            self.scheduler.complete(
+                scope,
+                now,
+                self.ports.clock.monotonic(),
+                result.is_ok(),
+                None,
+            );
+        }
         if let Some(account) = self.core.snapshot.accounts.get_mut(scope) {
             account.refresh = match &result {
                 Ok(_) => RefreshState::Idle,
@@ -839,7 +928,7 @@ impl QuotaService {
                     if let Some(schedule) = self.scheduler.scopes.get_mut(scope) {
                         schedule.suspended = true;
                     }
-                    RefreshState::Suspended(ErrorCode::Unknown)
+                    RefreshState::Suspended(ErrorCode::NotLoggedIn)
                 }
                 Err(RefreshError::Failed(
                     code
@@ -881,6 +970,9 @@ impl QuotaService {
                     }
                     RefreshState::Suspended(ErrorCode::UnsupportedVersion)
                 }
+                Err(RefreshError::Deferred { retry_at }) => RefreshState::Backoff {
+                    retry_at: *retry_at,
+                },
                 Err(error) => {
                     account.availability = Availability::Error(match error {
                         RefreshError::Failed(code) => *code,
@@ -1136,7 +1228,7 @@ pub fn init(app_state: Arc<AppState>, cx: &mut App) {
 fn sync_inventory(
     service: &mut QuotaService,
     store: &Entity<AgentServerStore>,
-    changed: bool,
+    _changed: bool,
     cx: &mut Context<QuotaService>,
 ) {
     let status = store.update(cx, |store, cx| {
@@ -1159,8 +1251,7 @@ fn sync_inventory(
                 handle.abort();
             }
             service.tasks.remove(scope);
-            service.core.snapshot.accounts.remove(scope);
-            service.scheduler.scopes.remove(scope);
+            service.remove_scope(scope, cx);
         }
         service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
         service.finish_init(Ok(()));
@@ -1181,7 +1272,7 @@ fn sync_inventory(
             .await;
         let scope_id = match mapping {
             Ok(Some(value)) if value.len() < 128 && uuid::Uuid::parse_str(&value).is_ok() => value,
-            Ok(None) => {
+            Ok(_) => {
                 let value = uuid::Uuid::new_v4().to_string();
                 if cx
                     .update(|cx| store.save("inventory/codex-acp".into(), value.clone(), cx))
@@ -1247,7 +1338,7 @@ fn sync_inventory(
                     installation_code(&availability)
                 );
                 let installation = installation_code(&availability);
-                if !changed && this.codex_installation == Some(installation) {
+                if this.codex_installation == Some(installation) {
                     this.finish_init(Ok(()));
                     return;
                 }
@@ -1352,6 +1443,10 @@ mod tests {
         fail: Cell<bool>,
     }
     impl QuotaStore for MemoryStore {
+        fn delete(&self, key: String, _: &App) -> Task<Result<(), ErrorCode>> {
+            self.records.borrow_mut().remove(&key);
+            Task::ready(Ok(()))
+        }
         fn load(&self, key: String, _: &App) -> Task<Result<Option<String>, ErrorCode>> {
             Task::ready(Ok(self.records.borrow().get(&key).cloned()))
         }
@@ -1417,6 +1512,293 @@ mod tests {
             })
         }
     }
+    #[gpui::test]
+    fn isolated_reader_exit_removes_its_account(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        let (sender, receiver) = async_channel::bounded(1);
+        service.update(cx, |service, cx| {
+            let scope = "claude-isolated-reader";
+            service
+                .core
+                .inventory(
+                    AccountScope {
+                        id: scope.into(),
+                        provider: ProviderId::Claude,
+                        runtime: "local".into(),
+                        identity_known: false,
+                    },
+                    1,
+                    Availability::Unknown,
+                )
+                .expect("inventory");
+            claude::attach_reader(
+                service,
+                123,
+                scope.into(),
+                "session".into(),
+                Vec::new(),
+                receiver,
+                cx,
+            );
+        });
+        drop(sender);
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert!(
+                !service
+                    .core
+                    .snapshot
+                    .accounts
+                    .contains_key("claude-isolated-reader")
+            );
+            assert!(service.claude.readers.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn manual_refresh_retries_suspended_scope(cx: &mut TestAppContext) {
+        let (service, _, source, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            assert_eq!(
+                service.complete("scope", 1, Err(RefreshError::NotLoggedIn), cx),
+                Err(RefreshError::NotLoggedIn)
+            );
+        });
+        let refresh = service.update(cx, |service, cx| service.refresh(Selector::default(), cx));
+        cx.run_until_parked();
+        assert_eq!(source.calls.get(), 1);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        assert_eq!(refresh.await, Ok(()));
+    }
+
+    #[gpui::test]
+    async fn auth_poll_detects_login_when_home_was_missing(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        let filesystem = fs::FakeFs::new(cx.executor());
+        service.update(cx, |service, cx| {
+            service.watch_auth("/codex".into(), filesystem.clone(), cx)
+        });
+        cx.run_until_parked();
+        filesystem
+            .insert_tree("/codex", serde_json::json!({"auth.json": "fixture"}))
+            .await;
+        cx.executor().advance_clock(Duration::from_secs(5));
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert_eq!(service.core.snapshot.accounts["scope"].generation, 2)
+        });
+    }
+
+    #[gpui::test]
+    fn metadata_only_observation_updates_passive_cadence(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            service
+                .core
+                .snapshot
+                .accounts
+                .get_mut("scope")
+                .expect("scope")
+                .scope
+                .provider = ProviderId::Grok;
+            service
+                .observe(
+                    Observation {
+                        scope: "scope".into(),
+                        generation: 1,
+                        source: SourceKind::GrokResponseHeaders,
+                        source_version: "fixture".into(),
+                        observed_at: 1000,
+                        provider_sample_at: None,
+                        sequence: 1,
+                        start_sequence: None,
+                        windows: Vec::new(),
+                        complete: false,
+                        metadata: AccountMetadata {
+                            grok_response: Some(GrokResponse {
+                                blocked: Some(GrokBlockReason::SpendingLimit),
+                                status: 429,
+                                observed_at: 1000,
+                                retry_at: None,
+                            }),
+                            ..Default::default()
+                        },
+                    },
+                    cx,
+                )
+                .expect("metadata");
+            assert_eq!(service.scheduler.scopes["scope"].last_success, Some(1000));
+        });
+    }
+
+    #[gpui::test]
+    fn deferred_refresh_keeps_availability_and_failure_count(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            assert_eq!(
+                service.complete(
+                    "scope",
+                    1,
+                    Err(RefreshError::Deferred { retry_at: 2000 }),
+                    cx
+                ),
+                Err(RefreshError::Deferred { retry_at: 2000 })
+            );
+            assert_eq!(
+                service.core.snapshot.accounts["scope"].availability,
+                Availability::Ready
+            );
+            assert_eq!(service.scheduler.scopes["scope"].failures, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn logged_out_suspension_records_auth_cause(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            assert_eq!(
+                service.complete("scope", 1, Err(RefreshError::NotLoggedIn), cx),
+                Err(RefreshError::NotLoggedIn)
+            );
+            assert_eq!(
+                service.core.snapshot.accounts["scope"].refresh,
+                RefreshState::Suspended(ErrorCode::NotLoggedIn)
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn removed_scope_deletes_queued_snapshot_and_attempt(cx: &mut TestAppContext) {
+        let (service, _, _, store) = harness(cx);
+        store
+            .records
+            .borrow_mut()
+            .insert("attempt/scope".into(), "old".into());
+        service.update(cx, |service, cx| {
+            service.write_snapshot("scope", cx);
+            service.remove_scope("scope", cx);
+        });
+        cx.run_until_parked();
+        assert!(store.records.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn orphan_schedule_does_not_consume_a_slot(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            service.core.snapshot.accounts.clear();
+            service.evaluate(cx);
+            assert!(!service.scheduler.scopes.contains_key("scope"));
+        });
+    }
+
+    #[gpui::test]
+    fn isolated_reader_retirement_keeps_inventory_bounded(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            for index in 0..128 {
+                let scope = format!("claude-isolated-{index}");
+                service
+                    .core
+                    .inventory(
+                        AccountScope {
+                            id: scope.clone(),
+                            provider: ProviderId::Claude,
+                            runtime: "local".into(),
+                            identity_known: false,
+                        },
+                        1,
+                        Availability::Ready,
+                    )
+                    .expect("inventory remains bounded");
+                claude::retire_isolated(service, &scope, cx);
+            }
+            assert_eq!(service.core.snapshot.accounts.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    fn claude_persistence_only_blocks_future_schemas(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            claude::handle_persistence_error(service, ErrorCode::Persistence, cx);
+            assert!(service.persistence_blocked.is_empty());
+            claude::handle_persistence_error(service, ErrorCode::InvalidData, cx);
+            assert!(service.persistence_blocked.is_empty());
+            claude::handle_persistence_error(service, ErrorCode::UnsupportedVersion, cx);
+            assert_eq!(service.persistence_blocked.len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn hydration_failure_keeps_readiness_pending_until_recovery(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, _| {
+            service.finish_init(Err(ErrorCode::Persistence))
+        });
+        let ready = service.read_with(cx, |service, _| service.ready());
+        assert!(ready.clone().now_or_never().is_none());
+        service.update(cx, |service, _| service.finish_init(Ok(())));
+        assert_eq!(ready.await, Ok(()));
+    }
+
+    #[gpui::test]
+    fn journal_contention_retries_on_inventory_tick(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, cx| {
+            service
+                .core
+                .snapshot
+                .accounts
+                .get_mut("scope")
+                .expect("scope")
+                .scope
+                .provider = ProviderId::Antigravity;
+            assert_eq!(
+                service.complete(
+                    "scope",
+                    1,
+                    Err(RefreshError::Failed(ErrorCode::CleanupFailed)),
+                    cx
+                ),
+                Err(RefreshError::Failed(ErrorCode::CleanupFailed))
+            );
+            assert!(service.scheduler.scopes["scope"].suspended);
+            drop(service.recheck_inventory("tick", cx));
+            assert!(!service.scheduler.scopes["scope"].suspended);
+        });
+    }
+
+    #[gpui::test]
+    fn suspension_retry_preserves_structural_latch(cx: &mut TestAppContext) {
+        let (service, _, _, _) = harness(cx);
+        service.update(cx, |service, _| {
+            let account = service
+                .core
+                .snapshot
+                .accounts
+                .get_mut("scope")
+                .expect("scope");
+            account.scope.provider = ProviderId::Antigravity;
+            account.availability = Availability::Error(ErrorCode::Protocol);
+            account.refresh = RefreshState::Suspended(ErrorCode::Protocol);
+            service
+                .scheduler
+                .scopes
+                .get_mut("scope")
+                .expect("schedule")
+                .suspended = true;
+            service.retry_suspended(&Selector::default(), false);
+            assert!(service.scheduler.scopes["scope"].suspended);
+            service.retry_suspended(&Selector::default(), true);
+            assert!(!service.scheduler.scopes["scope"].suspended);
+            assert_eq!(
+                service.core.snapshot.accounts["scope"].availability,
+                Availability::Unknown
+            );
+        });
+    }
+
     #[gpui::test]
     fn passive_grok_snapshot_persists_without_active_schedule(cx: &mut TestAppContext) {
         let (service, _, _, store) = harness(cx);
@@ -1596,12 +1978,21 @@ mod tests {
             });
         });
         cx.run_until_parked();
-        let (service, _, source, _) = harness(cx);
+        let (service, _, source, store) = harness(cx);
+        store
+            .records
+            .borrow_mut()
+            .insert("inventory/codex-acp".into(), "corrupt".into());
         service.update(cx, |service, _| {
             service.core.snapshot.accounts.clear();
             service.scheduler.scopes.clear();
             service._project = Some(project);
         });
+        store.fail.set(true);
+        let failed = service.update(cx, |service, cx| service.recheck_inventory("tick", cx));
+        failed.await;
+        service.read_with(cx, |service, _| assert!(!service.hydrated));
+        store.fail.set(false);
         let task = service.update(cx, |service, cx| service.recheck_inventory("tick", cx));
         task.await;
         service.read_with(cx, |service, _| {
@@ -1630,6 +2021,34 @@ mod tests {
                     .any(|account| account.scope.provider == ProviderId::Codex
                         && account.availability == Availability::Ready)
             )
+        });
+        let previous = service.read_with(cx, |service, _| {
+            service
+                .core
+                .snapshot
+                .accounts
+                .values()
+                .map(|account| (account.scope.id.clone(), account.generation))
+                .collect::<BTreeMap<_, _>>()
+        });
+        let inventory = service.update(cx, |service, cx| {
+            let project = service._project.clone().expect("project");
+            let store = project.read(cx).agent_server_store().clone();
+            sync_inventory(service, &store, true, cx);
+            service._inventory.take().expect("inventory task")
+        });
+        inventory.await;
+        service.read_with(cx, |service, _| {
+            assert_eq!(
+                previous,
+                service
+                    .core
+                    .snapshot
+                    .accounts
+                    .values()
+                    .map(|account| (account.scope.id.clone(), account.generation))
+                    .collect()
+            );
         });
     }
 

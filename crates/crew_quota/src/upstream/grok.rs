@@ -355,11 +355,9 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
             .as_ref()
             .map_or(0, |(_, generation)| generation.saturating_add(1));
         if old.as_ref().is_some_and(|(previous, _)| previous != &scope) {
-            service
-                .core
-                .snapshot
-                .accounts
-                .retain(|_, account| account.scope.provider != ProviderId::Grok);
+            if let Some((previous, _)) = &old {
+                service.remove_scope(previous, cx);
+            }
         }
         if service
             .core

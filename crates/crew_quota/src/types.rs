@@ -121,6 +121,7 @@ pub enum ErrorCode {
     CleanupFailed,
     InferenceAccess,
     StoredAuthUnsupported,
+    NotLoggedIn,
     AttributionAmbiguous,
     Unknown,
 }

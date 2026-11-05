@@ -62,9 +62,9 @@ impl Scheduler {
                     .and_then(|state| state.restored_attempt_at),
                 last_success: None,
                 last_success_monotonic: None,
-                retry_monotonic: previous.as_ref().and_then(|state| state.retry_monotonic),
-                retry_at: previous.as_ref().map_or(0, |state| state.retry_at),
-                failures: previous.as_ref().map_or(0, |state| state.failures),
+                retry_monotonic: None,
+                retry_at: 0,
+                failures: 0,
                 in_flight: false,
                 suspended: false,
                 demand_until: 0,
@@ -295,6 +295,14 @@ impl Scheduler {
             }
         }
         started
+    }
+    pub fn defer(&mut self, scope: &str, now: Timestamp, monotonic: u64, retry_at: Timestamp) {
+        if let Some(state) = self.scopes.get_mut(scope) {
+            state.in_flight = false;
+            state.retry_at = retry_at.max(now);
+            state.retry_monotonic =
+                Some(monotonic.saturating_add(state.retry_at.saturating_sub(now) as u64));
+        }
     }
     pub fn complete(
         &mut self,

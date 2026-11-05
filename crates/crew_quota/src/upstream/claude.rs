@@ -14,7 +14,26 @@ const SHARED_SCOPE: &str = "claude-registry-shell-oauth";
 pub(super) struct ClaudeState {
     pub(super) readers: BTreeMap<usize, (Rc<RefCell<BTreeSet<String>>>, Task<()>)>,
     pub(super) inventory: Option<Task<()>>,
+    connection_allocations: BTreeMap<usize, Box<dyn std::any::Any>>,
     installation: Option<&'static str>,
+}
+
+impl ClaudeState {
+    fn retain_allocation<T: ?Sized + 'static>(&mut self, identity: usize, connection: &Rc<T>) {
+        // A weak handle keeps this address reserved until the reader has deregistered.
+        self.connection_allocations
+            .insert(identity, Box::new(Rc::downgrade(connection)));
+    }
+}
+
+#[test]
+fn reader_reserves_connection_allocation_until_deregistration() {
+    let connection = Rc::new(());
+    let mut state = ClaudeState::default();
+    state.retain_allocation(1, &connection);
+    assert_eq!(Rc::weak_count(&connection), 1);
+    state.connection_allocations.remove(&1);
+    assert_eq!(Rc::weak_count(&connection), 0);
 }
 
 trait DebugFeed {
@@ -255,6 +274,7 @@ pub(super) fn init(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                         }
                     }
                     attach_reader(service, identity, scope, session, backlog, receiver, cx);
+                    service.claude.retain_allocation(identity, &connection);
                 });
             });
         }
@@ -348,8 +368,10 @@ pub(super) fn attach_reader(
                 }
             }
             if this
-                .update(cx, |service, _| {
+                .update(cx, |service, cx| {
                     service.claude.readers.remove(&identity);
+                    service.claude.connection_allocations.remove(&identity);
+                    retire_isolated(service, &scope, cx);
                 })
                 .is_err()
             {
@@ -444,15 +466,13 @@ pub(super) fn sync(service: &Entity<QuotaService>, project: &Entity<Project>, cx
                                     service.ports.clock.now(),
                                     service.ports.clock.monotonic(),
                                 ),
-                                Err(_) => {
-                                    service.persistence_blocked.insert(SHARED_SCOPE.into());
-                                    service.persistence_failure(SHARED_SCOPE.into(), cx);
+                                Err(error) => {
+                                    handle_persistence_error(service, error, cx);
                                 }
                             }
                         }
                         Err(_) => {
-                            service.persistence_blocked.insert(SHARED_SCOPE.into());
-                            service.persistence_failure(SHARED_SCOPE.into(), cx);
+                            handle_persistence_error(service, ErrorCode::Persistence, cx);
                         }
                         Ok(None) => {}
                     }
@@ -954,4 +974,33 @@ mod feed_contracts {
         let (connection, sender) = fake();
         check_feed(&connection, sender).await;
     }
+}
+
+pub(super) fn handle_persistence_error(
+    service: &mut QuotaService,
+    error: ErrorCode,
+    cx: &mut Context<QuotaService>,
+) {
+    if error == ErrorCode::UnsupportedVersion {
+        service.persistence_blocked.insert(SHARED_SCOPE.into());
+    }
+    service.persistence_failure(SHARED_SCOPE.into(), cx);
+}
+
+pub(super) fn retire_isolated(
+    service: &mut QuotaService,
+    scope: &str,
+    cx: &mut Context<QuotaService>,
+) {
+    if !scope.starts_with("claude-isolated-") {
+        return;
+    }
+    service.remove_scope(scope, cx);
+    service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
+    cx.emit(QuotaEvent::Changed {
+        scopes: vec![scope.into()],
+        windows: Vec::new(),
+        revision: service.core.snapshot.revision,
+    });
+    cx.notify();
 }
