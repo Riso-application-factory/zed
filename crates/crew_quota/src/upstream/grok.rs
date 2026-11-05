@@ -60,7 +60,7 @@ impl HttpClient for Observer {
         }
         let endpoint = inference_endpoint(&request).map(str::to_owned);
         if endpoint.is_none() {
-            log::info!(
+            log::debug!(
                 "crew_quota: native_capture provider={provider} outcome=Unmatched path_kind=Other"
             );
             return self.inner.send(request);
@@ -68,7 +68,7 @@ impl HttpClient for Observer {
         let target = endpoint
             .as_ref()
             .and_then(|_| self.target.lock().ok()?.get(request.uri().host()?).cloned());
-        log::info!("crew_quota: native_capture provider={provider} outcome=Eligible");
+        log::debug!("crew_quota: native_capture provider={provider} outcome=Eligible");
         let target = match target {
             Some(target) if target.gate_reason.is_none() => Some(target),
             target => {
@@ -76,7 +76,7 @@ impl HttpClient for Observer {
                     .as_ref()
                     .and_then(|target| target.gate_reason.as_deref())
                     .unwrap_or("NoCaptureTarget");
-                log::info!(
+                log::debug!(
                     "crew_quota: native_capture provider={provider} outcome=Gated reason={reason}"
                 );
                 None
@@ -88,7 +88,7 @@ impl HttpClient for Observer {
         Box::pin(async move {
             let mut response = future.await.inspect_err(|_| {
                 if endpoint.is_some() {
-                    log::info!(
+                    log::debug!(
                         "crew_quota: native_capture provider={provider} outcome=TransportError"
                     );
                 }
@@ -96,7 +96,7 @@ impl HttpClient for Observer {
             if let (Some(endpoint), Some(target)) = (endpoint, target) {
                 let now = chrono::Utc::now().timestamp();
                 if response.status().is_redirection() {
-                    log::info!(
+                    log::debug!(
                         "crew_quota: native_capture provider={provider} outcome=Skipped reason=Redirect"
                     );
                     return Ok(response);
@@ -106,7 +106,7 @@ impl HttpClient for Observer {
                 let status = response.status().as_u16();
                 let blocked = classify_response(&mut response, &host).await;
                 if let Some(reason) = blocked {
-                    log::info!(
+                    log::debug!(
                         "crew_quota: native_capture provider={provider} outcome=Blocked reason={reason:?}"
                     );
                 }
@@ -137,10 +137,12 @@ impl HttpClient for Observer {
                     retry_at: retry_after(response.headers(), now),
                 }) {
                     Ok(()) => {
-                        log::info!("crew_quota: native_capture provider={provider} outcome=Queued")
+                        log::debug!("crew_quota: native_capture provider={provider} outcome=Queued")
                     }
                     Err(_) => {
-                        log::info!("crew_quota: native_capture provider={provider} outcome=Dropped")
+                        log::debug!(
+                            "crew_quota: native_capture provider={provider} outcome=Dropped"
+                        )
                     }
                 }
             }
@@ -520,7 +522,7 @@ async fn buffer_until_ready(
                 if pending.len() < MAX_SCOPES || pending.contains_key(&headers.quota.scope) {
                     pending.insert(headers.quota.scope.clone(), headers);
                 }
-                log::info!("crew_quota: native_capture provider={provider} outcome=Buffered");
+                log::debug!("crew_quota: native_capture provider={provider} outcome=Buffered");
             }
         }
     }
@@ -551,7 +553,6 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
                     | language_model::Event::ProvidersChanged
             ) && let Some(service) = service.upgrade()
             {
-                service.update(cx, |service, _| service.native_inventory.clear());
                 sync(&service, cx);
             }
         }
@@ -602,7 +603,7 @@ pub(super) fn init(service: &Entity<QuotaService>, cx: &mut App) {
                         let provider = capture_provider(&observation);
                         let scope = observation.scope.clone();
                         let generation = observation.generation;
-                        log::info!(
+                        log::debug!(
                             "crew_quota: native_capture provider={provider} outcome=Received"
                         );
                         if validate_observation(&observation, service.ports.clock.now()).is_err() {

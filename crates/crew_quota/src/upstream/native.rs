@@ -274,6 +274,15 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
                 availability,
             ) {
                 Ok(()) => {
+                    if active(&candidate.id) && candidate.capture_host.is_some() {
+                        service.scheduler.track(
+                            scope.clone(),
+                            ProviderId::LlmProvider,
+                            service.native_generation,
+                        );
+                    } else {
+                        service.scheduler.scopes.remove(&scope);
+                    }
                     if restore && let Some(account) = service.core.snapshot.accounts.get(&scope) {
                         service.restore_snapshot(account.scope.clone(), account.generation, cx);
                     }
@@ -294,6 +303,7 @@ pub(super) fn sync(service: &Entity<QuotaService>, cx: &mut App) {
             }
         }
         if !changed.is_empty() {
+            service.wake();
             service.core.snapshot.revision = service.core.snapshot.revision.saturating_add(1);
             for scope in &changed {
                 cx.emit(QuotaEvent::AvailabilityChanged(scope.clone()));
@@ -355,6 +365,9 @@ mod tests {
         fn provided_models(&self, _: &App) -> Vec<LanguageModel> {
             panic!("no model discovery")
         }
+        fn loaded_api_key(&self, _: &App) -> Option<String> {
+            Some("fake-test-key".into())
+        }
         fn is_authenticated(&self, _: &App) -> bool {
             self.authenticated.load(Ordering::SeqCst)
         }
@@ -397,6 +410,236 @@ mod tests {
         fn delete(&self, _: String, _: &App) -> Task<Result<(), ErrorCode>> {
             Task::ready(Ok(()))
         }
+    }
+
+    #[gpui::test]
+    async fn native_inventory_drives_active_reads_and_preserves_unrelated_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct TestPorts {
+            now: std::cell::Cell<i64>,
+            monotonic: std::cell::Cell<u64>,
+            records: std::cell::RefCell<BTreeMap<String, String>>,
+        }
+        impl Clock for TestPorts {
+            fn now(&self) -> Timestamp {
+                self.now.get()
+            }
+            fn monotonic(&self) -> u64 {
+                self.monotonic.get()
+            }
+        }
+        impl QuotaStore for TestPorts {
+            fn load(&self, key: String, _: &App) -> Task<Result<Option<String>, ErrorCode>> {
+                Task::ready(Ok(self.records.borrow().get(&key).cloned()))
+            }
+            fn save(&self, key: String, value: String, _: &App) -> Task<Result<(), ErrorCode>> {
+                self.records.borrow_mut().insert(key, value);
+                Task::ready(Ok(()))
+            }
+            fn delete(&self, key: String, _: &App) -> Task<Result<(), ErrorCode>> {
+                self.records.borrow_mut().remove(&key);
+                Task::ready(Ok(()))
+            }
+        }
+        let ports = Rc::new(TestPorts {
+            now: std::cell::Cell::new(chrono::Utc::now().timestamp()),
+            monotonic: std::cell::Cell::new(0),
+            records: Default::default(),
+        });
+        let requests = Arc::new(std::sync::Mutex::new(BTreeMap::<String, usize>::new()));
+        let (service, provider) = cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            language_models::AllLanguageModelSettings::register(cx);
+            language_model::init(cx);
+            cx.set_http_client(http_client::FakeHttpClient::create({
+                let requests = requests.clone();
+                move |request| {
+                    let host = request.uri().host().expect("host").to_string();
+                    *requests.lock().expect("requests").entry(host.clone()).or_default() += 1;
+                    async move {
+                        let (status, body) = if host == "api.x.ai" {
+                            (402, "{}")
+                        } else {
+                            (200, r#"{"is_available":true,"balance_infos":[{"currency":"USD","total_balance":"12.50"}]}"#)
+                        };
+                        Ok(http_client::Response::builder().status(status)
+                            .body(http_client::AsyncBody::from(body))?)
+                    }
+                }
+            }));
+            super::super::grok::install_http_observer(cx);
+            let registry = LanguageModelRegistry::global(cx);
+            let mut observed = None;
+            for id in ["x_ai", "deepseek", "anthropic", "openai"] {
+                let provider = Arc::new(FakeProvider {
+                    id, authenticated: AtomicBool::new(true),
+                    authenticate_calls: AtomicUsize::new(0), state: cx.new(|_| ()),
+                });
+                if id == "anthropic" { observed = Some(provider.clone()); }
+                registry.update(cx, |registry, cx| registry.register_provider(provider, cx));
+            }
+            let service = cx.new(|cx| QuotaService::new(Ports {
+                source: Rc::new(InMemoryPorts), store: ports.clone(), clock: ports.clone(),
+            }, cx));
+            service.update(cx, |service, _| service.finish_init(Ok(())));
+            super::super::grok::init(&service, cx);
+            (service, observed.expect("provider"))
+        });
+        cx.run_until_parked();
+        assert_eq!(requests.lock().expect("requests").get("api.x.ai"), Some(&1));
+        assert_eq!(
+            requests.lock().expect("requests").get("api.deepseek.com"),
+            Some(&1)
+        );
+        service.read_with(cx, |service, _| {
+            let accounts = &service.core.snapshot.accounts;
+            assert!(
+                super::super::panel::native_status(&accounts["llm-provider:x_ai"], ports.now())
+                    .contains("Out of credits")
+            );
+            assert!(
+                super::super::panel::compact_summary(
+                    &accounts["llm-provider:deepseek"],
+                    false,
+                    ports.now()
+                )
+                .contains("12.5 USD left")
+            );
+            assert!(
+                !service
+                    .scheduler
+                    .scopes
+                    .contains_key("llm-provider:anthropic")
+            );
+            assert!(!service.scheduler.scopes.contains_key("llm-provider:openai"));
+        });
+        let generation = service.read_with(cx, |service, _| {
+            service.core.snapshot.accounts["llm-provider:deepseek"].generation
+        });
+        provider.state.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert_eq!(
+                service.core.snapshot.accounts["llm-provider:deepseek"].generation,
+                generation
+            );
+            assert!(
+                !service.core.snapshot.accounts["llm-provider:deepseek"]
+                    .windows
+                    .is_empty()
+            );
+        });
+        // A new service restores the durable reservation before allowing another probe.
+        drop(service);
+        let service = cx.update(|cx| {
+            let service = cx.new(|cx| {
+                QuotaService::new(
+                    Ports {
+                        source: Rc::new(InMemoryPorts),
+                        store: ports.clone(),
+                        clock: ports.clone(),
+                    },
+                    cx,
+                )
+            });
+            service.update(cx, |service, _| service.finish_init(Ok(())));
+            super::super::grok::init(&service, cx);
+            service
+        });
+        cx.run_until_parked();
+        let lease = service.update(cx, |service, cx| {
+            service.acquire_demand(
+                FreshRequest {
+                    selector: Selector {
+                        scopes: vec!["llm-provider:x_ai".into()],
+                        ..Default::default()
+                    },
+                    max_age: Duration::from_secs(120),
+                    required_measurements: Vec::new(),
+                    deadline: ports.now() + 300,
+                    allow_inference: false,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        drop(lease);
+        assert_eq!(requests.lock().expect("requests").get("api.x.ai"), Some(&1));
+        let baseline = *requests
+            .lock()
+            .expect("requests")
+            .get("api.deepseek.com")
+            .expect("read");
+        for elapsed in [120, 240, 900] {
+            ports.now.set(ports.now.get() + elapsed);
+            ports.monotonic.set(ports.monotonic.get() + elapsed as u64);
+            let lease = service.update(cx, |service, cx| {
+                service.acquire_demand(
+                    FreshRequest {
+                        selector: Selector {
+                            scopes: vec!["llm-provider:deepseek".into()],
+                            ..Default::default()
+                        },
+                        max_age: Duration::from_secs(120),
+                        required_measurements: Vec::new(),
+                        deadline: ports.now() + 300,
+                        allow_inference: false,
+                    },
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            drop(lease);
+        }
+        assert_eq!(requests.lock().expect("requests").get("api.x.ai"), Some(&2));
+        assert_eq!(
+            requests.lock().expect("requests").get("api.deepseek.com"),
+            Some(&(baseline + 3))
+        );
+        ports.now.set(ports.now.get() + 900);
+        ports.monotonic.set(ports.monotonic.get() + 900);
+        let lease = service.update(cx, |service, cx| {
+            service.acquire_demand(
+                FreshRequest {
+                    selector: Selector {
+                        scopes: vec!["llm-provider:x_ai".into()],
+                        ..Default::default()
+                    },
+                    max_age: Duration::from_secs(120),
+                    required_measurements: Vec::new(),
+                    deadline: ports.now() + 300,
+                    allow_inference: false,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        drop(lease);
+        assert_eq!(requests.lock().expect("requests").get("api.x.ai"), Some(&3));
+        assert_eq!(
+            requests.lock().expect("requests").get("api.deepseek.com"),
+            Some(&(baseline + 4))
+        );
+        let lease = service.update(cx, |service, cx| {
+            service.acquire_demand(
+                FreshRequest {
+                    selector: Selector {
+                        scopes: vec!["llm-provider:x_ai".into()],
+                        ..Default::default()
+                    },
+                    max_age: Duration::from_secs(120),
+                    required_measurements: Vec::new(),
+                    deadline: ports.now() + 300,
+                    allow_inference: false,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        drop(lease);
+        assert_eq!(requests.lock().expect("requests").get("api.x.ai"), Some(&3));
     }
 
     #[gpui::test]
@@ -645,7 +888,10 @@ mod tests {
         provider.state.update(cx, |_, cx| cx.notify());
         cx.run_until_parked();
         service.read_with(cx, |service, _| {
-            assert!(service.core.snapshot.accounts["llm-provider:x_ai"].generation > generation)
+            assert_eq!(
+                service.core.snapshot.accounts["llm-provider:x_ai"].generation,
+                generation
+            )
         });
         provider.authenticated.store(false, Ordering::SeqCst);
         provider.state.update(cx, |_, cx| cx.notify());
@@ -1059,7 +1305,7 @@ fn probe(
                 .map_err(|_| RefreshError::Failed(ErrorCode::Persistence))?
                 .is_some()
             {
-                return Err(RefreshError::NotRefreshable);
+                return Err(RefreshError::Failed(ErrorCode::InferenceAccess));
             }
             let (observation, denied) =
                 read_probe(client, key, scope, generation, sequence).await?;
@@ -1069,6 +1315,7 @@ fn probe(
                     .write("xai-probe-no-inference".into(), "true".into())
                     .await
                     .map_err(|_| RefreshError::Failed(ErrorCode::Persistence))?;
+                return Err(RefreshError::Failed(ErrorCode::InferenceAccess));
             }
             Ok(observation)
         };

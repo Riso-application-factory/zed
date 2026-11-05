@@ -902,7 +902,14 @@ impl QuotaService {
                 })
                 .min();
             if let Some(reset) = reset {
-                if account.scope.id != "llm-provider:x_ai" {
+                if account.scope.id != "llm-provider:x_ai"
+                    && (account.scope.category != AccountCategory::LlmProvider
+                        || account
+                            .scope
+                            .native_provider_id
+                            .as_deref()
+                            .is_some_and(native::active))
+                {
                     self.scheduler.reset_due(&account.scope.id, reset);
                 }
             }
@@ -1128,9 +1135,19 @@ impl QuotaService {
                     }
                     RefreshState::Suspended(ErrorCode::UnsupportedVersion)
                 }
-                Err(RefreshError::Deferred { retry_at }) => RefreshState::Backoff {
-                    retry_at: *retry_at,
-                },
+                Err(RefreshError::Deferred { retry_at }) => {
+                    if scope == "llm-provider:x_ai" {
+                        account.metadata.grok_response = Some(GrokResponse {
+                            blocked: Some(GrokBlockReason::RateLimited),
+                            status: 429,
+                            observed_at: now,
+                            retry_at: Some(*retry_at),
+                        });
+                    }
+                    RefreshState::Backoff {
+                        retry_at: *retry_at,
+                    }
+                }
                 Err(error) => {
                     account.availability = Availability::Error(match error {
                         RefreshError::Failed(code) => *code,

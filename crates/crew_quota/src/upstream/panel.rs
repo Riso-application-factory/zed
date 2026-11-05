@@ -537,6 +537,7 @@ fn visible_windows(account: &AccountState) -> Vec<&QuotaWindow> {
                             | "tokens"
                             | "input-tokens"
                             | "output-tokens"
+                            | "balance"
                     )
                 } else {
                     matches!(window.key.duration_seconds, Some(18000 | 604800))
@@ -578,7 +579,7 @@ fn window_title(account: &AccountState, window: &QuotaWindow) -> String {
     }
 }
 
-fn compact_summary(account: &AccountState, show_used: bool, now: Timestamp) -> String {
+pub(super) fn compact_summary(account: &AccountState, show_used: bool, now: Timestamp) -> String {
     let windows = visible_windows(account);
     let balances = windows
         .iter()
@@ -786,9 +787,7 @@ pub(super) fn account_status(account: &AccountState, now: Timestamp) -> String {
         Availability::Unavailable(ErrorCode::StoredAuthUnsupported) => {
             "Stored OAuth unsupported — use producer shell login"
         }
-        Availability::Unavailable(ErrorCode::InferenceAccess) => {
-            "Probe access unavailable — listening for session updates"
-        }
+        Availability::Unavailable(ErrorCode::InferenceAccess) => "No inference permission",
         Availability::NotInstalled => "Not installed",
         Availability::NotSetUp => "Not set up",
         Availability::NotLoggedIn => "Not logged in",
@@ -872,7 +871,10 @@ fn native_rows(snapshot: &QuotaSnapshot) -> Vec<&AccountState> {
     accounts
 }
 
-fn native_status(account: &AccountState, now: Timestamp) -> String {
+pub(super) fn native_status(account: &AccountState, now: Timestamp) -> String {
+    if account.availability == Availability::Unavailable(ErrorCode::InferenceAccess) {
+        return "No inference permission".into();
+    }
     match account
         .metadata
         .native_provider
@@ -1013,6 +1015,7 @@ fn short_amount_text(window: &QuotaWindow) -> Option<String> {
 
 fn native_window_title(window: &QuotaWindow) -> String {
     match window.key.role.as_str() {
+        "balance" => "Balance",
         "requests" => "Requests",
         "tokens" => "Tokens",
         "input-tokens" => "Input tokens",
