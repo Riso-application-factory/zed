@@ -36,6 +36,12 @@ impl HttpClient for Observer {
         &self,
         request: Request<AsyncBody>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        let host_category = match request.uri().host() {
+            Some("api.x.ai") => "xai",
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]") => "localhost",
+            _ => "other",
+        };
+        log::debug!("crew_quota: http_send host_category={host_category}");
         if !is_xai_host(&request) {
             return self.inner.send(request);
         }
@@ -703,6 +709,7 @@ mod tests {
                 let settings = settings::SettingsStore::test(cx);
                 cx.set_global(settings);
                 language_models::AllLanguageModelSettings::register(cx);
+                client::ClientSettings::register(cx);
                 cx.set_http_client(transport);
                 install_http_observer(cx);
                 let bridge = cx.global::<Bridge>();
@@ -711,14 +718,10 @@ mod tests {
                     generation: 1,
                 });
                 let receiver = bridge.receiver.clone();
-                // Client::production wraps the decorated app client in HttpClientWithUrl.
-                let client = Arc::new(http_client::HttpClientWithUrl::new_url(
-                    cx.http_client(),
-                    "https://zed.dev",
-                    None,
-                ));
+                let client = client::Client::production(cx);
+                cx.set_http_client(client.http_client());
                 let provider = language_models::provider::x_ai::XAiLanguageModelProvider::new(
-                    client,
+                    client.http_client(),
                     Arc::new(
                         credentials_provider::test_support::FakeCredentialsProvider::default(),
                     ),
